@@ -57,13 +57,18 @@ def test_tag_offline_with_seeded_data(monkeypatch, capsys):
     conn.close()
 
 
-def test_pull_subcommand_with_mocked_fetch(monkeypatch, capsys):
+def test_pull_subcommand_with_mocked_fetch(monkeypatch, tmp_path, capsys):
     from feedback_hub import puller
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
     def fake_fetch(s_sec, e_sec, **kw):
         return {"errCode": 0, "results": []}
 
     monkeypatch.setattr(puller, "fetch_window", fake_fetch)
+    monkeypatch.setattr(puller, "RAW_DIR", raw_dir)
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: None)
     rc = cli.main(["pull", "--last", "1h"])
     assert rc == 0
     out = capsys.readouterr().out
