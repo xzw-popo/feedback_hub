@@ -1,17 +1,20 @@
 """打标流水线（spec §5.2）。
 
-本模块包含两类内容：
+本模块包含：
 - `aggregate_conversation_label`：纯函数，把多条消息标签聚合成会话标签（spec §4.3）
-- `run_tagging`：编排函数（Task 10 加入）
-
-把"聚合"独立成纯函数，便于单元测试。
+- `run_tagging`：编排函数——取待打标消息 → 规则+LLM → 写 message_label →
+                 重算受影响 user_vid 的 conversation_id → 重算 conversation_label
 """
 from __future__ import annotations
 
+import sqlite3
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+from feedback_hub import db
 from feedback_hub.config import L1_PRIORITY, SEVERITY_PRIORITY
+from feedback_hub.conversation import assign_conversation_ids
+from feedback_hub.tagger import label_parser, rules
 
 
 def aggregate_conversation_label(
@@ -85,3 +88,174 @@ def aggregate_conversation_label(
         "channel": meta.get("channel"),
         "aggregated_at": int(time.time()),
     }
+
+
+# ---------------------------------------------------------------------------
+# run_tagging：编排
+# ---------------------------------------------------------------------------
+
+# LLM 调用器签名：(text) -> raw_reply_string；可被测试注入
+LLMCallable = Callable[[str], str]
+
+
+def _default_llm_caller() -> LLMCallable:
+    """默认 LLM 调用器（懒加载，避免单测必须连真实环境）。"""
+    from feedback_hub.tagger.llm_client import classify_one
+
+    def call(text: str) -> str:
+        return classify_one(text)
+    return call
+
+
+def _tag_one(text: str, llm_call: Optional[LLMCallable]) -> dict[str, Any]:
+    """对一条消息打标：先规则，未命中走 LLM；LLM 失败回 '待定'。"""
+    rule_hit = rules.apply_rules(text)
+    if rule_hit is not None:
+        return rule_hit
+
+    # LLM 兜底
+    if llm_call is None:
+        # 没有可用 LLM：返回兜底"待定"
+        return {
+            "L1": "待定", "L2": [], "severity": "P3",
+            "confidence": 0.0, "reason": "no_llm_available",
+            "source": "llm", "rule_name": None,
+        }
+    try:
+        reply = llm_call(text or "")
+    except Exception as e:
+        return {
+            "L1": "待定", "L2": [], "severity": "P3",
+            "confidence": 0.0, "reason": f"llm_error: {type(e).__name__}",
+            "source": "llm", "rule_name": None,
+        }
+    parsed = label_parser.parse_llm_reply(reply)
+    parsed["rule_name"] = None
+    return parsed
+
+
+def _l2_to_pipe(l2: Any) -> str:
+    if isinstance(l2, list):
+        return "|".join(str(x) for x in l2 if x)
+    if l2 is None:
+        return ""
+    return str(l2)
+
+
+def run_tagging(
+    conn: sqlite3.Connection,
+    *,
+    llm_call: Optional[LLMCallable] = None,
+    limit: Optional[int] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> dict[str, int]:
+    """执行一轮打标流水线。返回统计字典。
+
+    步骤（spec §5.2）：
+        1. 取所有未打标的 feedback
+        2. 逐条打标（规则优先 → LLM 兜底）→ upsert message_label
+        3. 取本批涉及的所有 user_vid，对每个 user_vid 在数据库里重算 conversation_id
+        4. 取本批涉及的所有 conversation_id，重新聚合 conversation_label
+
+    Args:
+        conn: 已 init_schema 的 sqlite 连接
+        llm_call: 可注入的 LLM 调用器；为 None 时使用默认（真实远端）
+        limit: 单次最多处理多少条；None=全部
+        on_progress: 可选回调，参数 (done_count, total_count)
+    """
+    if llm_call is None:
+        try:
+            llm_call = _default_llm_caller()
+        except Exception:
+            llm_call = None  # 离线运行也应能跑（仅命中规则的部分被打标）
+
+    untagged_rows = db.get_untagged_feedback(conn)
+    if limit is not None:
+        untagged_rows = untagged_rows[:limit]
+
+    total = len(untagged_rows)
+    stats = {
+        "total": total, "tagged": 0,
+        "by_rule": 0, "by_llm": 0, "pending": 0,
+        "conversations_recomputed": 0,
+        "user_vids_recomputed": 0,
+    }
+    if total == 0:
+        return stats
+
+    now = int(time.time())
+    affected_feedback_ids: list[str] = []
+    for i, row in enumerate(untagged_rows):
+        text = row["text"]
+        feedback_id = row["feedback_id"]
+        result = _tag_one(text, llm_call)
+        db.upsert_message_label(conn, {
+            "feedback_id": feedback_id,
+            "L1": result["L1"],
+            "L2": _l2_to_pipe(result.get("L2")),
+            "severity": result["severity"],
+            "confidence": float(result.get("confidence") or 0.0),
+            "reason": result.get("reason") or "",
+            "source": result.get("source") or "rule",
+            "rule_name": result.get("rule_name"),
+            "tagged_at": now,
+        })
+        stats["tagged"] += 1
+        if result.get("source") == "rule":
+            stats["by_rule"] += 1
+        elif result["L1"] == "待定":
+            stats["pending"] += 1
+            stats["by_llm"] += 1
+        else:
+            stats["by_llm"] += 1
+        affected_feedback_ids.append(feedback_id)
+        if on_progress:
+            on_progress(i + 1, total)
+
+    conn.commit()
+
+    # ---- 重算 conversation_id（仅本批涉及的 user_vid 范围）----
+    user_vids = db.get_distinct_user_vids_for_feedbacks(conn, affected_feedback_ids)
+    affected_conv_ids: set[str] = set()
+    for uv in user_vids:
+        rows = db.get_feedback_by_user_vid(conn, uv)
+        msgs = [{"feedback_id": r["feedback_id"],
+                 "user_vid": r["user_vid"],
+                 "ts_ms": r["ts_ms"]} for r in rows]
+        out = assign_conversation_ids(msgs)
+        for m in out:
+            db.update_conversation_assignment(
+                conn, m["feedback_id"], m["conversation_id"], m["msg_seq"],
+            )
+            affected_conv_ids.add(m["conversation_id"])
+    stats["user_vids_recomputed"] = len(user_vids)
+
+    # 还要把本批 feedback 自身的 conversation_id（可能从未排过的旧记录）也算入
+    cur = conn.execute(
+        f"SELECT DISTINCT conversation_id FROM feedback "
+        f"WHERE feedback_id IN ({','.join('?'*len(affected_feedback_ids))})",
+        tuple(affected_feedback_ids),
+    )
+    for r in cur.fetchall():
+        affected_conv_ids.add(r[0])
+
+    conn.commit()
+
+    # ---- 重算 conversation_label ----
+    for cid in affected_conv_ids:
+        ml_rows = db.get_message_labels_for_conversation(conn, cid)
+        rows_dicts = [{
+            "feedback_id": r["feedback_id"],
+            "L1": r["L1"], "L2": r["L2"], "severity": r["severity"],
+            "confidence": r["confidence"], "reason": r["reason"],
+            "ts_ms": r["ts_ms"], "msg_seq": r["msg_seq"],
+            "user_vid": r["user_vid"], "appversion": r["appversion"],
+            "channel": r["channel"],
+        } for r in ml_rows]
+        agg = aggregate_conversation_label(cid, rows_dicts)
+        if agg is not None:
+            db.upsert_conversation_label(conn, agg)
+    stats["conversations_recomputed"] = len(affected_conv_ids)
+
+    conn.commit()
+    return stats
