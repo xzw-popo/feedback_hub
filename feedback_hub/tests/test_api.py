@@ -148,3 +148,25 @@ def test_date_range_filter(client):
 def test_invalid_date_returns_400(client):
     r = client.get("/api/conversations?from=not-a-date")
     assert r.status_code == 400
+
+
+def test_cors_allows_localhost_5173(client):
+    r = client.options(
+        "/api/conversations",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_cors_blocks_unknown_origin(client):
+    r = client.get(
+        "/api/conversations",
+        headers={"Origin": "http://evil.example.com"},
+    )
+    assert r.status_code == 200
+    headers_lower = {k.lower() for k in r.headers.keys()}
+    assert "access-control-allow-origin" not in headers_lower

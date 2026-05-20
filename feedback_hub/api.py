@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from feedback_hub import db
@@ -72,6 +73,15 @@ def _conv_to_item(r: sqlite3.Row, preview_text: str) -> dict:
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     app = FastAPI(title="feedback_hub", version="1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
 
     def _conn() -> sqlite3.Connection:
         c = db.connect(db_path) if db_path else db.connect()
