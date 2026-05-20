@@ -54,7 +54,7 @@ export interface ListParams {
   offset?: number
 }
 
-function clean<T extends Record<string, unknown>>(obj: T): Partial<T> {
+function clean<T extends object>(obj: T): Partial<T> {
   const out: Partial<T> = {}
   for (const [k, v] of Object.entries(obj)) {
     if (v !== undefined && v !== null && v !== '') {
