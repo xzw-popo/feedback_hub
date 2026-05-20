@@ -17,6 +17,12 @@ const style = computed(() => {
 </script>
 
 <template>
-  <span v-if="value" :style="style">{{ value }}</span>
-  <span v-else class="muted">—</span>
+  <span
+    v-if="value"
+    :style="style"
+  >{{ value }}</span>
+  <span
+    v-else
+    class="muted"
+  >—</span>
 </template>

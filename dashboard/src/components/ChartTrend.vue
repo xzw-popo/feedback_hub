@@ -59,5 +59,8 @@ watch(() => props.buckets, render, { deep: true })
 </script>
 
 <template>
-  <div ref="el" :style="{ height: height ?? '320px', width: '100%' }" />
+  <div
+    ref="el"
+    :style="{ height: height ?? '320px', width: '100%' }"
+  />
 </template>

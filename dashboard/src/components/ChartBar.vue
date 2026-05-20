@@ -43,5 +43,8 @@ watch(() => props.data, render, { deep: true })
 </script>
 
 <template>
-  <div ref="el" :style="{ height: height ?? '280px', width: '100%' }" />
+  <div
+    ref="el"
+    :style="{ height: height ?? '280px', width: '100%' }"
+  />
 </template>

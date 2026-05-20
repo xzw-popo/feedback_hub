@@ -54,7 +54,12 @@ function update<K extends keyof FilterState>(k: K, v: FilterState[K]) {
       style="width: 120px"
       @update:model-value="update('L1', $event ?? '')"
     >
-      <el-option v-for="x in L1_VALUES" :key="x" :label="x" :value="x" />
+      <el-option
+        v-for="x in L1_VALUES"
+        :key="x"
+        :label="x"
+        :value="x"
+      />
     </el-select>
     <el-select
       :model-value="modelValue.L2"
@@ -64,7 +69,12 @@ function update<K extends keyof FilterState>(k: K, v: FilterState[K]) {
       style="width: 160px"
       @update:model-value="update('L2', $event ?? '')"
     >
-      <el-option v-for="x in L2_VALUES" :key="x" :label="x" :value="x" />
+      <el-option
+        v-for="x in L2_VALUES"
+        :key="x"
+        :label="x"
+        :value="x"
+      />
     </el-select>
     <el-select
       :model-value="modelValue.severity"
@@ -73,7 +83,12 @@ function update<K extends keyof FilterState>(k: K, v: FilterState[K]) {
       style="width: 120px"
       @update:model-value="update('severity', $event ?? '')"
     >
-      <el-option v-for="x in SEVERITY_VALUES" :key="x" :label="x" :value="x" />
+      <el-option
+        v-for="x in SEVERITY_VALUES"
+        :key="x"
+        :label="x"
+        :value="x"
+      />
     </el-select>
     <el-date-picker
       v-model="dateRange"
@@ -84,9 +99,18 @@ function update<K extends keyof FilterState>(k: K, v: FilterState[K]) {
       style="width: 240px"
     />
     <div class="filter-actions">
-      <el-button type="primary" @click="emit('apply')">筛选</el-button>
-      <el-button @click="emit('clear')">清空</el-button>
-      <el-button @click="emit('export')">导出 CSV</el-button>
+      <el-button
+        type="primary"
+        @click="emit('apply')"
+      >
+        筛选
+      </el-button>
+      <el-button @click="emit('clear')">
+        清空
+      </el-button>
+      <el-button @click="emit('export')">
+        导出 CSV
+      </el-button>
     </div>
   </div>
 </template>

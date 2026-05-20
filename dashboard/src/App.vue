@@ -6,17 +6,32 @@ const { healthy } = useApiHealth()
 <template>
   <div class="layout">
     <header class="layout-header">
-      <div class="layout-brand">反馈台</div>
+      <div class="layout-brand">
+        反馈台
+      </div>
       <div class="layout-status">
-        <span class="status-dot" :class="{ down: !healthy }"></span>
+        <span
+          class="status-dot"
+          :class="{ down: !healthy }"
+        />
         <span class="status-text muted">{{ healthy ? '正常' : '异常' }}</span>
       </div>
     </header>
     <div class="layout-body">
       <aside class="layout-sider">
         <nav class="nav">
-          <router-link to="/" class="nav-item">概览</router-link>
-          <router-link to="/list" class="nav-item">反馈列表</router-link>
+          <router-link
+            to="/"
+            class="nav-item"
+          >
+            概览
+          </router-link>
+          <router-link
+            to="/list"
+            class="nav-item"
+          >
+            反馈列表
+          </router-link>
         </nav>
       </aside>
       <main class="layout-main">

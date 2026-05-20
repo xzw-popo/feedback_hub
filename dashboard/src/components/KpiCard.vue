@@ -6,11 +6,20 @@ defineProps<{ title: string; value: string | number; tooltip?: string }>()
   <div class="card kpi">
     <div class="kpi-title">
       {{ title }}
-      <el-tooltip v-if="tooltip" :content="tooltip" placement="top">
-        <span class="kpi-hint" :title="tooltip">ⓘ</span>
+      <el-tooltip
+        v-if="tooltip"
+        :content="tooltip"
+        placement="top"
+      >
+        <span
+          class="kpi-hint"
+          :title="tooltip"
+        >ⓘ</span>
       </el-tooltip>
     </div>
-    <div class="kpi-value font-mono">{{ value }}</div>
+    <div class="kpi-value font-mono">
+      {{ value }}
+    </div>
   </div>
 </template>
 

@@ -9,9 +9,9 @@ export function useUrlQuery<T extends Record<string, string>>(defaults: T): T {
   for (const k of Object.keys(defaults) as (keyof T)[]) {
     const fromUrl = route.query[k as string]
     if (typeof fromUrl === 'string' && fromUrl !== '') {
-      ;(initial as Record<string, string>)[k as string] = fromUrl
+      (initial as Record<string, string>)[k as string] = fromUrl
     } else {
-      ;(initial as Record<string, string>)[k as string] = defaults[k]
+      (initial as Record<string, string>)[k as string] = defaults[k]
     }
   }
 
