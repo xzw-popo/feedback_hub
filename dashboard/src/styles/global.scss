@@ -1,0 +1,39 @@
+:root {
+  --bg: #f7f8fa;
+  --bg-card: #ffffff;
+  --border: #e5e7eb;
+  --text: #1f2937;
+  --text-muted: #6b7280;
+  --primary: #3b82f6;
+  --primary-hover: #2563eb;
+  --success: #10b981;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.font-mono { font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace; }
+
+.card {
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  padding: 16px;
+  transition: box-shadow 0.2s;
+  &:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06); }
+}
+
+.page { padding: 24px; }
+.page-title { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+.muted { color: var(--text-muted); }
