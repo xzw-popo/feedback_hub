@@ -171,3 +171,60 @@ def test_update_conversation_assignment(conn):
         "SELECT conversation_id, msg_seq FROM feedback WHERE feedback_id='fb_001'"
     ).fetchone()
     assert tuple(got) == ("conv_new", 7)
+
+
+# ----------------------------- push_log --------------------------------
+
+def test_push_log_table_exists(conn):
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+    names = {r[0] for r in rows}
+    assert "push_log" in names
+
+
+def test_insert_push_log_returns_id(conn):
+    pid = db.insert_push_log(conn, {
+        "push_date": "2026-05-22", "rank": 1,
+        "signature": "crash|输入核心|5.4",
+        "group_id": "crash", "primary_l2": "输入核心", "major_version": "5.4",
+        "representative_conversation_id": "c1", "representative_feedback_id": "f1",
+        "score": 42.0, "dup_count": 12, "p0_count": 8, "cross_version": 1,
+        "affected_versions": "5.4.0:3|5.4.1:9",
+        "representative_text": "微信里打字突然闪退",
+        "created_at": int(time.time()), "delivered_at": None, "is_empty": 0,
+    })
+    assert isinstance(pid, int) and pid > 0
+
+
+def test_update_push_log_delivered(conn):
+    pid = db.insert_push_log(conn, {
+        "push_date": "2026-05-22", "rank": 1, "signature": "x",
+        "group_id": "x", "primary_l2": "x", "major_version": "x",
+        "representative_conversation_id": "c", "representative_feedback_id": "f",
+        "score": 1.0, "dup_count": 1, "p0_count": 1, "cross_version": 0,
+        "affected_versions": "1.0:1", "representative_text": "t",
+        "created_at": 100, "delivered_at": None, "is_empty": 0,
+    })
+    db.update_push_log_delivered(conn, pid, 200)
+    row = conn.execute(
+        "SELECT delivered_at FROM push_log WHERE id=?", (pid,),
+    ).fetchone()
+    assert row["delivered_at"] == 200
+
+
+def test_push_log_is_empty_placeholder(conn):
+    pid = db.insert_push_log(conn, {
+        "push_date": "2026-05-22", "rank": 0,
+        "signature": None, "group_id": None, "primary_l2": None,
+        "major_version": None,
+        "representative_conversation_id": None, "representative_feedback_id": None,
+        "score": None, "dup_count": None, "p0_count": None, "cross_version": None,
+        "affected_versions": None, "representative_text": None,
+        "created_at": 100, "delivered_at": None, "is_empty": 1,
+    })
+    row = conn.execute(
+        "SELECT is_empty, signature FROM push_log WHERE id=?", (pid,),
+    ).fetchone()
+    assert row["is_empty"] == 1
+    assert row["signature"] is None

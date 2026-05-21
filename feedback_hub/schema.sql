@@ -78,3 +78,29 @@ CREATE TABLE IF NOT EXISTS label_history (
     created_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_target ON label_history(target_type, target_id);
+
+-- 5. 推送日志（spec 阶段 2 §5.1）：每日 Top Bug 推送的审计 + 未来 A→B 升级钩子
+CREATE TABLE IF NOT EXISTS push_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    push_date       TEXT NOT NULL,                       -- 'YYYY-MM-DD'
+    rank            INTEGER NOT NULL,                    -- 1~5；is_empty=1 时为 0 占位
+    signature       TEXT,                                -- 'group|primary_l2|major_version'
+    group_id        TEXT,
+    primary_l2      TEXT,
+    major_version   TEXT,
+    representative_conversation_id TEXT,                 -- 代表会话
+    representative_feedback_id     TEXT,                 -- 代表消息（confidence 最高那条）
+    score           REAL,
+    dup_count       INTEGER,
+    p0_count        INTEGER,
+    cross_version   INTEGER,                             -- 0/1
+    affected_versions TEXT,                              -- '5.4.1:9|5.4.0:3' 形式
+    representative_text TEXT,                            -- 群里展示的引用原文
+    created_at      INTEGER NOT NULL,                    -- 候选生成时间
+    delivered_at    INTEGER,                             -- 推送成功时间，NULL=未送达
+    is_empty        INTEGER NOT NULL DEFAULT 0           -- 1=当日 0 候选的占位行
+);
+CREATE INDEX IF NOT EXISTS idx_pushlog_date    ON push_log(push_date);
+CREATE INDEX IF NOT EXISTS idx_pushlog_sig     ON push_log(signature);
+CREATE INDEX IF NOT EXISTS idx_pushlog_repconv ON push_log(representative_conversation_id);
+CREATE INDEX IF NOT EXISTS idx_pushlog_repmsg  ON push_log(representative_feedback_id);

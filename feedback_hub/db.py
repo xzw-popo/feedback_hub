@@ -159,3 +159,37 @@ def delete_conversation_label(conn: sqlite3.Connection, conversation_id: str) ->
         "DELETE FROM conversation_label WHERE conversation_id = ?",
         (conversation_id,),
     )
+
+
+# ----------------------------- push_log ---------------------------------
+
+# 顺序与 schema.sql 中 push_log 表的字段顺序保持一致（不含自增 id）
+PUSH_LOG_COLUMNS: tuple[str, ...] = (
+    "push_date", "rank", "signature",
+    "group_id", "primary_l2", "major_version",
+    "representative_conversation_id", "representative_feedback_id",
+    "score", "dup_count", "p0_count", "cross_version",
+    "affected_versions", "representative_text",
+    "created_at", "delivered_at", "is_empty",
+)
+
+
+def insert_push_log(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
+    """插入一条推送日志，返回自增 id。"""
+    placeholders = ", ".join("?" * len(PUSH_LOG_COLUMNS))
+    cols = ", ".join(PUSH_LOG_COLUMNS)
+    vals = tuple(row.get(c) for c in PUSH_LOG_COLUMNS)
+    cur = conn.execute(
+        f"INSERT INTO push_log ({cols}) VALUES ({placeholders})", vals,
+    )
+    return int(cur.lastrowid)
+
+
+def update_push_log_delivered(
+    conn: sqlite3.Connection, push_log_id: int, delivered_at: int,
+) -> None:
+    """标记一条 push_log 为已送达。"""
+    conn.execute(
+        "UPDATE push_log SET delivered_at = ? WHERE id = ?",
+        (delivered_at, push_log_id),
+    )
