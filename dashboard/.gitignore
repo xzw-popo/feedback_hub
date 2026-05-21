@@ -2,3 +2,9 @@ node_modules
 dist
 .DS_Store
 *.local
+*.tsbuildinfo
+# vue-tsc -b composite project emit artifacts
+vite.config.js
+vite.config.d.ts
+vitest.config.js
+vitest.config.d.ts
