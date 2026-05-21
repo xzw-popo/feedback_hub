@@ -54,3 +54,12 @@ def ensure_dirs() -> None:
     """启动期调用，确保数据目录存在。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Pusher（spec 阶段 2）----------
+KW_GROUPS_PATH: Path = PKG_DIR / "pusher" / "kw_groups.yaml"
+
+
+def get_webhook_url() -> str | None:
+    """企微群机器人 webhook URL；优先取环境变量 WECHAT_WEBHOOK_URL。"""
+    return os.environ.get("WECHAT_WEBHOOK_URL")

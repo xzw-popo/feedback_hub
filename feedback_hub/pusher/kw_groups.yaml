@@ -1,0 +1,46 @@
+# =============================================================================
+# kw_groups.yaml —— Bug 关键词分组 + 优先级 + 评分权重 + 显示名
+# spec 阶段 2 §2.1 / §2.2 / §3.4 / §4.1
+# 修改后无需改代码，重启进程即可生效。
+# =============================================================================
+
+groups:
+  crash:
+    keywords: [闪退, 崩溃, crash, 打不开, 无法启动, 启动不了, 白屏, 黑屏, 自动退出, 重启]
+  input_dead:
+    keywords: [无法输入, 输入不了, 打不出字, 敲不了字, 失灵, 失效]
+  unusable:
+    keywords: [用不了, 无法使用, 完全不能用, 完全用不了]
+  lag:
+    keywords: [卡死, 卡住, 卡顿, 反应慢, 延迟]
+  power:
+    keywords: [发烫, 耗电, 掉电]
+  garbled:
+    keywords: [乱码, 错位, 错乱, 丢字, 漏字, 显示不全]
+  missing:
+    keywords: [不显示, 看不到, 消失了, 找不到]
+  generic_bug:
+    keywords: [bug, BUG, 故障, 异常]
+
+# 具体组集合（用于"generic_bug 让位"判定）
+specific_groups: [crash, input_dead, unusable, lag, power, garbled, missing]
+
+# 多组命中时的优先级（越靠前越优先）
+priority_order: [crash, input_dead, unusable, garbled, lag, power, missing]
+
+# 评分权重（spec §3.4）
+scoring:
+  w_dup_count: 3.0      # 重复会话数（影响面，核心）
+  w_p0_count: 2.0       # P0 子项数（严重度加成）
+  w_cross_version: 5.0  # 跨版本（强信号）
+  w_recent_24h: 2.0     # 24h 内出现（新鲜度）
+
+# 群里展示用的中文组名
+display_names:
+  crash: 闪退类
+  input_dead: 输入失效
+  unusable: 整体不可用
+  lag: 卡顿延迟
+  power: 发热耗电
+  garbled: 内容错乱
+  missing: 元素消失
