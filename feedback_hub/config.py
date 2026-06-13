@@ -63,3 +63,7 @@ KW_GROUPS_PATH: Path = PKG_DIR / "pusher" / "kw_groups.yaml"
 def get_webhook_url() -> str | None:
     """企微群机器人 webhook URL；优先取环境变量 WECHAT_WEBHOOK_URL。"""
     return os.environ.get("WECHAT_WEBHOOK_URL")
+
+
+# ---------- 导入 API ----------
+IMPORT_TOKEN: str = os.environ.get("IMPORT_TOKEN", "")

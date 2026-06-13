@@ -8,8 +8,7 @@
     GET /api/export.csv                —— CSV 导出（与 /api/conversations 同筛选）
 
 约束：
-- 单文件，~250 行内
-- 直接 sqlite3 标准库
+- 支持 SQLite 和 MySQL 两种后端（通过 DB_MODE 环境变量切换）
 - 无鉴权（内网工具）
 - 不实现 POST/PATCH（schema 预留 label_history，下一期再做）
 """
@@ -17,8 +16,8 @@ from __future__ import annotations
 
 import csv
 import io
-import sqlite3
-from datetime import datetime, timezone
+import os
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -27,6 +26,17 @@ from fastapi.responses import StreamingResponse
 
 from feedback_hub import db
 from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
+from feedback_hub.importer import router as import_router
+
+
+def _ph1() -> str:
+    """单参数占位符。"""
+    return "%s" if db._db_mode() == "mysql" else "?"
+
+
+def _ph_n(n: int) -> str:
+    """多参数占位符列表。"""
+    return db._ph(n)
 
 
 def _parse_dt(s: Optional[str], *, end_of_day: bool = False) -> Optional[int]:
@@ -53,37 +63,58 @@ def _l2_split(s: Optional[str]) -> list[str]:
     return [x for x in s.split("|") if x]
 
 
-def _conv_to_item(r: sqlite3.Row, preview_text: str) -> dict:
+def _row_val(row: Any, key: str) -> Any:
+    """兼容 sqlite3.Row 和 pymysql DictCursor 的字段读取。"""
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[key]
+
+
+def _conv_to_item(r: Any, preview_text: str) -> dict:
     return {
-        "conversation_id": r["conversation_id"],
-        "L1": r["L1"],
-        "L2": _l2_split(r["L2"]),
-        "severity": r["severity"],
-        "confidence": r["confidence"],
-        "reason": r["reason"],
-        "msg_count": r["msg_count"],
-        "first_ts_ms": r["first_ts_ms"],
-        "last_ts_ms": r["last_ts_ms"],
-        "user_vid": r["user_vid"],
-        "appversion": r["appversion"],
-        "channel": r["channel"],
+        "conversation_id": _row_val(r, "conversation_id"),
+        "L1": _row_val(r, "L1"),
+        "L2": _l2_split(_row_val(r, "L2")),
+        "severity": _row_val(r, "severity"),
+        "confidence": _row_val(r, "confidence"),
+        "reason": _row_val(r, "reason"),
+        "msg_count": _row_val(r, "msg_count"),
+        "first_ts_ms": _row_val(r, "first_ts_ms"),
+        "last_ts_ms": _row_val(r, "last_ts_ms"),
+        "user_vid": _row_val(r, "user_vid"),
+        "appversion": _row_val(r, "appversion"),
+        "channel": _row_val(r, "channel"),
         "preview_text": preview_text,
     }
+
+
+def _get_cors_origins() -> list[str]:
+    """从环境变量 CORS_ORIGINS 读取允许的 Origin 列表。
+
+    格式：逗号分隔，如 "http://localhost:5173,https://example.com"
+    未设置时回退到本地开发默认值。
+    """
+    env_val = os.environ.get("CORS_ORIGINS", "")
+    if env_val.strip():
+        return [o.strip() for o in env_val.split(",") if o.strip()]
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     app = FastAPI(title="feedback_hub", version="1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        ],
-        allow_methods=["GET"],
+        allow_origins=_get_cors_origins(),
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
+    # 注册导入 API（POST /api/import）
+    app.include_router(import_router)
 
-    def _conn() -> sqlite3.Connection:
+    def _conn() -> Any:
         c = db.connect(db_path) if db_path else db.connect()
         return c
 
@@ -94,60 +125,68 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
+        ph = _ph1()
         f_ms = _parse_dt(from_)
         t_ms = _parse_dt(to, end_of_day=True)
         if f_ms is not None:
-            clauses.append("cl.last_ts_ms >= ?")
+            clauses.append(f"cl.last_ts_ms >= {ph}")
             params.append(f_ms)
         if t_ms is not None:
-            clauses.append("cl.last_ts_ms <= ?")
+            clauses.append(f"cl.last_ts_ms <= {ph}")
             params.append(t_ms)
         if L1:
             if L1 not in L1_VALUES:
                 raise HTTPException(status_code=400, detail=f"非法 L1：{L1}")
-            clauses.append("cl.L1 = ?")
+            clauses.append(f"cl.L1 = {ph}")
             params.append(L1)
         if L2:
             if L2 not in L2_VALUES:
                 raise HTTPException(status_code=400, detail=f"非法 L2：{L2}")
-            clauses.append("cl.L2 LIKE ?")
+            clauses.append(f"cl.L2 LIKE {ph}")
             params.append(f"%{L2}%")
         if severity:
             if severity not in SEVERITY_VALUES:
                 raise HTTPException(status_code=400, detail=f"非法 severity：{severity}")
-            clauses.append("cl.severity = ?")
+            clauses.append(f"cl.severity = {ph}")
             params.append(severity)
         if q:
-            clauses.append("cl.conversation_id IN ("
-                           "SELECT DISTINCT conversation_id FROM feedback WHERE text LIKE ?)")
+            clauses.append(f"cl.conversation_id IN ("
+                           f"SELECT DISTINCT conversation_id FROM feedback WHERE text LIKE {ph})")
             params.append(f"%{q}%")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
     def _query_conversations(
         from_, to, L1, L2, severity, q, limit, offset,
-    ) -> tuple[int, list[sqlite3.Row]]:
+    ) -> tuple[int, list[Any]]:
         where, params = _build_filters(from_, to, L1, L2, severity, q)
+        is_mysql = db._db_mode() == "mysql"
         with _conn() as conn:
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM conversation_label cl {where}", params
-            ).fetchone()[0]
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM conversation_label cl {where}", params
+            ).fetchone()
+            total = total_row["cnt"] if is_mysql else total_row[0]
+
+            ph = _ph1()
             rows = conn.execute(
                 f"SELECT cl.* FROM conversation_label cl {where} "
-                f"ORDER BY cl.last_ts_ms DESC LIMIT ? OFFSET ?",
+                f"ORDER BY cl.last_ts_ms DESC LIMIT {ph} OFFSET {ph}",
                 params + [limit, offset],
             ).fetchall()
             preview_map: dict[str, str] = {}
             if rows:
-                ids = [r["conversation_id"] for r in rows]
-                placeholders = ",".join("?" * len(ids))
+                ids = [_row_val(r, "conversation_id") for r in rows]
+                placeholders = _ph_n(len(ids))
                 cur = conn.execute(
                     f"SELECT conversation_id, text FROM feedback "
                     f"WHERE conversation_id IN ({placeholders}) AND msg_seq = 0",
-                    ids,
+                    tuple(ids),
                 )
-                preview_map = {r[0]: (r[1] or "")[:80] for r in cur.fetchall()}
-            items = [_conv_to_item(r, preview_map.get(r["conversation_id"], "")) for r in rows]
+                for r in cur.fetchall():
+                    cid = r["conversation_id"] if is_mysql else r[0]
+                    txt = (r["text"] if is_mysql else r[1]) or ""
+                    preview_map[cid] = txt[:80]
+            items = [_conv_to_item(r, preview_map.get(_row_val(r, "conversation_id"), "")) for r in rows]
         return total, items
 
     @app.get("/api/conversations")
@@ -170,36 +209,37 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/api/conversations/{conv_id}")
     def get_conversation(conv_id: str):
+        ph = _ph1()
         with _conn() as conn:
             cl = conn.execute(
-                "SELECT * FROM conversation_label WHERE conversation_id = ?",
+                f"SELECT * FROM conversation_label WHERE conversation_id = {ph}",
                 (conv_id,),
             ).fetchone()
             if cl is None:
                 raise HTTPException(status_code=404, detail="conversation not found")
             msg_rows = conn.execute(
-                "SELECT f.feedback_id, f.msg_seq, f.ts_ms, f.text, f.appversion, f.platform, "
-                "ml.L1, ml.L2, ml.severity, ml.confidence, ml.reason, ml.source, ml.rule_name "
-                "FROM feedback f LEFT JOIN message_label ml ON f.feedback_id = ml.feedback_id "
-                "WHERE f.conversation_id = ? ORDER BY f.msg_seq ASC",
+                f"SELECT f.feedback_id, f.msg_seq, f.ts_ms, f.text, f.appversion, f.platform, "
+                f"ml.L1, ml.L2, ml.severity, ml.confidence, ml.reason, ml.source, ml.rule_name "
+                f"FROM feedback f LEFT JOIN message_label ml ON f.feedback_id = ml.feedback_id "
+                f"WHERE f.conversation_id = {ph} ORDER BY f.msg_seq ASC",
                 (conv_id,),
             ).fetchall()
         return {
             "conversation": _conv_to_item(cl, ""),
             "messages": [{
-                "feedback_id": r["feedback_id"],
-                "msg_seq": r["msg_seq"],
-                "ts_ms": r["ts_ms"],
-                "text": r["text"],
-                "appversion": r["appversion"],
-                "platform": r["platform"],
-                "L1": r["L1"],
-                "L2": _l2_split(r["L2"]),
-                "severity": r["severity"],
-                "confidence": r["confidence"],
-                "reason": r["reason"],
-                "source": r["source"],
-                "rule_name": r["rule_name"],
+                "feedback_id": _row_val(r, "feedback_id"),
+                "msg_seq": _row_val(r, "msg_seq"),
+                "ts_ms": _row_val(r, "ts_ms"),
+                "text": _row_val(r, "text"),
+                "appversion": _row_val(r, "appversion"),
+                "platform": _row_val(r, "platform"),
+                "L1": _row_val(r, "L1"),
+                "L2": _l2_split(_row_val(r, "L2")),
+                "severity": _row_val(r, "severity"),
+                "confidence": _row_val(r, "confidence"),
+                "reason": _row_val(r, "reason"),
+                "source": _row_val(r, "source"),
+                "rule_name": _row_val(r, "rule_name"),
             } for r in msg_rows],
         }
 
@@ -209,19 +249,27 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         to: Optional[str] = None,
     ):
         where, params = _build_filters(from_, to, None, None, None, None)
+        is_mysql = db._db_mode() == "mysql"
         with _conn() as conn:
-            l1 = {r[0]: r[1] for r in conn.execute(
-                f"SELECT cl.L1, COUNT(*) FROM conversation_label cl {where} GROUP BY cl.L1",
-                params).fetchall()}
-            sev = {r[0]: r[1] for r in conn.execute(
-                f"SELECT cl.severity, COUNT(*) FROM conversation_label cl {where} GROUP BY cl.severity",
-                params).fetchall()}
+            l1_rows = conn.execute(
+                f"SELECT cl.L1, COUNT(*) AS cnt FROM conversation_label cl {where} GROUP BY cl.L1",
+                params,
+            ).fetchall()
+            l1 = {_row_val(r, "L1"): _row_val(r, "cnt") for r in l1_rows}
+
+            sev_rows = conn.execute(
+                f"SELECT cl.severity, COUNT(*) AS cnt FROM conversation_label cl {where} GROUP BY cl.severity",
+                params,
+            ).fetchall()
+            sev = {_row_val(r, "severity"): _row_val(r, "cnt") for r in sev_rows}
+
             # L2 union 需要拆 '|' —— 简单做法：取所有 L2 列，python 端展开
             l2_cnt: dict[str, int] = {}
             cur = conn.execute(
                 f"SELECT cl.L2 FROM conversation_label cl {where}", params
             )
-            for (l2_str,) in cur.fetchall():
+            for r in cur.fetchall():
+                l2_str = r["L2"] if is_mysql else r[0]
                 for tag in _l2_split(l2_str):
                     l2_cnt[tag] = l2_cnt.get(tag, 0) + 1
         return {"L1": l1, "L2": l2_cnt, "severity": sev}
@@ -236,13 +284,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="granularity 仅支持 hour|day")
         fmt = "%Y-%m-%d %H:00" if granularity == "hour" else "%Y-%m-%d"
         where, params = _build_filters(from_, to, None, None, None, None)
+        is_mysql = db._db_mode() == "mysql"
         with _conn() as conn:
             cur = conn.execute(
                 f"SELECT cl.last_ts_ms, cl.L1 FROM conversation_label cl {where} "
                 f"ORDER BY cl.last_ts_ms ASC", params,
             )
             buckets: dict[str, dict[str, int]] = {}
-            for ts_ms, l1 in cur.fetchall():
+            for r in cur.fetchall():
+                ts_ms = r["last_ts_ms"] if is_mysql else r[0]
+                l1 = r["L1"] if is_mysql else r[1]
                 bucket = datetime.fromtimestamp(ts_ms / 1000).strftime(fmt)
                 buckets.setdefault(bucket, {})
                 buckets[bucket][l1] = buckets[bucket].get(l1, 0) + 1

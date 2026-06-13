@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.feedback_hub.daily_sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/auto_daily.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/logs/launchd_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/logs/launchd_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>IMPORT_TOKEN</key>
+        <string>CHANGE_ME</string>
+        <key>FEEDBACK_API_URL</key>
+        <string>https://feedback-api-269678-9-1442771950.sh.run.tcloudbase.com</string>
+    </dict>
+</dict>
+</plist>
