@@ -3,7 +3,11 @@ import { ref, computed, onMounted } from 'vue'
 import dayjs from 'dayjs'
 import FilterBar from '@/components/FilterBar.vue'
 import ConversationTable from '@/components/ConversationTable.vue'
+import SmartSearch from '@/components/SmartSearch.vue'
+import KeywordBuilder from '@/components/KeywordBuilder.vue'
+import FineFilterButton from '@/components/FineFilterButton.vue'
 import { useUrlQuery } from '@/composables/useUrlQuery'
+import { provideSearchState } from '@/composables/useSearchState'
 import {
   listConversations,
   exportCsvUrl,
@@ -15,7 +19,6 @@ const defaultFrom = dayjs().subtract(7, 'day').format('YYYY-MM-DD')
 const defaultTo = dayjs().format('YYYY-MM-DD')
 
 const url = useUrlQuery({
-  q: '',
   L1: '',
   L2: '',
   severity: '',
@@ -25,11 +28,13 @@ const url = useUrlQuery({
   pageSize: '50',
 })
 
+// 搜索状态
+const searchState = provideSearchState()
+
 // 给 FilterBar 用的 v-model 对象（不含 page/pageSize）
 const filterState = computed({
   get() {
     return {
-      q: url.q,
       L1: url.L1,
       L2: url.L2,
       severity: url.severity,
@@ -38,7 +43,6 @@ const filterState = computed({
     }
   },
   set(v) {
-    url.q = v.q
     url.L1 = v.L1
     url.L2 = v.L2
     url.severity = v.severity
@@ -47,15 +51,37 @@ const filterState = computed({
   },
 })
 
-const items = ref<ConversationItem[]>([])
-const total = ref(0)
-const loading = ref(false)
+// 元数据筛选参数（传给搜索组件）
+const metadataFilters = computed(() => ({
+  from: url.from || undefined,
+  to: url.to || undefined,
+  L1: url.L1 || undefined,
+  L2: url.L2 || undefined,
+  severity: url.severity || undefined,
+}))
+
+// 常规列表浏览数据
+const normalItems = ref<ConversationItem[]>([])
+const normalTotal = ref(0)
+const normalLoading = ref(false)
+
+// 展示数据：如果有搜索结果则用搜索结果，否则用常规浏览
+const displayItems = computed(() =>
+  searchState.hasAnySearch.value ? searchState.state.items : normalItems.value
+)
+const displayTotal = computed(() =>
+  searchState.hasAnySearch.value ? searchState.state.total : normalTotal.value
+)
+const displayLoading = computed(() =>
+  searchState.hasAnySearch.value
+    ? searchState.state.smartLoading || searchState.state.keywordLoading
+    : normalLoading.value
+)
 
 function buildParams(): ListParams {
   const page = Number(url.page) || 1
   const pageSize = Number(url.pageSize) || 50
   return {
-    q: url.q || undefined,
     L1: url.L1 || undefined,
     L2: url.L2 || undefined,
     severity: url.severity || undefined,
@@ -67,13 +93,15 @@ function buildParams(): ListParams {
 }
 
 async function load() {
-  loading.value = true
+  // 如果有搜索条件，则由搜索组件管理数据，不走常规加载
+  if (searchState.hasAnySearch.value) return
+  normalLoading.value = true
   try {
     const r = await listConversations(buildParams())
-    items.value = r.items
-    total.value = r.total
+    normalItems.value = r.items
+    normalTotal.value = r.total
   } finally {
-    loading.value = false
+    normalLoading.value = false
   }
 }
 
@@ -83,19 +111,18 @@ function onApply() {
 }
 
 function onClear() {
-  url.q = ''
   url.L1 = ''
   url.L2 = ''
   url.severity = ''
   url.from = defaultFrom
   url.to = defaultTo
   url.page = '1'
+  searchState.clearAllSearch()
   void load()
 }
 
 function onExport() {
   const u = exportCsvUrl({
-    q: url.q || undefined,
     L1: url.L1 || undefined,
     L2: url.L2 || undefined,
     severity: url.severity || undefined,
@@ -116,6 +143,12 @@ function onSizeChange(s: number) {
   void load()
 }
 
+// 关键词构建器的 newKeywords 状态
+const newKeywords = ref<Record<number, string>>({})
+
+// 手动选取关键词折叠状态
+const manualKeywordsOpen = ref<string[]>([])
+
 onMounted(() => {
   void load()
 })
@@ -134,18 +167,44 @@ onMounted(() => {
       @export="onExport"
     />
 
+    <!-- 智能搜索区域 -->
+    <div class="search-section card">
+      <SmartSearch :filters="metadataFilters" />
+
+      <el-collapse v-model="manualKeywordsOpen" class="manual-keywords-collapse">
+        <el-collapse-item name="open">
+          <template #title>
+            <span class="collapse-title">手动选取关键词</span>
+          </template>
+          <KeywordBuilder
+            v-model:new-keywords="newKeywords"
+            :filters="metadataFilters"
+          />
+        </el-collapse-item>
+      </el-collapse>
+    </div>
+
     <div class="card table-card">
+      <div class="table-header">
+        <span class="muted">共 {{ displayTotal }} 条</span>
+        <FineFilterButton />
+      </div>
       <ConversationTable
-        :items="items"
-        :loading="loading"
+        :items="displayItems"
+        :loading="displayLoading"
+        :ai-scores="searchState.state.aiScores"
+        :fine-filtering="searchState.state.fineFiltering"
       />
 
-      <div class="pager">
-        <span class="muted">共 {{ total }} 条</span>
+      <div
+        v-if="!searchState.hasAnySearch.value"
+        class="pager"
+      >
+        <span class="muted">共 {{ normalTotal }} 条</span>
         <el-pagination
           background
           layout="prev, pager, next, sizes"
-          :total="total"
+          :total="normalTotal"
           :page-sizes="[20, 50, 100]"
           :page-size="Number(url.pageSize) || 50"
           :current-page="Number(url.page) || 1"
@@ -158,8 +217,43 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.search-section {
+  margin-top: 16px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.manual-keywords-collapse {
+  border: none;
+  margin-top: 4px;
+}
+.manual-keywords-collapse :deep(.el-collapse-item__header) {
+  border-bottom: none;
+  background: transparent;
+  height: 32px;
+  line-height: 32px;
+  padding: 0;
+}
+.manual-keywords-collapse :deep(.el-collapse-item__wrap) {
+  border-bottom: none;
+  background: transparent;
+}
+.manual-keywords-collapse :deep(.el-collapse-item__content) {
+  padding: 0;
+}
+.collapse-title {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
 .table-card {
   margin-top: 16px;
+}
+.table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
 }
 .pager {
   margin-top: 16px;

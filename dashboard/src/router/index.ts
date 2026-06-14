@@ -1,7 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
-  { path: '/', name: 'overview', component: () => import('@/views/Overview.vue') },
+  { path: '/', name: 'simple-list', component: () => import('@/views/SimpleList.vue') },
+  { path: '/overview', name: 'overview', component: () => import('@/views/Overview.vue') },
   { path: '/list', name: 'list', component: () => import('@/views/List.vue') },
   {
     path: '/feedback/:id',

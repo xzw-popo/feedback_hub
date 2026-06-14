@@ -24,13 +24,19 @@ const { healthy } = useApiHealth()
             to="/"
             class="nav-item"
           >
+            反馈列表
+          </router-link>
+          <router-link
+            to="/overview"
+            class="nav-item"
+          >
             概览
           </router-link>
           <router-link
             to="/list"
             class="nav-item"
           >
-            反馈列表
+            标签列表
           </router-link>
         </nav>
       </aside>
