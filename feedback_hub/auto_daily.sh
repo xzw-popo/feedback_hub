@@ -188,31 +188,43 @@ print(total)
         exit 0
     fi
 
-    # 步骤 5：POST /api/import
+    # 步骤 5：POST /api/import（带重试）
     log "步骤 5/6: 同步到云端..."
     if [[ -z "$IMPORT_TOKEN" ]]; then
         die "IMPORT_TOKEN 环境变量未设置"
     fi
 
-    local IMPORT_RESPONSE
-    IMPORT_RESPONSE=$(curl -s -X POST \
-        -H "Content-Type: application/json" \
-        -d @"$EXPORT_FILE" \
-        "$API_BASE/api/import" \
-        --max-time 120 \
-        -w "\n%{http_code}" 2>&1) || die "HTTP 请求失败"
+    local MAX_IMPORT_RETRIES=3
+    local IMPORT_RETRY_DELAY=10
+    local IMPORT_RESPONSE=""
+    local HTTP_CODE=""
 
-    local HTTP_CODE
-    HTTP_CODE=$(echo "$IMPORT_RESPONSE" | tail -1)
-    local BODY
-    BODY=$(echo "$IMPORT_RESPONSE" | sed '$d')
+    for attempt in $(seq 1 $MAX_IMPORT_RETRIES); do
+        IMPORT_RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d @"$EXPORT_FILE" \
+            "$API_BASE/api/import" \
+            --max-time 120 \
+            -w "\n%{http_code}" 2>&1) || true
 
-    log "API 响应: HTTP $HTTP_CODE"
-    log "响应体: $BODY"
+        HTTP_CODE=$(echo "$IMPORT_RESPONSE" | tail -1)
+        local BODY
+        BODY=$(echo "$IMPORT_RESPONSE" | sed '$d')
 
-    if [[ "$HTTP_CODE" != "200" ]]; then
-        die "导入失败: HTTP $HTTP_CODE - $BODY"
-    fi
+        log "API 响应 (尝试 $attempt/$MAX_IMPORT_RETRIES): HTTP $HTTP_CODE"
+
+        if [[ "$HTTP_CODE" == "200" ]]; then
+            log "响应体: $BODY"
+            break
+        fi
+
+        if [[ $attempt -lt $MAX_IMPORT_RETRIES ]]; then
+            log "重试 ${IMPORT_RETRY_DELAY}s 后..."
+            sleep "$IMPORT_RETRY_DELAY"
+        else
+            die "导入失败（已重试 $MAX_IMPORT_RETRIES 次）: HTTP $HTTP_CODE - $BODY"
+        fi
+    done
 
     # 检查部分失败
     local HAS_ERRORS

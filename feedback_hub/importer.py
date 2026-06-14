@@ -62,6 +62,9 @@ def _batch_upsert_mysql(
     if not rows:
         return 0, 0
 
+    # 过滤掉不在 columns 中的字段，防止多余 key 导致问题
+    clean_rows = [{c: row.get(c) for c in columns} for row in rows]
+
     cols = ", ".join(columns)
     ph = ", ".join(["%s"] * len(columns))
     update_cols = ", ".join(f"{c}=VALUES({c})" for c in columns)
@@ -71,9 +74,9 @@ def _batch_upsert_mysql(
     upserted = 0
     errors = 0
 
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i:i + BATCH_SIZE]
-        vals = [tuple(row.get(c) for c in columns) for row in batch]
+    for i in range(0, len(clean_rows), BATCH_SIZE):
+        batch = clean_rows[i:i + BATCH_SIZE]
+        vals = [tuple(row[c] for c in columns) for row in batch]
         try:
             with conn.cursor() as cur:
                 cur.executemany(sql, vals)
@@ -81,8 +84,18 @@ def _batch_upsert_mysql(
             upserted += len(batch)
         except Exception as e:
             conn.rollback()
-            logger.error(f"[import] {table} batch {i // BATCH_SIZE} failed: {e}")
-            errors += len(batch)
+            # 尝试逐条插入以定位错误行
+            for j, val in enumerate(vals):
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, val)
+                    conn.commit()
+                    upserted += 1
+                except Exception as e2:
+                    conn.rollback()
+                    logger.error(f"[import] {table} row {i+j} failed: {e2}")
+                    errors += 1
+            logger.error(f"[import] {table} batch {i // BATCH_SIZE} partial failure: {e}")
 
     return upserted, errors
 
