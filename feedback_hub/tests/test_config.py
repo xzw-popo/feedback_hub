@@ -1,6 +1,7 @@
 """验证 config 模块的常量、路径与函数。"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from feedback_hub import config
@@ -39,6 +40,35 @@ def test_get_agent_key_uses_env(monkeypatch):
 def test_get_agent_key_falls_back_to_default(monkeypatch):
     monkeypatch.delenv("WINK_AGENT_KEY", raising=False)
     assert config.get_agent_key() == ""
+
+
+def test_load_dotenv_sets_missing_values(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOTENV_TEST_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join([
+            "# comment",
+            "DOTENV_TEST_KEY='loaded value'",
+            "export DOTENV_EXPORTED=value2",
+            "INVALID_LINE",
+        ]),
+        encoding="utf-8",
+    )
+
+    config._load_dotenv(env_file)
+
+    assert os.environ["DOTENV_TEST_KEY"] == "loaded value"
+    assert os.environ["DOTENV_EXPORTED"] == "value2"
+
+
+def test_load_dotenv_does_not_override_existing_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOTENV_KEEP_KEY", "from-shell")
+    env_file = tmp_path / ".env"
+    env_file.write_text('DOTENV_KEEP_KEY="from-file"', encoding="utf-8")
+
+    config._load_dotenv(env_file)
+
+    assert os.environ["DOTENV_KEEP_KEY"] == "from-shell"
 
 
 def test_gap_seconds_is_30_minutes():
