@@ -26,7 +26,7 @@
 | 环境ID | `feedback7-d3gz69ofw321c4da5`（ap-shanghai） |
 | MySQL 地址 | `172.17.0.7:3306`（内网，仅 VPC 内可访问） |
 | MySQL Schema | `feedback7-d3gz69ofw321c4da5` |
-| MySQL 账号 | `feedback` / `12345678tencent.` |
+| MySQL 账号 | `feedback` / `<MySQL 密码>` |
 | VPC | `vpc-b58tn9wu` / `subnet-39ye4y0j` |
 | CloudRun 服务 | `feedback-api`（version 021，1 CPU / 2GB Mem，最小/最大实例=1） |
 
@@ -37,7 +37,7 @@ DB_MODE=mysql
 MYSQL_HOST=172.17.0.7
 MYSQL_PORT=3306
 MYSQL_USER=feedback
-MYSQL_PASSWORD=12345678tencent.
+MYSQL_PASSWORD=<MySQL 密码>
 MYSQL_DATABASE=feedback7-d3gz69ofw321c4da5
 CORS_ORIGINS=https://feedback7-d3gz69ofw321c4da5-1442771950.tcloudbaseapp.com
 PORT=9000

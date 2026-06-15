@@ -1,0 +1,8 @@
+{
+  "envId": "feedback7-d3gz69ofw321c4da5",
+  "version": "2.0",
+  "$schema": "https://framework-1258016615.tcloudbaseapp.com/schema/latest.json",
+  "cloudrun": {
+    "name": "feedback-api"
+  }
+}

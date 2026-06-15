@@ -4,7 +4,23 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+dashboard/.env.*
+!dashboard/.env.example
 feedback_hub/data/
 *.db
 *.db-journal
 .DS_Store
+
+# Local tooling / generated artifacts
+.superpowers/
+.vite/
+.workbuddy/
+dashboard/dist/
+dashboard/node_modules/
+dashboard/*.tsbuildinfo
+
+# Local assistant/reference material, not part of the app
+skills/
+cloudbase-skills/

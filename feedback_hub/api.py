@@ -27,6 +27,7 @@ from fastapi.responses import StreamingResponse
 from feedback_hub import db
 from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
 from feedback_hub.importer import router as import_router
+from feedback_hub.search.api import router as search_router
 
 
 def _ph1() -> str:
@@ -70,7 +71,7 @@ def _row_val(row: Any, key: str) -> Any:
     return row[key]
 
 
-def _conv_to_item(r: Any, preview_text: str) -> dict:
+def _conv_to_item(r: Any, preview_text: str, platform: str = "") -> dict:
     return {
         "conversation_id": _row_val(r, "conversation_id"),
         "L1": _row_val(r, "L1"),
@@ -84,6 +85,7 @@ def _conv_to_item(r: Any, preview_text: str) -> dict:
         "user_vid": _row_val(r, "user_vid"),
         "appversion": _row_val(r, "appversion"),
         "channel": _row_val(r, "channel"),
+        "platform": platform,
         "preview_text": preview_text,
     }
 
@@ -113,6 +115,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
     # 注册导入 API（POST /api/import）
     app.include_router(import_router)
+    # 注册智能搜索 API
+    app.include_router(search_router)
 
     def _conn() -> Any:
         c = db.connect(db_path) if db_path else db.connect()
@@ -122,6 +126,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         from_: Optional[str], to: Optional[str],
         L1: Optional[str], L2: Optional[str],
         severity: Optional[str], q: Optional[str],
+        platform: Optional[str] = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -153,13 +158,23 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             clauses.append(f"cl.conversation_id IN ("
                            f"SELECT DISTINCT conversation_id FROM feedback WHERE text LIKE {ph})")
             params.append(f"%{q}%")
+        if platform:
+            # 逗号分隔多选，如 "iOS,Android"
+            plat_list = [p.strip() for p in platform.split(",") if p.strip()]
+            if plat_list:
+                plat_ph = _ph_n(len(plat_list))
+                clauses.append(
+                    f"cl.conversation_id IN ("
+                    f"SELECT DISTINCT conversation_id FROM feedback WHERE platform IN ({plat_ph}))"
+                )
+                params.extend(plat_list)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
     def _query_conversations(
-        from_, to, L1, L2, severity, q, limit, offset,
+        from_, to, L1, L2, severity, q, limit, offset, platform=None,
     ) -> tuple[int, list[Any]]:
-        where, params = _build_filters(from_, to, L1, L2, severity, q)
+        where, params = _build_filters(from_, to, L1, L2, severity, q, platform)
         is_mysql = db._db_mode() == "mysql"
         with _conn() as conn:
             total_row = conn.execute(
@@ -174,19 +189,26 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                 params + [limit, offset],
             ).fetchall()
             preview_map: dict[str, str] = {}
+            platform_map: dict[str, str] = {}
             if rows:
                 ids = [_row_val(r, "conversation_id") for r in rows]
                 placeholders = _ph_n(len(ids))
                 cur = conn.execute(
-                    f"SELECT conversation_id, text FROM feedback "
+                    f"SELECT conversation_id, text, platform FROM feedback "
                     f"WHERE conversation_id IN ({placeholders}) AND msg_seq = 0",
                     tuple(ids),
                 )
                 for r in cur.fetchall():
                     cid = r["conversation_id"] if is_mysql else r[0]
                     txt = (r["text"] if is_mysql else r[1]) or ""
+                    plat = (r["platform"] if is_mysql else r[2]) or ""
                     preview_map[cid] = txt[:80]
-            items = [_conv_to_item(r, preview_map.get(_row_val(r, "conversation_id"), "")) for r in rows]
+                    platform_map[cid] = plat
+            items = [_conv_to_item(
+                r,
+                preview_map.get(_row_val(r, "conversation_id"), ""),
+                platform_map.get(_row_val(r, "conversation_id"), ""),
+            ) for r in rows]
         return total, items
 
     @app.get("/api/conversations")
@@ -197,6 +219,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         L2: Optional[str] = None,
         severity: Optional[str] = None,
         q: Optional[str] = None,
+        platform: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ):
@@ -204,7 +227,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="limit 必须在 [1, 500]")
         if offset < 0:
             raise HTTPException(status_code=400, detail="offset 不能为负")
-        total, items = _query_conversations(from_, to, L1, L2, severity, q, limit, offset)
+        total, items = _query_conversations(from_, to, L1, L2, severity, q, limit, offset, platform)
         return {"total": total, "items": items}
 
     @app.get("/api/conversations/{conv_id}")
@@ -310,15 +333,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         L2: Optional[str] = None,
         severity: Optional[str] = None,
         q: Optional[str] = None,
+        platform: Optional[str] = None,
     ):
         # 直接走与 list_conversations 同样的筛选，不分页（最多 5000 条防爆）
-        _, items = _query_conversations(from_, to, L1, L2, severity, q, limit=5000, offset=0)
+        _, items = _query_conversations(from_, to, L1, L2, severity, q, 5000, 0, platform)
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow([
             "conversation_id", "L1", "L2", "severity", "confidence", "reason",
             "msg_count", "first_ts_human", "last_ts_human",
-            "user_vid", "appversion", "channel", "preview_text",
+            "user_vid", "appversion", "platform", "channel", "preview_text",
         ])
         for it in items:
             w.writerow([
@@ -326,7 +350,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                 it["confidence"], it["reason"], it["msg_count"],
                 datetime.fromtimestamp(it["first_ts_ms"] / 1000).isoformat(),
                 datetime.fromtimestamp(it["last_ts_ms"] / 1000).isoformat(),
-                it["user_vid"] or "", it["appversion"] or "", it["channel"], it["preview_text"],
+                it["user_vid"] or "", it["appversion"] or "",
+                it["platform"] or "", it["channel"], it["preview_text"],
             ])
         buf.seek(0)
         return StreamingResponse(

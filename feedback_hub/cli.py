@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -124,6 +125,25 @@ def cmd_push(args) -> int:
 
     ensure_dirs()
 
+    # ws 通道：转发到 ws_bot HTTP trigger
+    if getattr(args, "via", "webhook") == "ws" and not args.dry_run and not args.no_send:
+        import requests as _requests
+        trigger_port = int(os.environ.get("WECOM_TRIGGER_PORT", "8081"))
+        trigger_url = f"http://localhost:{trigger_port}/trigger"
+        body = {"date": args.date} if args.date else {}
+        try:
+            resp = _requests.post(trigger_url, json=body, timeout=15)
+            data = resp.json()
+            if resp.status_code == 200:
+                print(f"[push] via ws: {data}")
+                return 0
+            else:
+                print(f"[push] via ws failed: {data}", file=sys.stderr)
+                return 1
+        except Exception as e:
+            print(f"[push] via ws error: {e}", file=sys.stderr)
+            return 1
+
     # webhook url 校验（dry-run 与 no-send 不需要）
     if not args.dry_run and not args.no_send:
         if not config.get_webhook_url():
@@ -198,7 +218,10 @@ def cmd_serve(args) -> int:
     conn = db.connect()
     db.init_schema(conn)
     conn.close()
-    uvicorn.run("feedback_hub.api:app", host=args.host, port=args.port,
+    # CloudBase CloudRun 注入 PORT 环境变量，优先使用
+    port = int(os.environ.get("PORT", args.port))
+    host = os.environ.get("HOST", args.host)
+    uvicorn.run("feedback_hub.api:app", host=host, port=port,
                 reload=False, log_level="info")
     return 0
 
@@ -237,6 +260,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="写 push_log 但不调 webhook（用于自动化校验）")
     pu.add_argument("--date", default=None,
                     help="指定推送日期 YYYY-MM-DD，默认今天")
+    pu.add_argument("--via", choices=["webhook", "ws"], default="webhook",
+                    help="推送通道：webhook（默认）或 ws（长连接，需 ws_bot 进程运行）")
     pu.set_defaults(func=cmd_push)
 
     return p

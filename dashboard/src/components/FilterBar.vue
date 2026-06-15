@@ -3,7 +3,6 @@ import { computed } from 'vue'
 import { L1_VALUES, L2_VALUES, SEVERITY_VALUES } from '@/constants/labels'
 
 interface FilterState {
-  q: string
   L1: string
   L2: string
   severity: string
@@ -40,13 +39,6 @@ function update<K extends keyof FilterState>(k: K, v: FilterState[K]) {
 
 <template>
   <div class="filter-bar card">
-    <el-input
-      :model-value="modelValue.q"
-      placeholder="关键词搜索"
-      style="width: 200px"
-      clearable
-      @update:model-value="update('q', $event ?? '')"
-    />
     <el-select
       :model-value="modelValue.L1"
       placeholder="L1"

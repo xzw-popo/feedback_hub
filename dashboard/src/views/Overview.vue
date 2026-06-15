@@ -120,6 +120,7 @@ function gotoListPending() {
     <div class="overview-header">
       <h1 class="page-title">
         概览
+        <span class="beta-inline">测试</span>
       </h1>
       <el-radio-group
         v-model="days"
@@ -259,6 +260,19 @@ function gotoListPending() {
 }
 .overview-header .page-title {
   margin: 0;
+}
+.beta-inline {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 16px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 3px;
+  vertical-align: middle;
 }
 
 .kpi-grid {

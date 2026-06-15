@@ -12,8 +12,8 @@ const props = defineProps<{
   emptyText?: string
   aiScores?: AiScoreMap
   fineFiltering?: boolean
-  /** 'full' 显示所有列（默认），'simple' 只显示时间/反馈/平台 */
-  mode?: 'full' | 'simple'
+  /** 'full' 显示所有列（默认），'simple' 只显示时间/反馈/平台，'device' 显示时间/反馈/设备 */
+  mode?: 'full' | 'simple' | 'device'
 }>()
 
 const router = useRouter()
@@ -51,14 +51,14 @@ function scoreClass(score: 1 | 2 | 3): string {
     </el-table-column>
     <el-table-column
       label="反馈片段"
-      :min-width="mode === 'simple' ? 480 : 320"
+      :min-width="mode === 'simple' || mode === 'device' ? 480 : 320"
     >
       <template #default="{ row }">
         {{ truncate(row.preview_text, 80) }}
       </template>
     </el-table-column>
     <el-table-column
-      v-if="mode !== 'simple'"
+      v-if="mode !== 'simple' && mode !== 'device'"
       label="L1"
       width="100"
     >
@@ -67,7 +67,7 @@ function scoreClass(score: 1 | 2 | 3): string {
       </template>
     </el-table-column>
     <el-table-column
-      v-if="mode !== 'simple'"
+      v-if="mode !== 'simple' && mode !== 'device'"
       label="L2"
       width="200"
     >
@@ -80,12 +80,21 @@ function scoreClass(score: 1 | 2 | 3): string {
       </template>
     </el-table-column>
     <el-table-column
-      v-if="mode !== 'simple'"
+      v-if="mode !== 'simple' && mode !== 'device'"
       label="severity"
       width="100"
     >
       <template #default="{ row }">
         <SeverityTag :value="row.severity" />
+      </template>
+    </el-table-column>
+    <el-table-column
+      v-if="mode === 'device'"
+      label="设备"
+      width="100"
+    >
+      <template #default="{ row }">
+        <span>{{ row.platform || '—' }}</span>
       </template>
     </el-table-column>
     <el-table-column

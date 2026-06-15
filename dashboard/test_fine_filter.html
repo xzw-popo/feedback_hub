@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>精筛诊断测试</title>
+<style>
+  body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  .warn { color: #fbbf24; }
+  .info { color: #60a5fa; }
+  button { padding: 8px 20px; margin: 8px; font-size: 14px; cursor: pointer; }
+  input { padding: 6px 12px; font-size: 14px; width: 300px; }
+</style>
+</head>
+<body>
+<h2>精筛诊断测试</h2>
+
+<div>
+  <label>API 地址：</label>
+  <input id="apiUrl" value="" placeholder="留空走 Vite 代理(同真实应用)，或填 http://localhost:8000 直连后端" />
+</div>
+<div>
+  <label>搜索意图：</label>
+  <input id="query" value="语音输入不好用" />
+</div>
+<div>
+  <button onclick="test1_pingBackend()">Test 1: 后端连通性</button>
+  <button onclick="test2_smartSearch()">Test 2: 粗筛（获取会话ID）</button>
+  <button onclick="test3_fineFilter3()">Test 3: 精筛 3 条</button>
+  <button onclick="test4_fineFilterAll()">Test 4: 精筛全部</button>
+  <button onclick="test5_sseRaw()">Test 5: SSE 原始数据流</button>
+  <button onclick="clearLog()">清空日志</button>
+</div>
+
+<hr/>
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg, cls='info') {
+  const ts = new Date().toLocaleTimeString('zh-CN', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit', fractionalSecondDigits:3});
+  logEl.innerHTML += `<span class="${cls}">[${ts}] ${msg}</span>\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function clearLog() { logEl.innerHTML = ''; }
+
+function getApiUrl() { return document.getElementById('apiUrl').value.replace(/\/+$/, ''); }
+function getQuery() { return document.getElementById('query').value; }
+
+// ---- Test 1: 后端连通性 ----
+async function test1_pingBackend() {
+  log('=== Test 1: 后端连通性 ===');
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`${getApiUrl()}/api/conversations?limit=1`);
+    const dt = (performance.now() - t0).toFixed(0);
+    if (resp.ok) {
+      const data = await resp.json();
+      log(`✅ 后端正常，响应 ${dt}ms，total=${data.total}`, 'ok');
+    } else {
+      log(`❌ 后端返回 ${resp.status} ${resp.statusText}`, 'err');
+    }
+  } catch (e) {
+    log(`❌ 连接失败：${e.message}`, 'err');
+  }
+}
+
+// ---- Test 2: 粗筛获取会话ID ----
+let cachedIds = [];
+async function test2_smartSearch() {
+  log('=== Test 2: 粗筛 ===');
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`${getApiUrl()}/api/smart-search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: getQuery(), filters: {}, limit: 50, offset: 0 }),
+    });
+    const dt = (performance.now() - t0).toFixed(0);
+    if (resp.ok) {
+      const data = await resp.json();
+      cachedIds = data.items.map(it => it.conversation_id);
+      log(`✅ 粗筛返回 ${data.total} 条，取前 ${cachedIds.length} 条，耗时 ${dt}ms`, 'ok');
+      log(`  debug: ${JSON.stringify(data.debug?.regex_groups || data.debug?.regex_patterns)}`, 'info');
+      log(`  前5个ID: ${cachedIds.slice(0,5).join(', ')}`, 'info');
+    } else {
+      const text = await resp.text();
+      log(`❌ 粗筛失败 ${resp.status}: ${text}`, 'err');
+    }
+  } catch (e) {
+    log(`❌ 粗筛请求失败：${e.message}`, 'err');
+  }
+}
+
+// ---- Test 3: 精筛 3 条 ----
+async function test3_fineFilter3() {
+  if (cachedIds.length < 3) {
+    log('⚠️ 先运行 Test 2 获取会话ID', 'warn');
+    return;
+  }
+  const ids = cachedIds.slice(0, 3);
+  log(`=== Test 3: 精筛 ${ids.length} 条 ===`);
+  await runFineFilter(getQuery(), ids);
+}
+
+// ---- Test 4: 精筛全部 ----
+async function test4_fineFilterAll() {
+  if (cachedIds.length === 0) {
+    log('⚠️ 先运行 Test 2 获取会话ID', 'warn');
+    return;
+  }
+  log(`=== Test 4: 精筛全部 ${cachedIds.length} 条 ===`);
+  await runFineFilter(getQuery(), cachedIds);
+}
+
+// ---- 通用精筛函数 ----
+async function runFineFilter(query, ids) {
+  const t0 = performance.now();
+  let processed = 0;
+  let batchCount = 0;
+
+  try {
+    log(`发送 POST /api/fine-filter，${ids.length} 条...`);
+    const resp = await fetch(`${getApiUrl()}/api/fine-filter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, conversation_ids: ids }),
+    });
+
+    log(`HTTP 状态: ${resp.status} ${resp.statusText}`, resp.ok ? 'ok' : 'err');
+    if (!resp.ok) {
+      const text = await resp.text();
+      log(`响应内容: ${text}`, 'err');
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    log('开始读取 SSE 流...');
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        log('SSE 流结束 (reader.done=true)', 'warn');
+        break;
+      }
+
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+
+      // 解析 SSE 事件
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      let eventType = '';
+      let data = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          data = line.slice(5).trim();
+        } else if (!line.trim() && data) {
+          // 空行 = 事件结束
+          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          try {
+            const parsed = JSON.parse(data);
+            if (eventType === 'batch' || parsed.batch) {
+              batchCount++;
+              processed = parsed.processed || processed + (parsed.batch?.length || 0);
+              const scores = (parsed.batch || []).map(r => `  ${r.id}: ⭐${r.score} (${r.reason})`).join('\n');
+              log(`📦 批次 #${batchCount} [${elapsed}s] 进度 ${processed}/${ids.length}\n${scores}`, 'ok');
+            } else if (eventType === 'warning' || parsed.message) {
+              log(`⚠️ 警告: ${parsed.message}`, 'warn');
+            } else if (eventType === 'done' || parsed.done) {
+              const totalDt = ((performance.now() - t0) / 1000).toFixed(1);
+              log(`✅ 完成! 总处理 ${parsed.total_processed || processed} 条，耗时 ${totalDt}s，${batchCount} 批`, 'ok');
+            } else {
+              log(`❓ 未知事件 [${eventType}]: ${data.slice(0,200)}`, 'warn');
+            }
+          } catch (parseErr) {
+            log(`❌ JSON 解析失败: ${data.slice(0,200)}`, 'err');
+          }
+          eventType = '';
+          data = '';
+        }
+      }
+    }
+
+    // 如果流结束但没有收到 done 事件
+    if (batchCount === 0) {
+      log('❌ 未收到任何 batch 事件！', 'err');
+    }
+  } catch (e) {
+    log(`❌ 精筛异常: ${e.message}`, 'err');
+  }
+}
+
+// ---- Test 5: SSE 原始数据流 ----
+async function test5_sseRaw() {
+  if (cachedIds.length < 3) {
+    log('⚠️ 先运行 Test 2 获取会话ID', 'warn');
+    return;
+  }
+  const ids = cachedIds.slice(0, 3);
+  log(`=== Test 5: SSE 原始数据流（3条） ===`);
+
+  try {
+    const resp = await fetch(`${getApiUrl()}/api/fine-filter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: getQuery(), conversation_ids: ids }),
+    });
+
+    log(`HTTP 状态: ${resp.status}`, resp.ok ? 'ok' : 'err');
+    log(`Content-Type: ${resp.headers.get('content-type')}`, 'info');
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let totalBytes = 0;
+    let chunkCount = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) { log('流结束', 'warn'); break; }
+      chunkCount++;
+      totalBytes += value.length;
+      const text = decoder.decode(value, { stream: true });
+      // 打印原始内容（转义不可见字符）
+      const escaped = text.replace(/\r/g, '\\r').replace(/\n/g, '\\n\n');
+      log(`[chunk #${chunkCount}, ${value.length}B, total ${totalBytes}B]\n${escaped}`, 'info');
+    }
+
+    if (chunkCount === 0) {
+      log('❌ 没有收到任何数据块！', 'err');
+    }
+  } catch (e) {
+    log(`❌ 异常: ${e.message}`, 'err');
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# CloudRun 部署时不需要的文件
+feedback_hub/data/
+feedback_hub/tests/
+feedback_hub/__pycache__/
+feedback_hub/**/__pycache__/
+dashboard/
+docs/
+skills/
+cloudbase-skills/
+.git/
+.DS_Store
+*.pyc
+.pytest_cache/
+backfill.*.log

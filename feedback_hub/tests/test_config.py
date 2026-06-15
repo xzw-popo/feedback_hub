@@ -38,7 +38,7 @@ def test_get_agent_key_uses_env(monkeypatch):
 
 def test_get_agent_key_falls_back_to_default(monkeypatch):
     monkeypatch.delenv("WINK_AGENT_KEY", raising=False)
-    assert config.get_agent_key() == config.DEFAULT_AGENT_KEY
+    assert config.get_agent_key() == ""
 
 
 def test_gap_seconds_is_30_minutes():

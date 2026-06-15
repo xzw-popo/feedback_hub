@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>精筛诊断测试 v2</title>
+<style>
+  body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  .warn { color: #fbbf24; }
+  .info { color: #60a5fa; }
+  .dbg { color: #a78bfa; }
+  button { padding: 8px 20px; margin: 8px; font-size: 14px; cursor: pointer; border-radius:4px;border:none;background:#333;color:#eee;}
+  input { padding: 6px 12px; font-size: 14px; width: 350px; background:#222; border:1px solid #555; color:#eee; border-radius:4px;}
+  label { display:inline-block; width:100px; text-align:right; margin-right:8px; }
+  .row { margin:8px 0; }
+  hr { border-color:#333;margin:16px 0; }
+  h2 { color:#e0e0ff; font-size:18px; }
+</style>
+</head>
+<body>
+<h2>精筛诊断测试 v2（详细调试）</h2>
+
+<div class="row"><label>API 地址：</label><input id="apiUrl" value="" placeholder="留空=Vite代理 / http://localhost:8000=直连" /></div>
+<div class="row"><label>搜索意图：</label><input id="query" value="语音输入不好用" /></div>
+
+<div style="margin:12px 0">
+  <button onclick="test1_pingBackend()">Test 1: 后端连通</button>
+  <button onclick="test2_smartSearch()">Test 2: 粗筛</button>
+  <button onclick="test3_debug()">Test 3: 精筛(调试模式)</button>
+  <button onclick="test3_direct()">Test 3b: 精筛(直连后端)</button>
+  <button onclick="clearLog()">清空</button>
+</div>
+
+<hr/>
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg, cls='info') {
+  const ts = new Date().toLocaleTimeString('zh-CN', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit', fractionalSecondDigits:3});
+  logEl.innerHTML += `<span class="${cls}">[${ts}] ${msg}</span>\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function clearLog() { logEl.innerHTML = ''; }
+
+function getApiUrl() { return document.getElementById('apiUrl').value.replace(/\/+$/, ''); }
+function getQuery() { return document.getElementById('query').value; }
+
+// 辅助：显示字符串的每个字符的编码
+function showChars(s) {
+  const chars = [];
+  for (let i = 0; i < s.length && i < 200; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 10) chars.push('\\n');
+    else if (c === 13) chars.push('\\r');
+    else if (c < 32 || c > 126) chars.push(`\\x${c.toString(16).padStart(2,'0')}`);
+    else chars.push(s[i]);
+  }
+  return chars.join('');
+}
+
+// ---- Test 1 ----
+async function test1_pingBackend() {
+  log('=== Test 1: 后端连通性 ===');
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`${getApiUrl()}/api/conversations?limit=1`);
+    const dt = (performance.now() - t0).toFixed(0);
+    if (resp.ok) {
+      const data = await resp.json();
+      log(`✅ 后端正常，响应 ${dt}ms，total=${data.total}`, 'ok');
+    } else {
+      log(`❌ 后端返回 ${resp.status}`, 'err');
+    }
+  } catch (e) { log(`❌ 连接失败：${e.message}`, 'err'); }
+}
+
+// ---- Test 2 ----
+let cachedIds = [];
+async function test2_smartSearch() {
+  log('=== Test 2: 粗筛 ===');
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`${getApiUrl()}/api/smart-search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: getQuery(), filters: {}, limit: 50, offset: 0 }),
+    });
+    const dt = (performance.now() - t0).toFixed(0);
+    if (resp.ok) {
+      const data = await resp.json();
+      cachedIds = data.items.map(it => it.conversation_id);
+      log(`✅ 粗筛返回 ${data.total} 条，取前 ${cachedIds.length} 条，耗时 ${dt}ms`, 'ok');
+      log(`  前5个ID: ${cachedIds.slice(0,5).join(', ')}`, 'info');
+    } else {
+      const text = await resp.text();
+      log(`❌ 粗筛失败 ${resp.status}: ${text}`, 'err');
+    }
+  } catch (e) { log(`❌ 粗筛失败：${e.message}`, 'err'); }
+}
+
+// ---- 通用精筛函数（带完整调试） ----
+async function runFineFilterDebug(query, ids, label='') {
+  const urlPrefix = getApiUrl();
+  const t0 = performance.now();
+  let processed = 0;
+  let batchCount = 0;
+
+  try {
+    log(`--- [${label}] 发送 POST /api/fine-filter，${ids.length} 条 ---`);
+    log(`    目标URL: ${urlPrefix}/api/fine-filter`);
+
+    // 打印请求体大小
+    const bodyStr = JSON.stringify({ query, conversation_ids: ids });
+    log(`    请求体: ${bodyStr.length} 字节`, 'info');
+
+    const resp = await fetch(`${urlPrefix}/api/fine-filter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: bodyStr,
+    });
+
+    const dt1 = ((performance.now() - t0) / 1000).toFixed(2);
+    log(`HTTP ${resp.status} ${resp.statusText} [${dt1}s]`, resp.ok ? 'ok' : 'err');
+
+    // 打印所有响应头
+    resp.headers.forEach((v, k) => {
+      log(`    Header: ${k}: ${v}`, 'dbg');
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      log(`响应内容: ${text}`, 'err');
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+
+    // 检查 body 是否存在
+    if (!reader) {
+      log('❌ resp.body.getReader() 返回 null！', 'err');
+      return;
+    }
+
+    let buffer = '';
+    let chunkNum = 0;
+    let totalBytes = 0;
+    log('开始读取流...', 'info');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      chunkNum++;
+      if (done) {
+        const dtDone = ((performance.now() - t0) / 1000).toFixed(2);
+        log(`[chunk #${chunkNum}] 流结束 done=true [${dtDone}s] 总计 ${totalBytes}B`, chunkNum > 1 ? 'warn' : 'err');
+        break;
+      }
+      totalBytes += value.length;
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+      const dtChunk = ((performance.now() - t0) / 1000).toFixed(2);
+      log(`[chunk #${chunkNum}] 收到 ${value.length}B (total=${totalBytes}B) [${dtChunk}s]`, 'dbg');
+
+      // 解析 SSE 事件
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      let eventType = '';
+      let data = '';
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineHex = showChars(line);
+
+        if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim();
+          log(`  [line ${i}] event → "${eventType}" | raw="${lineHex}"`, 'dbg');
+        } else if (line.startsWith('data:')) {
+          data = line.slice(5).trim();
+          log(`  [line ${i}] data → (${data.length}字符) | first80="${data.slice(0,80)}"`, 'dbg');
+        } else if (!line.trim() && data) {
+          // 空行 = 事件结束
+          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          log(`  [line ${i}] ★ 空行触发! type="${eventType}" hasData=${!!data} | raw="${lineHex}"`, 'ok');
+          try {
+            const parsed = JSON.parse(data);
+            if (eventType === 'batch' || parsed.batch) {
+              batchCount++;
+              processed = parsed.processed || processed + (parsed.batch?.length || 0);
+              log(`📦 批次 #${batchCount} [${elapsed}s] 进度 ${processed}/${ids.length}`, 'ok');
+            } else if (eventType === 'done' || parsed.done) {
+              const totalDt = ((performance.now() - t0) / 1000).toFixed(1);
+              log(`✅ 完成! 处理 ${parsed.total_processed || processed} 条，耗时 ${totalDt}s，${batchCount} 批`, 'ok');
+              eventType = ''; data = '';
+            }
+          } catch (parseErr) {
+            log(`  ❌ JSON解析错误: ${parseErr.message}`, 'err');
+          }
+          eventType = '';
+          data = '';
+        } else if (line !== '') {
+          // 非空非event非data行 — 记录但不处理
+          log(`  [line ${i}] 跳过: raw="${lineHex}" len=${line.length}`, 'warn');
+        }
+        // 完全空行且无data → 正常的事件间分隔符
+      }
+    }
+
+    // 最终报告
+    const dtEnd = ((performance.now() - t0) / 1000).toFixed(2);
+    if (buffer.trim()) {
+      log(`⚠️ 缓冲区残留内容(${buffer.length}字符): "${showChars(buffer.slice(0,200))}"`, 'warn');
+    }
+    if (batchCount === 0) {
+      log(`❌ [${label}] 未收到任何 batch/done 事件！总耗时 ${dtEnd}s, ${chunkNum} chunks, ${totalBytes}B`, 'err');
+    } else {
+      log(`✅ [${label}] 完成，${batchCount} 批, 耗时 ${dtEnd}s`, 'ok');
+    }
+  } catch (e) {
+    log(`❌ [${label}] 异常: ${e.stack || e.message}`, 'err');
+  }
+}
+
+async function test3_debug() {
+  if (cachedIds.length < 3) { log('⚠️ 先运行 Test 2', 'warn'); return; }
+  log('=== Test 3: 精筛 3 条（走当前API地址）===');
+  await runFineFilterDebug(getQuery(), cachedIds.slice(0, 3), 'proxy');
+}
+
+async function test3_direct() {
+  if (cachedIds.length < 3) { log('⚠️ 先运行 Test 2', 'warn'); return; }
+  log('=== Test 3b: 精筛 3 条（直连 localhost:8000）===');
+  await runFineFilterDebug(getQuery(), cachedIds.slice(0, 3), 'direct');
+}
+</script>
+</body>
+</html>

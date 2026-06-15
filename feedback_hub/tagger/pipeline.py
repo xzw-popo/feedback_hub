@@ -7,11 +7,11 @@
 """
 from __future__ import annotations
 
-import sqlite3
 import time
 from typing import Any, Callable, Optional
 
 from feedback_hub import db
+from feedback_hub.db import Connection as DBConnection
 from feedback_hub.config import L1_PRIORITY, SEVERITY_PRIORITY
 from feedback_hub.conversation import assign_conversation_ids
 from feedback_hub.tagger import label_parser, rules
@@ -143,7 +143,7 @@ def _l2_to_pipe(l2: Any) -> str:
 
 
 def run_tagging(
-    conn: sqlite3.Connection,
+    conn: DBConnection,
     *,
     llm_call: Optional[LLMCallable] = None,
     limit: Optional[int] = None,
@@ -231,9 +231,10 @@ def run_tagging(
     stats["user_vids_recomputed"] = len(user_vids)
 
     # 还要把本批 feedback 自身的 conversation_id（可能从未排过的旧记录）也算入
+    ph = db._ph(len(affected_feedback_ids))
     cur = conn.execute(
         f"SELECT DISTINCT conversation_id FROM feedback "
-        f"WHERE feedback_id IN ({','.join('?'*len(affected_feedback_ids))})",
+        f"WHERE feedback_id IN ({ph})",
         tuple(affected_feedback_ids),
     )
     for r in cur.fetchall():

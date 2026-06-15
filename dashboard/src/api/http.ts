@@ -1,7 +1,10 @@
 import axios, { AxiosError } from 'axios'
 import { ElMessage } from 'element-plus'
 
-export const http = axios.create({ baseURL: '', timeout: 30000 })
+export const http = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL || '',
+  timeout: 60000,
+})
 
 export interface ApiError {
   type: 'NOT_FOUND' | 'SERVER_ERROR' | 'NETWORK_ERROR' | 'BAD_REQUEST' | 'UNKNOWN'

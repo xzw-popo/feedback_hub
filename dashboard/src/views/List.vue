@@ -158,6 +158,7 @@ onMounted(() => {
   <div class="page">
     <h1 class="page-title">
       反馈列表
+      <span class="beta-inline">测试</span>
     </h1>
 
     <FilterBar
@@ -235,6 +236,12 @@ onMounted(() => {
   line-height: 32px;
   padding: 0;
 }
+/* 箭头移到最左端 */
+.manual-keywords-collapse :deep(.el-collapse-item__arrow) {
+  order: -1;
+  margin-left: 0;
+  margin-right: 6px;
+}
 .manual-keywords-collapse :deep(.el-collapse-item__wrap) {
   border-bottom: none;
   background: transparent;
@@ -261,5 +268,18 @@ onMounted(() => {
   align-items: center;
   gap: 16px;
   justify-content: flex-end;
+}
+.beta-inline {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 16px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 3px;
+  vertical-align: middle;
 }
 </style>

@@ -33,7 +33,7 @@ L1_PRIORITY: dict[str, int] = {
 SEVERITY_PRIORITY: dict[str, int] = {"P0": 4, "P1": 3, "P2": 2, "P3": 1}
 
 # ---------- LLM Agent ----------
-DEFAULT_AGENT_KEY: str = "7db9e110-d586-4bc5-be3f-07dab992cb49"
+DEFAULT_AGENT_KEY: str = ""
 AGENT_RUN_URL: str = "http://winkagentsvr.dante.weread2.woa.com/agent/run"
 AGENT_POLL_URL: str = "http://winkagentsvr.dante.weread2.woa.com/agent/poll"
 
@@ -67,3 +67,23 @@ def get_webhook_url() -> str | None:
 
 # ---------- 导入 API ----------
 IMPORT_TOKEN: str = os.environ.get("IMPORT_TOKEN", "")
+
+
+# ---------- 智能搜索 LLM ----------
+LLM_API_URL: str = os.environ.get(
+    "LLM_API_URL", "https://api.deepseek.com/v1/chat/completions"
+)
+LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL: str = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+
+# 精筛参数
+FINE_FILTER_MAX_CONVERSATIONS: int = 500   # 单次精筛上限
+FINE_FILTER_BATCH_SIZE: int = 10           # 每批条数（单次 LLM 调用评估 10 条）
+FINE_FILTER_MAX_CONCURRENCY: int = 50      # 最大并发 LLM 调用
+FINE_FILTER_BATCH_TIMEOUT: int = 30        # 单批超时(秒)
+FINE_FILTER_TOTAL_TIMEOUT: int = 180       # 整体超时(秒)
+
+# AI 搜索正则匹配的单条文本最大长度。超长文本（崩溃日志/直播口水等）配合
+# LLM 生成的含 .* 正则会触发灾难性回溯，实测单条卡死 80s+，远超前端 60s 超时。
+# 超过此长度的文本不参与正则匹配，且 SQLite REGEXP 回调内会截断后再匹配。
+SEARCH_REGEXP_MAX_TEXT_LEN: int = 2000

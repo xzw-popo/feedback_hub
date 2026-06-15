@@ -4,10 +4,10 @@
 """
 from __future__ import annotations
 
-import sqlite3
-from typing import List
+from typing import Any, List
 
 from feedback_hub import db
+from feedback_hub.db import Connection as DBConnection
 from feedback_hub.pusher import scorer
 
 
@@ -64,7 +64,7 @@ def _empty_placeholder_row(push_date: str, created_at: int) -> dict:
 
 
 def save_top_groups(
-    conn: sqlite3.Connection, *,
+    conn: DBConnection, *,
     push_date: str,
     top_groups: List[scorer.CandidateGroup],
     created_at: int,
@@ -91,7 +91,7 @@ def save_top_groups(
 
 
 def mark_delivered(
-    conn: sqlite3.Connection, push_log_ids: List[int], *, delivered_at: int,
+    conn: DBConnection, push_log_ids: List[int], *, delivered_at: int,
 ) -> None:
     """批量把一组 push_log 标记为已送达。"""
     for pid in push_log_ids:

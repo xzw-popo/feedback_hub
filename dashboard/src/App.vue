@@ -30,13 +30,13 @@ const { healthy } = useApiHealth()
             to="/overview"
             class="nav-item"
           >
-            概览
+            概览<span class="beta-tag">测试</span>
           </router-link>
           <router-link
             to="/list"
             class="nav-item"
           >
-            标签列表
+            反馈列表<span class="beta-tag">测试</span>
           </router-link>
         </nav>
       </aside>
@@ -73,6 +73,19 @@ const { healthy } = useApiHealth()
 .nav-item.router-link-active {
   background: var(--bg); color: var(--primary);
   border-left-color: var(--primary); font-weight: 600;
+}
+.beta-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 16px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 3px;
+  vertical-align: middle;
 }
 .layout-main { flex: 1; overflow: auto; }
 </style>
