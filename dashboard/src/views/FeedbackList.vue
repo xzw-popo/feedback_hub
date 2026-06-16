@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import dayjs from 'dayjs'
+import { ElMessage } from 'element-plus'
 import ConversationTable from '@/components/ConversationTable.vue'
 import SmartSearch from '@/components/SmartSearch.vue'
 import KeywordBuilder from '@/components/KeywordBuilder.vue'
@@ -10,8 +11,14 @@ import { provideSearchState } from '@/composables/useSearchState'
 import {
   listConversations,
   exportCsvUrl,
+  createSearchReport,
+  listSearchReports,
+  getSearchReport,
+  retrySearchReport,
   type ConversationItem,
   type ListParams,
+  type SearchReportJob,
+  type CreateSearchReportRequest,
 } from '@/api/feedback'
 
 const PLATFORM_OPTIONS = ['iOS', 'Android', 'Win', 'Mac', '小程序', '未知']
@@ -75,6 +82,9 @@ const displayLoading = computed(() =>
   searchState.hasAnySearch.value
     ? searchState.state.smartLoading || searchState.state.keywordLoading
     : normalLoading.value
+)
+const canGenerateReport = computed(() =>
+  searchState.hasAnySearch.value && displayItems.value.length > 0 && !displayLoading.value
 )
 
 function buildParams(): ListParams {
@@ -142,12 +152,158 @@ const newKeywords = ref<Record<number, string>>({})
 // 手动选取关键词折叠状态
 const manualKeywordsOpen = ref<string[]>([])
 
+// 搜索报告状态
+const reportDialogOpen = ref(false)
+const reportDrawerOpen = ref(false)
+const reportTitle = ref('')
+const reportSubmitting = ref(false)
+const reportsLoading = ref(false)
+const reportDetailLoading = ref(false)
+const reportJobs = ref<SearchReportJob[]>([])
+const selectedReport = ref<SearchReportJob | null>(null)
+let reportPollTimer: number | null = null
+
+const reportQuerySummary = computed(() => searchState.currentQueryIntent.value || '当前搜索结果')
+const reportSnapshotCount = computed(() => displayItems.value.length)
+const reportSampleLimit = computed(() => Math.min(displayItems.value.length, 80))
+const hasRunningReports = computed(() =>
+  reportJobs.value.some(job => job.status === 'pending' || job.status === 'running')
+)
+
+function defaultReportTitle() {
+  const base = reportQuerySummary.value.trim() || '搜索反馈'
+  return `${base.slice(0, 32)}分析报告`
+}
+
+function buildReportRequest(): CreateSearchReportRequest {
+  const aiScores: CreateSearchReportRequest['ai_scores'] = {}
+  for (const [id, score] of Object.entries(searchState.state.aiScores)) {
+    aiScores[id] = { score }
+  }
+  return {
+    title: reportTitle.value.trim() || defaultReportTitle(),
+    query: reportQuerySummary.value,
+    search_type: searchState.state.mode === 'smart' ? 'smart' : 'keyword',
+    filters: metadataFilters.value,
+    search_payload: {
+      mode: searchState.state.mode,
+      keyword_groups: searchState.state.keywordGroups,
+      keyword_excludes: searchState.state.keywordExcludes,
+      total: searchState.state.total,
+    },
+    conversation_ids: displayItems.value.map(item => item.conversation_id),
+    ai_scores: aiScores,
+  }
+}
+
+function openReportDialog() {
+  if (!canGenerateReport.value) return
+  reportTitle.value = defaultReportTitle()
+  reportDialogOpen.value = true
+}
+
+async function submitReportJob() {
+  reportSubmitting.value = true
+  try {
+    const created = await createSearchReport(buildReportRequest())
+    reportDialogOpen.value = false
+    reportDrawerOpen.value = true
+    ElMessage.success('报告任务已创建')
+    await refreshReportJobs()
+    await openReportDetail(created.id)
+    ensureReportPolling()
+  } finally {
+    reportSubmitting.value = false
+  }
+}
+
+async function refreshReportJobs() {
+  reportsLoading.value = true
+  try {
+    const resp = await listSearchReports(20)
+    reportJobs.value = resp.items
+    if (selectedReport.value) {
+      const fresh = resp.items.find(job => job.id === selectedReport.value?.id)
+      if (fresh) selectedReport.value = { ...selectedReport.value, ...fresh }
+    }
+    ensureReportPolling()
+  } finally {
+    reportsLoading.value = false
+  }
+}
+
+async function openReportDrawer() {
+  reportDrawerOpen.value = true
+  await refreshReportJobs()
+}
+
+async function openReportDetail(id: string) {
+  reportDetailLoading.value = true
+  try {
+    selectedReport.value = await getSearchReport(id)
+  } finally {
+    reportDetailLoading.value = false
+  }
+}
+
+async function retryReport(job: SearchReportJob) {
+  await retrySearchReport(job.id)
+  ElMessage.success('已重新提交报告任务')
+  await refreshReportJobs()
+  await openReportDetail(job.id)
+  ensureReportPolling()
+}
+
+async function copyReportMarkdown() {
+  if (!selectedReport.value?.result_markdown) return
+  await navigator.clipboard.writeText(selectedReport.value.result_markdown)
+  ElMessage.success('已复制 Markdown')
+}
+
+function ensureReportPolling() {
+  if (hasRunningReports.value && reportPollTimer === null) {
+    reportPollTimer = window.setInterval(() => {
+      void refreshReportJobs()
+      if (selectedReport.value?.status === 'pending' || selectedReport.value?.status === 'running') {
+        void openReportDetail(selectedReport.value.id)
+      }
+    }, 5000)
+  } else if (!hasRunningReports.value && reportPollTimer !== null) {
+    window.clearInterval(reportPollTimer)
+    reportPollTimer = null
+  }
+}
+
+function reportStatusText(status: SearchReportJob['status']) {
+  return {
+    pending: '排队中',
+    running: '生成中',
+    succeeded: '已完成',
+    failed: '生成失败',
+  }[status]
+}
+
+function reportStatusType(status: SearchReportJob['status']) {
+  return status === 'succeeded'
+    ? 'success'
+    : status === 'failed'
+      ? 'danger'
+      : 'warning'
+}
+
 onMounted(() => {
   // 从 URL 恢复 platform 多选状态
   if (url.platform) {
     selectedPlatforms.value = url.platform.split(',').filter(Boolean)
   }
   void load()
+  void refreshReportJobs()
+})
+
+onUnmounted(() => {
+  if (reportPollTimer !== null) {
+    window.clearInterval(reportPollTimer)
+  }
 })
 </script>
 
@@ -219,7 +375,19 @@ onMounted(() => {
     <div class="card table-card">
       <div class="table-header">
         <span class="muted">共 {{ displayTotal }} 条</span>
-        <FineFilterButton />
+        <div class="table-actions">
+          <el-button
+            :disabled="!canGenerateReport"
+            :loading="reportSubmitting"
+            @click="openReportDialog"
+          >
+            生成报告
+          </el-button>
+          <el-button @click="openReportDrawer">
+            报告
+          </el-button>
+          <FineFilterButton />
+        </div>
       </div>
       <ConversationTable
         :items="displayItems"
@@ -246,6 +414,144 @@ onMounted(() => {
         />
       </div>
     </div>
+
+    <el-dialog
+      v-model="reportDialogOpen"
+      title="生成搜索报告"
+      width="520px"
+    >
+      <el-form label-width="96px">
+        <el-form-item label="报告标题">
+          <el-input v-model="reportTitle" />
+        </el-form-item>
+        <el-form-item label="搜索问题">
+          <span class="dialog-text">{{ reportQuerySummary }}</span>
+        </el-form-item>
+        <el-form-item label="命中结果">
+          <span class="dialog-text">{{ reportSnapshotCount }} 条</span>
+        </el-form-item>
+        <el-form-item label="分析样本">
+          <span class="dialog-text">最多 {{ reportSampleLimit }} 条</span>
+        </el-form-item>
+      </el-form>
+      <p class="report-note">
+        报告会基于当前结果快照异步生成，可能需要几分钟。
+      </p>
+      <template #footer>
+        <el-button @click="reportDialogOpen = false">
+          取消
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="reportSubmitting"
+          @click="submitReportJob"
+        >
+          提交
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-drawer
+      v-model="reportDrawerOpen"
+      title="搜索报告"
+      size="680px"
+      @opened="refreshReportJobs"
+    >
+      <div class="report-drawer">
+        <div class="report-list">
+          <div class="report-list-header">
+            <span class="muted">最近报告</span>
+            <el-button
+              text
+              :loading="reportsLoading"
+              @click="refreshReportJobs"
+            >
+              刷新
+            </el-button>
+          </div>
+          <el-empty
+            v-if="!reportsLoading && reportJobs.length === 0"
+            description="暂无报告"
+          />
+          <button
+            v-for="job in reportJobs"
+            :key="job.id"
+            class="report-job"
+            :class="{ active: selectedReport?.id === job.id }"
+            type="button"
+            @click="openReportDetail(job.id)"
+          >
+            <span class="report-job-title">{{ job.title }}</span>
+            <span class="report-job-meta">
+              {{ dayjs(job.created_at).format('MM-DD HH:mm') }}
+              · 样本 {{ job.sample_count }}
+            </span>
+            <el-tag
+              size="small"
+              :type="reportStatusType(job.status)"
+            >
+              {{ reportStatusText(job.status) }}
+            </el-tag>
+          </button>
+        </div>
+
+        <div class="report-detail">
+          <el-empty
+            v-if="!selectedReport"
+            description="选择一份报告"
+          />
+          <template v-else>
+            <div class="report-detail-header">
+              <div>
+                <h2>{{ selectedReport.title }}</h2>
+                <p class="muted">
+                  {{ reportStatusText(selectedReport.status) }}
+                  <template v-if="selectedReport.finished_at">
+                    · {{ dayjs(selectedReport.finished_at).format('YYYY-MM-DD HH:mm') }}
+                  </template>
+                </p>
+              </div>
+              <div class="report-detail-actions">
+                <el-button
+                  v-if="selectedReport.status === 'failed'"
+                  @click="retryReport(selectedReport)"
+                >
+                  重试
+                </el-button>
+                <el-button
+                  :disabled="!selectedReport.result_markdown"
+                  @click="copyReportMarkdown"
+                >
+                  复制
+                </el-button>
+              </div>
+            </div>
+
+            <el-skeleton
+              v-if="reportDetailLoading"
+              :rows="8"
+              animated
+            />
+            <el-result
+              v-else-if="selectedReport.status === 'failed'"
+              icon="error"
+              title="生成失败"
+              :sub-title="selectedReport.error_message || 'AI 服务暂时不可用'"
+            />
+            <el-result
+              v-else-if="selectedReport.status === 'pending' || selectedReport.status === 'running'"
+              icon="info"
+              :title="reportStatusText(selectedReport.status)"
+              sub-title="报告生成后会自动刷新"
+            />
+            <pre
+              v-else
+              class="report-markdown"
+            >{{ selectedReport.result_markdown }}</pre>
+          </template>
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -296,11 +602,110 @@ onMounted(() => {
   align-items: center;
   margin-bottom: 12px;
 }
+.table-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.dialog-text {
+  color: var(--el-text-color-primary);
+  overflow-wrap: anywhere;
+}
+.report-note {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.report-drawer {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 16px;
+  height: 100%;
+  min-height: 0;
+}
+.report-list,
+.report-detail {
+  min-height: 0;
+  overflow: auto;
+}
+.report-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.report-job {
+  width: 100%;
+  border: 1px solid var(--el-border-color-lighter);
+  background: var(--el-bg-color);
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+  text-align: left;
+  cursor: pointer;
+  display: grid;
+  gap: 6px;
+}
+.report-job:hover,
+.report-job.active {
+  border-color: var(--el-color-primary);
+}
+.report-job-title {
+  color: var(--el-text-color-primary);
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.report-job-meta {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.report-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.report-detail-header h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.report-detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.report-markdown {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-lighter);
+  color: var(--el-text-color-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+  font-family: inherit;
+}
 .pager {
   margin-top: 16px;
   display: flex;
   align-items: center;
   gap: 16px;
   justify-content: flex-end;
+}
+@media (max-width: 720px) {
+  .report-drawer {
+    grid-template-columns: 1fr;
+  }
+  .report-detail-header {
+    flex-direction: column;
+  }
 }
 </style>

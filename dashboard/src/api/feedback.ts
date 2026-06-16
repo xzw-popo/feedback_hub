@@ -244,3 +244,59 @@ export function fineFilterSSE(
     close() { controller.abort() },
   } as unknown as EventSource
 }
+
+// ---------------------------------------------------------------------------
+// 搜索报告类型与 API
+// ---------------------------------------------------------------------------
+
+export interface CreateSearchReportRequest {
+  title: string
+  query?: string
+  search_type: 'smart' | 'keyword' | 'mixed'
+  filters?: MetadataFilters
+  search_payload?: Record<string, unknown>
+  conversation_ids: string[]
+  ai_scores?: Record<string, { score: 1 | 2 | 3; reason?: string }>
+}
+
+export interface SearchReportJob {
+  id: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed'
+  title: string
+  query: string | null
+  search_type: string
+  filters: Record<string, unknown>
+  search_payload: Record<string, unknown>
+  sample_count: number
+  result_markdown: string | null
+  error_message: string | null
+  created_at: number
+  started_at: number | null
+  finished_at: number | null
+  conversation_ids?: string[]
+  ai_scores?: Record<string, { score: 1 | 2 | 3; reason?: string }>
+}
+
+export interface SearchReportListResp {
+  items: SearchReportJob[]
+}
+
+export async function createSearchReport(req: CreateSearchReportRequest): Promise<{ id: string; status: string }> {
+  const r = await http.post<{ id: string; status: string }>('/api/search-reports', req)
+  return r.data
+}
+
+export async function listSearchReports(limit = 20): Promise<SearchReportListResp> {
+  const r = await http.get<SearchReportListResp>('/api/search-reports', { params: { limit } })
+  return r.data
+}
+
+export async function getSearchReport(id: string): Promise<SearchReportJob> {
+  const r = await http.get<SearchReportJob>(`/api/search-reports/${encodeURIComponent(id)}`)
+  return r.data
+}
+
+export async function retrySearchReport(id: string): Promise<{ id: string; status: string }> {
+  const r = await http.post<{ id: string; status: string }>(`/api/search-reports/${encodeURIComponent(id)}/retry`)
+  return r.data
+}
