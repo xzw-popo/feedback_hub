@@ -40,6 +40,18 @@ def test_create_report_job_saves_snapshot(tmp_path, monkeypatch):
     assert detail["filters"]["platform"] == "android"
 
 
+def test_report_list_initializes_missing_table_for_existing_db(tmp_path, monkeypatch):
+    db_path = _seed_schema(tmp_path, monkeypatch)
+    with db.connect(db_path) as conn:
+        conn.execute("DROP TABLE search_report_job")
+
+    client = TestClient(create_app(db_path=str(db_path), frontend_dist=None))
+    resp = client.get("/api/search-reports")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
 def test_create_report_job_rejects_empty_snapshot(tmp_path, monkeypatch):
     db_path = _seed_schema(tmp_path, monkeypatch)
     client = TestClient(create_app(db_path=str(db_path), frontend_dist=None))

@@ -16,6 +16,52 @@ MAX_SNAPSHOT_CONVERSATIONS = 500
 MAX_REPORT_SAMPLES = 80
 MAX_TEXT_CHARS_PER_CONVERSATION = 500
 
+_SQLITE_REPORT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS search_report_job (
+    id                    TEXT PRIMARY KEY,
+    status                TEXT NOT NULL,
+    title                 TEXT NOT NULL,
+    query                 TEXT,
+    search_type           TEXT NOT NULL,
+    filters_json          TEXT,
+    search_payload_json   TEXT,
+    conversation_ids_json TEXT NOT NULL,
+    ai_scores_json        TEXT,
+    sample_count          INTEGER NOT NULL DEFAULT 0,
+    result_markdown       TEXT,
+    error_message         TEXT,
+    created_at            INTEGER NOT NULL,
+    started_at            INTEGER,
+    finished_at           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_report_job_created ON search_report_job(created_at);
+CREATE INDEX IF NOT EXISTS idx_report_job_status ON search_report_job(status, created_at);
+"""
+
+_MYSQL_REPORT_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS search_report_job (
+        id                    VARCHAR(255) PRIMARY KEY,
+        status                VARCHAR(32) NOT NULL,
+        title                 VARCHAR(255) NOT NULL,
+        query                 TEXT,
+        search_type           VARCHAR(32) NOT NULL,
+        filters_json          TEXT,
+        search_payload_json   MEDIUMTEXT,
+        conversation_ids_json MEDIUMTEXT NOT NULL,
+        ai_scores_json        MEDIUMTEXT,
+        sample_count          INT NOT NULL DEFAULT 0,
+        result_markdown       MEDIUMTEXT,
+        error_message         TEXT,
+        created_at            BIGINT NOT NULL,
+        started_at            BIGINT,
+        finished_at           BIGINT,
+        INDEX idx_report_job_created (created_at),
+        INDEX idx_report_job_status (status, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+]
+
 
 @dataclass
 class CreateReportPayload:
@@ -57,6 +103,15 @@ def _row_val(row: Any, key: str) -> Any:
 
 def _connect(db_path: str | None = None) -> Any:
     return db.connect(db_path) if db_path else db.connect()
+
+
+def ensure_report_schema(conn: Any) -> None:
+    """Ensure report tables exist for databases created before this feature."""
+    if db._db_mode() == "mysql":
+        for stmt in _MYSQL_REPORT_SCHEMA:
+            conn.execute(stmt)
+    else:
+        conn.executescript(_SQLITE_REPORT_SCHEMA)
 
 
 def _job_to_dict(row: Any, *, include_snapshot: bool = False) -> dict[str, Any]:
@@ -110,6 +165,7 @@ def create_report_job(payload: CreateReportPayload, *, db_path: str | None = Non
     cols = ", ".join(row.keys())
     placeholders = db._ph(len(row))
     with _connect(db_path) as conn:
+        ensure_report_schema(conn)
         conn.execute(
             f"INSERT INTO search_report_job ({cols}) VALUES ({placeholders})",
             tuple(row.values()),
@@ -121,6 +177,7 @@ def list_report_jobs(*, limit: int = 20, db_path: str | None = None) -> list[dic
     limit = max(1, min(limit, 100))
     ph = _ph1()
     with _connect(db_path) as conn:
+        ensure_report_schema(conn)
         rows = conn.execute(
             f"SELECT * FROM search_report_job ORDER BY created_at DESC, id DESC LIMIT {ph}",
             (limit,),
@@ -131,6 +188,7 @@ def list_report_jobs(*, limit: int = 20, db_path: str | None = None) -> list[dic
 def get_report_job(job_id: str, *, db_path: str | None = None) -> dict[str, Any] | None:
     ph = _ph1()
     with _connect(db_path) as conn:
+        ensure_report_schema(conn)
         row = conn.execute(
             f"SELECT * FROM search_report_job WHERE id = {ph}",
             (job_id,),
@@ -152,6 +210,7 @@ def _update_job(
     assignments = ", ".join(f"{key} = {ph}" for key in fields)
     values = list(fields.values()) + [job_id]
     with _connect(db_path) as conn:
+        ensure_report_schema(conn)
         conn.execute(
             f"UPDATE search_report_job SET {assignments} WHERE id = {ph}",
             tuple(values),
