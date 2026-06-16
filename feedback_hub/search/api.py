@@ -462,21 +462,20 @@ def smart_search(req: SmartSearchRequest):
         raise HTTPException(status_code=400, detail="请输入搜索意图")
 
     parsed = _parse_structured_intent(req.query, req.filters)
+    fallback_mode: str | None = None
 
     try:
         group_patterns, group_logics, group_logic = generate_regex_patterns(parsed.text_query)
     except SearchLLMError as e:
         logger.warning("Smart search LLM failed: %s", e)
-        raise HTTPException(
-            status_code=503,
-            detail="AI 服务暂时不可用，请尝试关键词搜索",
-        )
+        group_patterns, group_logics, group_logic = [], [], "OR"
+        fallback_mode = "query_keywords"
 
     search_where, search_params = _build_regex_where(group_patterns, group_logics, group_logic)
     if not search_where:
-        # LLM 生成的正则全部无效，回退为 LIKE
+        # LLM 失败或生成的正则全部无效，回退为 LIKE。
         all_patterns = [p for grp in group_patterns for p in grp]
-        keywords = re_fallback_keywords(all_patterns)
+        keywords = re_fallback_keywords(all_patterns) or re_fallback_keywords([parsed.text_query])
         if keywords:
             like_parts = []
             like_params = []
@@ -486,6 +485,7 @@ def smart_search(req: SmartSearchRequest):
             inner = " OR ".join(like_parts)
             search_where = f"cl.conversation_id IN (SELECT DISTINCT conversation_id FROM feedback WHERE {inner})"
             search_params = like_params
+            fallback_mode = fallback_mode or "regex_keywords"
         else:
             raise HTTPException(status_code=503, detail="AI 未能生成有效搜索条件")
 
@@ -508,6 +508,7 @@ def smart_search(req: SmartSearchRequest):
             "regex_patterns": flat_patterns,  # 向后兼容
             "text_query": parsed.text_query,
             "metadata_filters": parsed.filters.model_dump(by_alias=True),
+            "fallback": fallback_mode,
         },
     }
 

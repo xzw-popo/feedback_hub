@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from feedback_hub import config, db
 from feedback_hub.api import create_app
+from feedback_hub.search.llm_client import SearchLLMError
 
 
 def _seed(
@@ -168,3 +169,23 @@ def test_smart_search_extracts_device_name_without_making_it_text_condition(sear
     assert seen_queries == ["闪退"]
     assert data["total"] == 1
     assert [item["conversation_id"] for item in data["items"]] == ["conv-iphone15"]
+
+
+def test_smart_search_falls_back_to_query_keywords_when_llm_patterns_invalid(search_client, monkeypatch):
+    def fake_generate_regex_patterns(query: str):
+        raise SearchLLMError("LLM generated no valid regex patterns")
+
+    monkeypatch.setattr(
+        "feedback_hub.search.api.generate_regex_patterns",
+        fake_generate_regex_patterns,
+    )
+
+    resp = search_client.post(
+        "/api/smart-search",
+        json={"query": "闪退", "filters": {}, "limit": 20, "offset": 0},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 4
+    assert data["debug"]["fallback"] == "query_keywords"
