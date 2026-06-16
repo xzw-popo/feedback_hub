@@ -30,6 +30,7 @@ from feedback_hub import db
 from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
 from feedback_hub.importer import router as import_router
 from feedback_hub.search.api import router as search_router
+from feedback_hub.search.report_api import router as report_router
 
 
 def _ph1() -> str:
@@ -128,6 +129,8 @@ def create_app(
     app.include_router(import_router)
     # 注册智能搜索 API
     app.include_router(search_router)
+    # 注册搜索报告 API
+    app.include_router(report_router)
 
     def _conn() -> Any:
         c = db.connect(db_path) if db_path else db.connect()

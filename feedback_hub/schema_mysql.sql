@@ -106,3 +106,24 @@ CREATE TABLE IF NOT EXISTS push_log (
     INDEX idx_pushlog_repconv (representative_conversation_id),
     INDEX idx_pushlog_repmsg  (representative_feedback_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 6. 搜索报告任务
+CREATE TABLE IF NOT EXISTS search_report_job (
+    id                    VARCHAR(255) PRIMARY KEY,
+    status                VARCHAR(32) NOT NULL,
+    title                 VARCHAR(255) NOT NULL,
+    query                 TEXT,
+    search_type           VARCHAR(32) NOT NULL,
+    filters_json          TEXT,
+    search_payload_json   MEDIUMTEXT,
+    conversation_ids_json MEDIUMTEXT NOT NULL,
+    ai_scores_json        MEDIUMTEXT,
+    sample_count          INT NOT NULL DEFAULT 0,
+    result_markdown       MEDIUMTEXT,
+    error_message         TEXT,
+    created_at            BIGINT NOT NULL,
+    started_at            BIGINT,
+    finished_at           BIGINT,
+    INDEX idx_report_job_created (created_at),
+    INDEX idx_report_job_status (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

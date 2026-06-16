@@ -104,3 +104,24 @@ CREATE INDEX IF NOT EXISTS idx_pushlog_date    ON push_log(push_date);
 CREATE INDEX IF NOT EXISTS idx_pushlog_sig     ON push_log(signature);
 CREATE INDEX IF NOT EXISTS idx_pushlog_repconv ON push_log(representative_conversation_id);
 CREATE INDEX IF NOT EXISTS idx_pushlog_repmsg  ON push_log(representative_feedback_id);
+
+-- 6. 搜索报告任务：基于一次搜索结果快照异步生成 Markdown 报告
+CREATE TABLE IF NOT EXISTS search_report_job (
+    id                    TEXT PRIMARY KEY,
+    status                TEXT NOT NULL,
+    title                 TEXT NOT NULL,
+    query                 TEXT,
+    search_type           TEXT NOT NULL,
+    filters_json          TEXT,
+    search_payload_json   TEXT,
+    conversation_ids_json TEXT NOT NULL,
+    ai_scores_json        TEXT,
+    sample_count          INTEGER NOT NULL DEFAULT 0,
+    result_markdown       TEXT,
+    error_message         TEXT,
+    created_at            INTEGER NOT NULL,
+    started_at            INTEGER,
+    finished_at           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_report_job_created ON search_report_job(created_at);
+CREATE INDEX IF NOT EXISTS idx_report_job_status ON search_report_job(status, created_at);
