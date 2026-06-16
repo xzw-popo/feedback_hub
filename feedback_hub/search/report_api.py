@@ -1,9 +1,10 @@
 """Search report API endpoints."""
 from __future__ import annotations
 
+import threading
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from feedback_hub.search.report_service import (
@@ -18,6 +19,11 @@ from feedback_hub.search.report_service import (
 router = APIRouter(prefix="/api/search-reports", tags=["search-reports"])
 
 
+def start_report_job_async(job_id: str) -> None:
+    thread = threading.Thread(target=run_report_job, args=(job_id,), daemon=True)
+    thread.start()
+
+
 class CreateSearchReportRequest(BaseModel):
     title: str = "搜索反馈分析报告"
     query: Optional[str] = None
@@ -29,7 +35,7 @@ class CreateSearchReportRequest(BaseModel):
 
 
 @router.post("")
-def create_search_report(req: CreateSearchReportRequest, background_tasks: BackgroundTasks):
+def create_search_report(req: CreateSearchReportRequest):
     try:
         job = create_report_job(
             CreateReportPayload(
@@ -42,7 +48,7 @@ def create_search_report(req: CreateSearchReportRequest, background_tasks: Backg
                 ai_scores=req.ai_scores,
             )
         )
-        background_tasks.add_task(run_report_job, job["id"])
+        start_report_job_async(job["id"])
         return job
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -62,12 +68,12 @@ def get_search_report(job_id: str):
 
 
 @router.post("/{job_id}/retry")
-def retry_search_report(job_id: str, background_tasks: BackgroundTasks):
+def retry_search_report(job_id: str):
     try:
         job = retry_report_job(job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if job is None:
         raise HTTPException(status_code=404, detail="report job not found")
-    background_tasks.add_task(run_report_job, job_id)
+    start_report_job_async(job_id)
     return {"id": job_id, "status": job["status"]}

@@ -1,3 +1,5 @@
+import time
+
 from fastapi.testclient import TestClient
 
 from feedback_hub import db
@@ -136,3 +138,27 @@ def test_retry_failed_report_reuses_snapshot(tmp_path, monkeypatch):
     detail = client.get(f"/api/search-reports/{job['id']}").json()
     assert detail["status"] in ("pending", "running", "failed")
     assert detail["conversation_ids"] == ["missing"]
+
+
+def test_create_report_job_returns_before_generation_finishes(tmp_path, monkeypatch):
+    db_path = _seed_schema(tmp_path, monkeypatch)
+
+    def slow_run_report_job(job_id):
+        time.sleep(1.0)
+
+    monkeypatch.setattr(
+        "feedback_hub.search.report_api.run_report_job",
+        slow_run_report_job,
+    )
+    client = TestClient(create_app(db_path=str(db_path), frontend_dist=None))
+
+    start = time.time()
+    resp = client.post("/api/search-reports", json={
+        "title": "异步报告",
+        "search_type": "keyword",
+        "conversation_ids": ["c1"],
+    })
+    elapsed = time.time() - start
+
+    assert resp.status_code == 200
+    assert elapsed < 0.5
