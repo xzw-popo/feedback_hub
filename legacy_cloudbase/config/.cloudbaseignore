@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.git/
+.DS_Store
+*.pyc
+.pytest_cache/
+feedback_hub/data/
+feedback_hub/tests/
+feedback_hub/__pycache__/
+feedback_hub/**/__pycache__/
+dashboard/node_modules/
+dashboard/dist/
+docs/
+skills/
+cloudbase-skills/
+backfill.*.log

@@ -1,0 +1,349 @@
+# Feedback Hub CPU DevCloud 部署与同步手册
+
+本文档记录 Feedback Hub 部署到 CPU DevCloud 开发容器的完整流程，包括首次部署、日常代码更新、数据同步、远端管理和常见排障。
+
+## 1. 部署结论
+
+当前网站已部署在 CPU DevCloud 容器内，前端页面和后端 API 共用一个公网端口。
+
+访问地址：
+
+```text
+http://charvelxia-any2.devcloud.woa.com:8000/
+```
+
+远端目录：
+
+```text
+/opt/feedback_hub
+```
+
+默认端口：
+
+```text
+8000
+```
+
+## 2. 容器信息
+
+SSH 连接：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000
+```
+
+等价 IP 域名：
+
+```bash
+ssh root@21.91.26.201.devcloud.woa.com -p 36000
+```
+
+已确认的远端环境：
+
+- Python 3.11.6 可用。
+- `python3 -m venv` 可用。
+- `python3 -m ensurepip` 可用。
+- 远端没有 `node` / `npm`，因此前端在本机构建后上传。
+- `systemctl is-system-running` 为 `offline`，因此不用 systemd service。
+- 远端服务使用 Python venv + `nohup` 后台运行。
+
+## 3. 部署架构
+
+部署后，容器内独立保存和运行这些内容：
+
+- Vue/Vite 前端构建产物：`dashboard/dist`
+- FastAPI 后端代码：`feedback_hub`
+- SQLite 数据库：`feedback_hub/data/feedback.db`
+- Python 虚拟环境：`.venv`
+- 运行日志：`logs/app.log`
+- PID 文件：`run/feedback_hub.pid`
+
+FastAPI 会自动检测 `dashboard/dist/index.html`，并在同一个端口提供：
+
+- `/api/...`：后端 API
+- `/assets/...`：前端静态资源
+- `/`：前端首页
+- 其他前端路由：fallback 到 `index.html`
+
+前端生产构建必须使用同源 API，也就是请求当前域名下的 `/api`。因此：
+
+- `dashboard/.env.production` 中的 `VITE_API_BASE_URL` 应保持为空。
+- `deploy_devcloud.sh` 会在构建时显式清空 `VITE_API_BASE_URL`。
+- 不要在 DevCloud 部署中把 `VITE_API_BASE_URL` 写成 CloudBase 或其他旧后端域名。
+
+## 4. 首次部署
+
+在本机项目根目录执行：
+
+```bash
+APP_PORT=8000 ./deploy_devcloud.sh
+```
+
+脚本会自动完成：
+
+1. 在本机构建前端：`npm --prefix dashboard run build`
+2. 打包当前项目。
+3. 上传压缩包到远端容器。
+4. 停止远端旧服务。
+5. 替换远端目录 `/opt/feedback_hub`。
+6. 复用或创建远端 `.venv`。
+7. 安装 Python 依赖。
+8. 用 `nohup uvicorn` 启动 FastAPI。
+
+部署成功后访问：
+
+```text
+http://charvelxia-any2.devcloud.woa.com:8000/
+```
+
+如果需要使用其他端口：
+
+```bash
+APP_PORT=9000 ./deploy_devcloud.sh
+```
+
+如果需要部署到其他远端目录：
+
+```bash
+REMOTE_DIR=/data/feedback_hub APP_PORT=8000 ./deploy_devcloud.sh
+```
+
+## 5. 后续代码更新
+
+只要项目代码、前端页面、后端接口、依赖或文档发生需要发布到容器的变化，就重新执行：
+
+```bash
+APP_PORT=8000 ./deploy_devcloud.sh
+```
+
+这条命令是日常代码部署的标准入口。它会重新构建前端、上传项目、停止旧进程并启动新进程。
+
+部署后建议验证：
+
+```bash
+curl 'http://charvelxia-any2.devcloud.woa.com:8000/api/conversations?limit=1'
+```
+
+也可以在远端检查服务状态：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000
+cd /opt/feedback_hub
+APP_PORT=8000 scripts/devcloud_runtime.sh status
+```
+
+## 6. 数据更新方案
+
+数据更新有两种方式：容器自动更新，或本机更新后同步数据库到容器。
+
+### 6.1 方案 A：容器自动更新
+
+适用条件：
+
+- 容器能访问上游反馈接口。
+- 容器内 `.env` 配好了必要变量，例如 `LLM_API_KEY`、`WINK_AGENT_KEY` 等。
+- 上游接口不强绑定本机身份、浏览器态或其他只在本机存在的凭据。
+
+已完成基础连通性探测：
+
+- `wrfeedback.weread.woa.com:80/443` 可连通。
+- `api.deepseek.com:80/443` 可连通。
+- `winkagentsvr.dante.weread2.woa.com:80/443` 可连通。
+
+注意：网络连通不等于业务鉴权一定通过。真正切换到容器自动更新前，需要在远端执行一次真实拉取和打标流程验证。
+
+### 6.2 方案 B：本机自动更新后同步到容器
+
+如果容器无法通过业务鉴权，继续让本机执行自动更新，然后同步 SQLite 到远端。
+
+本机完成自动更新后，执行：
+
+```bash
+scp -P 36000 feedback_hub/data/feedback.db \
+  root@charvelxia-any2.devcloud.woa.com:/opt/feedback_hub/feedback_hub/data/feedback.db.new
+
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000 '
+  cd /opt/feedback_hub &&
+  scripts/devcloud_runtime.sh stop &&
+  mv feedback_hub/data/feedback.db.new feedback_hub/data/feedback.db &&
+  APP_PORT=8000 scripts/devcloud_runtime.sh start
+'
+```
+
+这个流程会先上传到 `.db.new`，再停服务并替换数据库，避免服务运行中直接覆盖 SQLite 文件。
+
+## 7. 远端管理命令
+
+登录远端：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000
+cd /opt/feedback_hub
+```
+
+查看状态：
+
+```bash
+APP_PORT=8000 scripts/devcloud_runtime.sh status
+```
+
+查看日志：
+
+```bash
+scripts/devcloud_runtime.sh logs
+```
+
+查看更多日志行：
+
+```bash
+LINES=300 scripts/devcloud_runtime.sh logs
+```
+
+重启：
+
+```bash
+APP_PORT=8000 scripts/devcloud_runtime.sh restart
+```
+
+停止：
+
+```bash
+scripts/devcloud_runtime.sh stop
+```
+
+启动：
+
+```bash
+APP_PORT=8000 scripts/devcloud_runtime.sh start
+```
+
+查看端口占用：
+
+```bash
+ss -ltnp | grep :8000
+```
+
+## 8. 验证清单
+
+部署后推荐按顺序检查：
+
+```bash
+curl -s -o /tmp/feedback_hub_index.html \
+  -w '%{http_code} %{content_type} %{size_download}\n' \
+  'http://charvelxia-any2.devcloud.woa.com:8000/'
+```
+
+期望首页返回：
+
+```text
+200 text/html
+```
+
+检查 API：
+
+```bash
+curl -s -o /tmp/feedback_hub_api.json \
+  -w '%{http_code} %{content_type} %{size_download}\n' \
+  'http://charvelxia-any2.devcloud.woa.com:8000/api/conversations?limit=1'
+```
+
+期望 API 返回：
+
+```text
+200 application/json
+```
+
+检查远端进程：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000 '
+  cd /opt/feedback_hub &&
+  APP_PORT=8000 scripts/devcloud_runtime.sh status
+'
+```
+
+期望看到：
+
+```text
+[runtime] running pid=<pid> port=8000
+```
+
+## 9. 常见问题
+
+### 页面提示“网络错误，请检查后端服务”
+
+优先检查生产构建是否误用了旧 API 域名。
+
+本地检查：
+
+```bash
+rg -n 'feedback-api|tcloudbase|sh.run.tcloudbase|VITE_API_BASE_URL' dashboard/dist dashboard/.env.production
+```
+
+远端检查：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000 \
+  "rg -n 'feedback-api|tcloudbase|sh.run.tcloudbase' /opt/feedback_hub/dashboard/dist || true"
+```
+
+如果产物里出现旧后端域名，确认 `dashboard/.env.production` 中 `VITE_API_BASE_URL=` 为空，然后重新部署：
+
+```bash
+APP_PORT=8000 ./deploy_devcloud.sh
+```
+
+### 重部署后仍然访问到旧页面
+
+可能是浏览器缓存。先强制刷新：
+
+```text
+Cmd + Shift + R
+```
+
+再检查首页引用的 JS 文件是否已变化：
+
+```bash
+curl -s 'http://charvelxia-any2.devcloud.woa.com:8000/'
+```
+
+### 新进程启动失败，提示端口占用
+
+检查远端端口：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000 '
+  ss -ltnp | grep :8000 || true
+'
+```
+
+当前 `scripts/devcloud_runtime.sh stop` 会优先按 PID 文件停止服务，并兜底停止占用 `APP_PORT` 的进程。修复后重新部署即可：
+
+```bash
+APP_PORT=8000 ./deploy_devcloud.sh
+```
+
+### API 能访问，但页面列表为空
+
+先直接请求列表 API：
+
+```bash
+curl 'http://charvelxia-any2.devcloud.woa.com:8000/api/conversations?limit=1'
+```
+
+如果 API 有数据而页面没有，检查浏览器控制台和前端构建产物。  
+如果 API 也没有数据，检查远端 SQLite：
+
+```bash
+ssh root@charvelxia-any2.devcloud.woa.com -p 36000 '
+  ls -lh /opt/feedback_hub/feedback_hub/data/feedback.db
+'
+```
+
+## 10. 注意事项
+
+- `deploy_devcloud.sh` 会上传当前工作区的 `.env`，请确认里面是远端运行允许使用的配置。
+- SQLite 是文件数据库。替换数据库前应先停止服务。
+- 如果开发容器被平台重置，`/opt/feedback_hub` 可能需要重新部署。
+- 当前长期运行依赖 `nohup` 后台进程。如果平台后续提供更正式的进程保活能力，可以再切换。
+- 日常记忆方式：改代码跑 `./deploy_devcloud.sh`，只更新数据就同步 `feedback.db` 并重启服务。

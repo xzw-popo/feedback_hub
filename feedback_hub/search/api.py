@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -33,8 +34,15 @@ class MetadataFilters(BaseModel):
     L2: Optional[str] = None
     severity: Optional[str] = None
     platform: Optional[str] = None
+    appversion: Optional[str] = None
+    device_name: Optional[str] = None
 
     model_config = {"populate_by_name": True}
+
+
+class ParsedSearchIntent(BaseModel):
+    text_query: str
+    filters: MetadataFilters
 
 
 class KeywordGroup(BaseModel):
@@ -120,6 +128,83 @@ def _parse_dt(s: Optional[str], *, end_of_day: bool = False) -> Optional[int]:
     return None
 
 
+_VERSION_RE = re.compile(r"(?<![A-Za-z0-9])v?(\d+(?:\.\d+){1,4})(?![A-Za-z0-9])", re.IGNORECASE)
+_PLATFORM_ALIASES: tuple[tuple[str, str], ...] = (
+    (r"(?<![A-Za-z0-9])windows?(?![A-Za-z0-9])", "Win"),
+    (r"(?<![A-Za-z0-9])win(?:32|64)?(?![A-Za-z0-9])", "Win"),
+    (r"(?<![A-Za-z0-9])mac\s*os(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])macos(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])mac(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])ios(?![A-Za-z0-9])", "iOS"),
+    (r"(?<![A-Za-z0-9])android(?![A-Za-z0-9])", "Android"),
+    (r"小程序", "小程序"),
+)
+_DEVICE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<![A-Za-z0-9])iPhone\s*\d+(?:,\d+)?(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])iPad\s*\d*(?:,\d+)?(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])MacBook(?:\s*(?:Pro|Air))?(?:\s*\d+(?:,\d+)?)?(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])Mate\s*\d+\w*(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])Pixel\s*\d+\w*(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])ThinkPad\s+[A-Za-z0-9][A-Za-z0-9 -]{0,24}(?![A-Za-z0-9])", re.IGNORECASE),
+)
+
+
+def _append_csv(existing: Optional[str], values: list[str]) -> Optional[str]:
+    merged: list[str] = []
+    for v in (existing or "").split(","):
+        v = v.strip()
+        if v and v not in merged:
+            merged.append(v)
+    for v in values:
+        v = v.strip()
+        if v and v not in merged:
+            merged.append(v)
+    return ",".join(merged) if merged else None
+
+
+def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    chars = list(text)
+    for start, end in spans:
+        for i in range(start, end):
+            chars[i] = " "
+    return "".join(chars)
+
+
+def _normalize_text_query(query: str) -> str:
+    query = re.sub(r"\s+", " ", query).strip()
+    return query.strip() or "反馈"
+
+
+def _parse_structured_intent(query: str, filters: MetadataFilters) -> ParsedSearchIntent:
+    """从自然语言查询中提取版本、平台、设备，并从正文意图中剥离这些片段。"""
+    spans: list[tuple[int, int]] = []
+    versions: list[str] = []
+    platforms: list[str] = []
+    devices: list[str] = []
+
+    for m in _VERSION_RE.finditer(query):
+        versions.append(m.group(1))
+        spans.append(m.span())
+
+    for pattern, platform in _PLATFORM_ALIASES:
+        for m in re.finditer(pattern, query, re.IGNORECASE):
+            platforms.append(platform)
+            spans.append(m.span())
+
+    for pattern in _DEVICE_PATTERNS:
+        for m in pattern.finditer(query):
+            devices.append(re.sub(r"\s+", "", m.group(0)))
+            spans.append(m.span())
+
+    text_query = _normalize_text_query(_blank_spans(query, spans))
+    merged_filters = filters.model_copy(update={
+        "appversion": _append_csv(filters.appversion, versions),
+        "platform": _append_csv(filters.platform, platforms),
+        "device_name": _append_csv(filters.device_name, devices),
+    })
+    return ParsedSearchIntent(text_query=text_query, filters=merged_filters)
+
+
 def _build_metadata_where(filters: MetadataFilters) -> tuple[str, list[Any]]:
     """从元数据筛选构建 WHERE 子句。"""
     clauses: list[str] = []
@@ -159,6 +244,21 @@ def _build_metadata_where(filters: MetadataFilters) -> tuple[str, list[Any]]:
                 f"SELECT DISTINCT conversation_id FROM feedback WHERE platform IN ({plat_ph}))"
             )
             params.extend(plat_list)
+    if filters.appversion:
+        versions = [v.strip() for v in filters.appversion.split(",") if v.strip()]
+        if versions:
+            version_parts = [f"cl.appversion LIKE {ph}" for _ in versions]
+            clauses.append(f"({' OR '.join(version_parts)})")
+            params.extend(f"{v}%" for v in versions)
+    if filters.device_name:
+        devices = [d.strip().lower() for d in filters.device_name.split(",") if d.strip()]
+        if devices:
+            device_parts = [f"LOWER(device_name) LIKE {ph}" for _ in devices]
+            clauses.append(
+                f"cl.conversation_id IN ("
+                f"SELECT DISTINCT conversation_id FROM feedback WHERE {' OR '.join(device_parts)})"
+            )
+            params.extend(f"%{d}%" for d in devices)
 
     return (" AND ".join(clauses)), params
 
@@ -361,8 +461,10 @@ def smart_search(req: SmartSearchRequest):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="请输入搜索意图")
 
+    parsed = _parse_structured_intent(req.query, req.filters)
+
     try:
-        group_patterns, group_logics, group_logic = generate_regex_patterns(req.query)
+        group_patterns, group_logics, group_logic = generate_regex_patterns(parsed.text_query)
     except SearchLLMError as e:
         logger.warning("Smart search LLM failed: %s", e)
         raise HTTPException(
@@ -388,7 +490,7 @@ def smart_search(req: SmartSearchRequest):
             raise HTTPException(status_code=503, detail="AI 未能生成有效搜索条件")
 
     total, items = _execute_search_query(
-        search_where, search_params, req.filters, req.limit, req.offset,
+        search_where, search_params, parsed.filters, req.limit, req.offset,
     )
 
     # 展平 patterns 供 debug 展示
@@ -404,6 +506,8 @@ def smart_search(req: SmartSearchRequest):
             ],
             "group_logic": group_logic,
             "regex_patterns": flat_patterns,  # 向后兼容
+            "text_query": parsed.text_query,
+            "metadata_filters": parsed.filters.model_dump(by_alias=True),
         },
     }
 

@@ -18,11 +18,13 @@ import csv
 import io
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from feedback_hub import db
 from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
@@ -105,7 +107,16 @@ def _get_cors_origins() -> list[str]:
     ]
 
 
-def create_app(db_path: Optional[str] = None) -> FastAPI:
+def _default_frontend_dist() -> Optional[Path]:
+    """Return dashboard/dist when present, otherwise disable frontend serving."""
+    dist = Path(__file__).resolve().parent.parent / "dashboard" / "dist"
+    return dist if (dist / "index.html").exists() else None
+
+
+def create_app(
+    db_path: Optional[str] = None,
+    frontend_dist: Optional[str | Path] = None,
+) -> FastAPI:
     app = FastAPI(title="feedback_hub", version="1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -359,6 +370,25 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="conversations.csv"'},
         )
+
+    dist_path = Path(frontend_dist) if frontend_dist is not None else _default_frontend_dist()
+    if dist_path is not None and (dist_path / "index.html").exists():
+        assets_path = dist_path / "assets"
+        if assets_path.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_path)), name="assets")
+
+        @app.get("/", include_in_schema=False)
+        def frontend_index():
+            return FileResponse(dist_path / "index.html")
+
+        @app.get("/{path:path}", include_in_schema=False)
+        def frontend_fallback(path: str):
+            if path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="Not Found")
+            target = dist_path / path
+            if target.is_file():
+                return FileResponse(target)
+            return FileResponse(dist_path / "index.html")
 
     return app
 

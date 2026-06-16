@@ -8,6 +8,9 @@ docs/
 skills/
 cloudbase-skills/
 .git/
+.env
+.env.*
+!.env.example
 .DS_Store
 *.pyc
 .pytest_cache/
