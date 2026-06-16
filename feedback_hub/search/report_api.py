@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from feedback_hub.search.report_service import (
@@ -11,6 +11,8 @@ from feedback_hub.search.report_service import (
     create_report_job,
     get_report_job,
     list_report_jobs,
+    retry_report_job,
+    run_report_job,
 )
 
 router = APIRouter(prefix="/api/search-reports", tags=["search-reports"])
@@ -27,9 +29,9 @@ class CreateSearchReportRequest(BaseModel):
 
 
 @router.post("")
-def create_search_report(req: CreateSearchReportRequest):
+def create_search_report(req: CreateSearchReportRequest, background_tasks: BackgroundTasks):
     try:
-        return create_report_job(
+        job = create_report_job(
             CreateReportPayload(
                 title=req.title,
                 query=req.query,
@@ -40,6 +42,8 @@ def create_search_report(req: CreateSearchReportRequest):
                 ai_scores=req.ai_scores,
             )
         )
+        background_tasks.add_task(run_report_job, job["id"])
+        return job
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -55,3 +59,15 @@ def get_search_report(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="report job not found")
     return job
+
+
+@router.post("/{job_id}/retry")
+def retry_search_report(job_id: str, background_tasks: BackgroundTasks):
+    try:
+        job = retry_report_job(job_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if job is None:
+        raise HTTPException(status_code=404, detail="report job not found")
+    background_tasks.add_task(run_report_job, job_id)
+    return {"id": job_id, "status": job["status"]}
