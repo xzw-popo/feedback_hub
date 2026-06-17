@@ -38,6 +38,12 @@ const { healthy } = useApiHealth()
           >
             反馈列表<span class="beta-tag">测试</span>
           </router-link>
+          <router-link
+            to="/reports"
+            class="nav-item"
+          >
+            报告
+          </router-link>
         </nav>
       </aside>
       <main class="layout-main">
