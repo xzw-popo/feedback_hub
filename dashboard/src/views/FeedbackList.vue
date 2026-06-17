@@ -8,6 +8,7 @@ import KeywordBuilder from '@/components/KeywordBuilder.vue'
 import FineFilterButton from '@/components/FineFilterButton.vue'
 import { useUrlQuery } from '@/composables/useUrlQuery'
 import { provideSearchState } from '@/composables/useSearchState'
+import { renderMarkdown } from '@/utils/markdown'
 import {
   listConversations,
   exportCsvUrl,
@@ -168,6 +169,11 @@ const reportSnapshotCount = computed(() => displayItems.value.length)
 const reportSampleLimit = computed(() => Math.min(displayItems.value.length, 80))
 const hasRunningReports = computed(() =>
   reportJobs.value.some(job => job.status === 'pending' || job.status === 'running')
+)
+const renderedReportHtml = computed(() =>
+  selectedReport.value?.result_markdown
+    ? renderMarkdown(selectedReport.value.result_markdown)
+    : ''
 )
 
 function defaultReportTitle() {
@@ -544,10 +550,11 @@ onUnmounted(() => {
               :title="reportStatusText(selectedReport.status)"
               sub-title="报告生成后会自动刷新"
             />
-            <pre
+            <div
               v-else
               class="report-markdown"
-            >{{ selectedReport.result_markdown }}</pre>
+              v-html="renderedReportHtml"
+            />
           </template>
         </div>
       </div>
@@ -688,10 +695,56 @@ onUnmounted(() => {
   border-radius: 6px;
   background: var(--el-fill-color-lighter);
   color: var(--el-text-color-primary);
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.7;
-  font-family: inherit;
+}
+.report-markdown :deep(h1),
+.report-markdown :deep(h2),
+.report-markdown :deep(h3) {
+  margin: 18px 0 8px;
+  color: var(--el-text-color-primary);
+  line-height: 1.35;
+}
+.report-markdown :deep(h1) {
+  margin-top: 0;
+  font-size: 22px;
+}
+.report-markdown :deep(h2) {
+  font-size: 18px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  padding-bottom: 4px;
+}
+.report-markdown :deep(h3) {
+  font-size: 15px;
+}
+.report-markdown :deep(p) {
+  margin: 8px 0;
+}
+.report-markdown :deep(ul),
+.report-markdown :deep(ol) {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.report-markdown :deep(li) {
+  margin: 4px 0;
+}
+.report-markdown :deep(code) {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--el-fill-color);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+}
+.report-markdown :deep(pre) {
+  margin: 10px 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--el-fill-color);
+}
+.report-markdown :deep(pre code) {
+  padding: 0;
+  background: transparent;
 }
 .pager {
   margin-top: 16px;
