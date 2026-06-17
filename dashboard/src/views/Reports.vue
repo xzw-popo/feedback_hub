@@ -359,6 +359,25 @@ onUnmounted(() => {
   padding: 0;
   background: transparent;
 }
+.report-markdown :deep(table) {
+  width: 100%;
+  margin: 12px 0;
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+.report-markdown :deep(th),
+.report-markdown :deep(td) {
+  border: 1px solid var(--el-border-color);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.report-markdown :deep(th) {
+  background: var(--el-fill-color);
+  font-weight: 600;
+}
 @media (max-width: 900px) {
   .reports-layout {
     grid-template-columns: 1fr;

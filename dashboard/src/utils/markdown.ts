@@ -26,6 +26,29 @@ function flushList(out: string[], list: string[], ordered: boolean) {
   list.length = 0
 }
 
+function isTableRow(line: string): boolean {
+  return line.trim().startsWith('|') && line.trim().endsWith('|')
+}
+
+function isTableDivider(line: string): boolean {
+  return isTableRow(line) && splitTableRow(line).every(cell => /^:?-{3,}:?$/.test(cell.trim()))
+}
+
+function splitTableRow(line: string): string[] {
+  const trimmed = line.trim()
+  return trimmed.slice(1, -1).split('|').map(cell => cell.trim())
+}
+
+function renderTable(rows: string[]): string {
+  const headers = splitTableRow(rows[0])
+  const bodyRows = rows.slice(2).map(splitTableRow)
+  const thead = `<thead><tr>${headers.map(cell => `<th>${renderInline(cell)}</th>`).join('')}</tr></thead>`
+  const tbody = bodyRows.length
+    ? `<tbody>${bodyRows.map(row => `<tr>${row.map(cell => `<td>${renderInline(cell)}</td>`).join('')}</tr>`).join('')}</tbody>`
+    : ''
+  return `<table>${thead}${tbody}</table>`
+}
+
 export function renderMarkdown(markdown: string): string {
   const out: string[] = []
   const paragraph: string[] = []
@@ -33,8 +56,10 @@ export function renderMarkdown(markdown: string): string {
   const code: string[] = []
   let inCode = false
   let orderedList = false
+  const lines = markdown.split(/\r?\n/)
 
-  for (const rawLine of markdown.split(/\r?\n/)) {
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i]
     const line = rawLine.trimEnd()
 
     if (line.trim().startsWith('```')) {
@@ -59,6 +84,21 @@ export function renderMarkdown(markdown: string): string {
       flushParagraph(out, paragraph)
       flushList(out, list, orderedList)
       orderedList = false
+      continue
+    }
+
+    if (isTableRow(line) && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flushParagraph(out, paragraph)
+      flushList(out, list, orderedList)
+      orderedList = false
+      const tableRows = [line, lines[i + 1]]
+      i += 2
+      while (i < lines.length && isTableRow(lines[i])) {
+        tableRows.push(lines[i].trimEnd())
+        i += 1
+      }
+      i -= 1
+      out.push(renderTable(tableRows))
       continue
     }
 
