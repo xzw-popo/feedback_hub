@@ -93,3 +93,81 @@ def test_date_filters_fall_back_to_last_seen_when_created_at_is_missing():
 
     assert stats["total_posts"] == 1
     assert posts["total"] == 1
+
+
+def test_upsert_skips_irrelevant_weibo_search_noise():
+    conn = make_conn()
+
+    result = upsert_post(
+        conn,
+        {
+            "weibo_id": "1005",
+            "url": "https://weibo.com/1005",
+            "text": "更好看的来咯来咯",
+            "raw": {},
+        },
+        keyword="微信键盘 豆包",
+        searched_at=1782216800,
+    )
+
+    assert result["inserted"] is False
+    assert result["skipped"] is True
+    assert list_posts(conn, limit=20, offset=0)["total"] == 0
+
+
+def test_upsert_skips_generic_wechat_and_keyboard_mentions():
+    conn = make_conn()
+
+    result = upsert_post(
+        conn,
+        {
+            "weibo_id": "1007",
+            "url": "https://weibo.com/1007",
+            "text": "猫咪踩键盘，在企业微信工作群里发了半小时乱码",
+            "raw": {},
+        },
+        keyword="微信键盘",
+        searched_at=1782216800,
+    )
+
+    assert result["inserted"] is False
+    assert result["skipped"] is True
+    assert list_posts(conn, limit=20, offset=0)["total"] == 0
+
+
+def test_upsert_keeps_exact_wechat_input_method_mentions():
+    conn = make_conn()
+
+    result = upsert_post(
+        conn,
+        {
+            "weibo_id": "1008",
+            "url": "https://weibo.com/1008",
+            "text": "微信输入法的语音输入功能也太舒服了",
+            "raw": {},
+        },
+        keyword="微信输入法",
+        searched_at=1782216800,
+    )
+
+    assert result["inserted"] is True
+    assert list_posts(conn, brand_focus="wechat", limit=20, offset=0)["total"] == 1
+
+
+def test_upsert_keeps_doubao_input_related_variant():
+    conn = make_conn()
+
+    result = upsert_post(
+        conn,
+        {
+            "weibo_id": "1006",
+            "url": "https://weibo.com/1006",
+            "text": "豆包语音输入法真的省事，长微博都能直接说出来",
+            "raw": {},
+        },
+        keyword="豆包输入法",
+        searched_at=1782216800,
+    )
+
+    assert result["inserted"] is True
+    assert list_posts(conn, brand_focus="doubao", limit=20, offset=0)["total"] == 1

@@ -27,3 +27,16 @@ def test_classifies_doubao_ai_topic():
     assert label["sentiment"] == "positive"
     assert "ai_capability" in label["topics"]
     assert label["post_type"] == "recommendation"
+
+
+def test_doubao_phone_with_generic_wechat_mention_is_not_comparison():
+    label = classify_post("豆包AI手机能帮老人操作软件，不用教爸妈微信怎么用了")
+
+    assert label["brand_focus"] == "doubao"
+    assert label["sentiment"] == "neutral"
+
+
+def test_nearby_wechat_and_doubao_input_method_terms_are_comparison():
+    label = classify_post("现在微信和豆包最新的输入法版本都解决了语音转文字权限问题")
+
+    assert label["brand_focus"] == "comparison"

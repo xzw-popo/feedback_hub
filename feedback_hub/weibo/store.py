@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from feedback_hub.weibo.labels import classify_post
+from feedback_hub.weibo.labels import classify_post, is_relevant_post
 
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
@@ -59,6 +59,8 @@ def upsert_post(
         raise ValueError("weibo_id is required")
     author = row.get("author") or {}
     text = str(row.get("text") or "")
+    if not is_relevant_post(text, keyword):
+        return {"inserted": False, "weibo_id": weibo_id, "skipped": True}
     existing = conn.execute("SELECT weibo_id FROM weibo_post WHERE weibo_id = ?", (weibo_id,)).fetchone()
     post_id = str(row.get("id") or f"wb_{weibo_id}")
     payload = (

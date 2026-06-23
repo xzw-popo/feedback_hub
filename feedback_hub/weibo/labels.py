@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
-WECHAT_TERMS = ("微信输入法", "微信键盘", "微信")
+WECHAT_TERMS = ("微信输入法", "微信键盘")
 DOUBAO_TERMS = ("豆包输入法", "豆包")
 COMPARISON_TERMS = ("比", "相比", "不如", "换成", "替代", "对比", "吊打", "更")
 POSITIVE_TERMS = ("好用", "流畅", "推荐", "准确", "方便", "智能", "不错", "喜欢")
 NEGATIVE_TERMS = ("难用", "崩", "垃圾", "烦", "广告", "隐私", "偷听", "卡", "bug", "问题")
 HIGH_RISK_TERMS = ("大规模", "热搜", "泄露", "严重", "投诉")
+WEIBO_PRODUCT_TERMS = ("微信输入法", "微信键盘", "豆包输入法")
+DOUBAO_CONTEXT_TERMS = ("输入法", "键盘", "语音输入", "AI手机", "ai手机", "手机", "改写")
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -16,9 +19,38 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term.lower() in lowered for term in terms)
 
 
+def _has_wechat_input_context(text: str) -> bool:
+    if _contains_any(text, WECHAT_TERMS):
+        return True
+    return bool(re.search(r"微信.{0,12}(输入法|键盘|语音输入|语音转文字)", text))
+
+
+def _has_doubao_input_context(text: str) -> bool:
+    return _contains_any(text, DOUBAO_TERMS) and _contains_any(text, DOUBAO_CONTEXT_TERMS)
+
+
+def is_relevant_post(text: str, keyword: str = "") -> bool:
+    """Return whether a Weibo search result is relevant to the opinion module.
+
+    Weibo PC search treats multi-word queries loosely, so terms like
+    "微信键盘 豆包" can return posts that contain none of the product intent.
+    The MVP keeps exact product mentions and close brand+input contexts.
+    """
+    normalized = (text or "").strip()
+    if _contains_any(normalized, WEIBO_PRODUCT_TERMS):
+        return True
+    if _has_wechat_input_context(normalized):
+        return True
+    if _has_doubao_input_context(normalized):
+        return True
+    # Keep comparison query results only when visible text contains exact WeChat
+    # input-method terms or a Doubao input/phone context.
+    return False
+
+
 def _brand_focus(text: str) -> str:
-    has_wechat = _contains_any(text, WECHAT_TERMS)
-    has_doubao = _contains_any(text, DOUBAO_TERMS)
+    has_wechat = _has_wechat_input_context(text)
+    has_doubao = _has_doubao_input_context(text) or _contains_any(text, ("豆包输入法",))
     if has_wechat and has_doubao:
         return "comparison"
     if has_doubao:
