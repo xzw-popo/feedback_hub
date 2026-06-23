@@ -104,6 +104,7 @@ def upsert_post(
     searched_at: int | None = None,
     search_rank: int = 1,
     source_mode: str = "pc",
+    skip_irrelevant: bool = True,
 ) -> dict[str, Any]:
     now = int(time.time()) if searched_at is None else searched_at
     weibo_id = str(row.get("weibo_id") or row.get("id") or "")
@@ -111,7 +112,7 @@ def upsert_post(
         raise ValueError("weibo_id is required")
     author = row.get("author") or {}
     text = str(row.get("text") or "")
-    if not is_relevant_post(text, keyword):
+    if skip_irrelevant and not is_relevant_post(text, keyword):
         return {"inserted": False, "weibo_id": weibo_id, "skipped": True}
     existing = conn.execute("SELECT weibo_id FROM weibo_post WHERE weibo_id = ?", (weibo_id,)).fetchone()
     post_id = str(row.get("id") or f"wb_{weibo_id}")
@@ -191,6 +192,51 @@ def upsert_post(
     return {"inserted": inserted, "weibo_id": weibo_id}
 
 
+def apply_label(conn: Any, weibo_id: str, label: dict[str, Any], *, labeled_at: int | None = None) -> None:
+    reason_parts = [str(label.get("summary") or "").strip(), str(label.get("reason") or "").strip()]
+    reason = "\n\n".join(part for part in reason_parts if part)
+    source = "llm_hidden" if label.get("is_relevant") is False else str(label.get("label_source") or "llm")
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO weibo_label (
+            weibo_id, brand_focus, sentiment, topics_json, post_type, risk_level,
+            confidence, reason, label_source, labeled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            weibo_id,
+            label["brand_focus"],
+            label["sentiment"],
+            _dumps(label.get("topics") or ["other"]),
+            label["post_type"],
+            label["risk_level"],
+            label.get("confidence"),
+            reason,
+            source,
+            labeled_at or int(time.time()),
+        ),
+    )
+
+
+def iter_posts_for_labeling(conn: Any, *, limit: int = 50, only_rule: bool = True) -> list[dict[str, Any]]:
+    where = "WHERE wl.label_source NOT IN ('llm', 'llm_hidden')" if only_rule else ""
+    rows = conn.execute(
+        f"""
+        SELECT wp.*, wl.brand_focus, wl.sentiment, wl.topics_json, wl.post_type,
+               wl.risk_level, wl.confidence, wl.reason, wl.label_source
+        FROM weibo_post wp
+        JOIN weibo_label wl ON wp.weibo_id = wl.weibo_id
+        {where}
+        ORDER BY COALESCE(wp.created_at_ms, wp.last_seen_at * 1000) DESC, wp.weibo_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    ids = [str(_row_get(row, "weibo_id")) for row in rows]
+    keywords = _keyword_map(conn, ids)
+    return [_row_to_item(row, keywords.get(str(_row_get(row, "weibo_id")), [])) for row in rows]
+
+
 def _build_filters(
     *,
     from_: str | None = None,
@@ -202,9 +248,12 @@ def _build_filters(
     post_type: str | None = None,
     risk_level: str | None = None,
     keyword: str | None = None,
+    include_hidden: bool = False,
 ) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
+    if not include_hidden:
+        clauses.append("wl.label_source != 'llm_hidden'")
     event_time_expr = "COALESCE(wp.created_at_ms, wp.last_seen_at * 1000)"
     if from_:
         clauses.append(f"{event_time_expr} >= ?")
@@ -310,6 +359,7 @@ def list_posts(
     keyword: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    include_hidden: bool = False,
 ) -> dict[str, Any]:
     where, params = _build_filters(
         from_=from_,
@@ -321,6 +371,7 @@ def list_posts(
         post_type=post_type,
         risk_level=risk_level,
         keyword=keyword,
+        include_hidden=include_hidden,
     )
     total = conn.execute(
         f"SELECT COUNT(*) AS cnt FROM weibo_post wp JOIN weibo_label wl ON wp.weibo_id = wl.weibo_id {where}",
@@ -365,8 +416,14 @@ def get_post(conn: Any, post_id: str) -> dict[str, Any] | None:
     return item
 
 
-def get_stats(conn: Any, *, from_: str | None = None, to: str | None = None) -> dict[str, Any]:
-    where, params = _build_filters(from_=from_, to=to)
+def get_stats(
+    conn: Any,
+    *,
+    from_: str | None = None,
+    to: str | None = None,
+    include_hidden: bool = False,
+) -> dict[str, Any]:
+    where, params = _build_filters(from_=from_, to=to, include_hidden=include_hidden)
     rows = conn.execute(
         f"""
         SELECT wl.brand_focus, wl.sentiment, wl.topics_json, wl.risk_level,
