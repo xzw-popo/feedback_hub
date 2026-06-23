@@ -4,6 +4,7 @@ from feedback_hub.weibo.store import (
     get_stats,
     init_schema,
     list_posts,
+    parse_weibo_created_at,
     upsert_post,
 )
 
@@ -46,6 +47,36 @@ def test_upsert_post_creates_post_hit_and_label():
     assert posts["items"][0]["keywords"] == ["微信输入法 豆包"]
     assert posts["items"][0]["brand_focus"] == "comparison"
     assert posts["items"][0]["sentiment"] == "positive"
+
+
+def test_parse_weibo_created_at_freezes_relative_today_values():
+    base = 1782216800
+
+    assert parse_weibo_created_at("今天16:00", base) == 1782201600000
+    assert parse_weibo_created_at("20分钟前", base) == (base - 20 * 60) * 1000
+    assert parse_weibo_created_at("06月22日 21:49", base) == 1782136140000
+    assert parse_weibo_created_at("2025年11月03日 16:11", base) == 1762157460000
+
+
+def test_upsert_parses_created_at_raw_to_absolute_timestamp():
+    conn = make_conn()
+
+    upsert_post(
+        conn,
+        {
+            "weibo_id": "1010",
+            "url": "https://weibo.com/1010",
+            "created_at_raw": "今天16:00",
+            "text": "微信输入法的语音输入功能也太舒服了",
+            "raw": {},
+        },
+        keyword="微信输入法",
+        searched_at=1782216800,
+    )
+
+    posts = list_posts(conn, limit=20, offset=0)
+
+    assert posts["items"][0]["created_at_ms"] == 1782201600000
 
 
 def test_repeated_upsert_updates_post_and_preserves_hits():

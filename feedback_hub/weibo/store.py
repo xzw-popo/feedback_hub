@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -43,6 +45,56 @@ def _ph(n: int) -> str:
     return ", ".join(["?"] * n)
 
 
+def parse_weibo_created_at(raw: str | None, base_seen_at: int | None = None) -> int | None:
+    """Parse Weibo PC search time text into an absolute unix timestamp in ms.
+
+    PC search returns display strings such as "今天16:00", "20分钟前", or
+    "06月22日 21:49". Store an absolute timestamp at ingest time so later UI
+    renders do not reinterpret "今天" on a different date.
+    """
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    base = datetime.fromtimestamp(base_seen_at or int(time.time()))
+    match = re.match(r"^今天\s*(\d{1,2}):(\d{2})$", value)
+    if match:
+        hour, minute = match.groups()
+        return int(base.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0).timestamp() * 1000)
+    match = re.match(r"^(\d+)\s*分钟前$", value)
+    if match:
+        dt = base - timedelta(minutes=int(match.group(1)))
+        return int(dt.timestamp() * 1000)
+    match = re.match(r"^(\d{1,2})月(\d{1,2})日\s+(\d{1,2}):(\d{2})$", value)
+    if match:
+        month, day, hour, minute = match.groups()
+        dt = base.replace(
+            month=int(month),
+            day=int(day),
+            hour=int(hour),
+            minute=int(minute),
+            second=0,
+            microsecond=0,
+        )
+        # If the month/day would be in the future relative to the crawl, it
+        # belongs to the previous year.
+        if dt > base + timedelta(days=1):
+            dt = dt.replace(year=dt.year - 1)
+        return int(dt.timestamp() * 1000)
+    match = re.match(r"^(\d{4})年(\d{1,2})月(\d{1,2})日\s+(\d{1,2}):(\d{2})$", value)
+    if match:
+        year, month, day, hour, minute = match.groups()
+        dt = datetime(int(year), int(month), int(day), int(hour), int(minute))
+        return int(dt.timestamp() * 1000)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return int(datetime.strptime(value, fmt).timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
 def upsert_post(
     conn: Any,
     row: dict[str, Any],
@@ -72,7 +124,7 @@ def upsert_post(
         str(author.get("screen_name") or row.get("author_name") or ""),
         1 if bool(author.get("verified") or row.get("author_verified")) else 0,
         row.get("created_at_raw") or "",
-        row.get("created_at_ms"),
+        row.get("created_at_ms") or parse_weibo_created_at(row.get("created_at_raw"), now),
         text,
         _dumps(row.get("pic_urls") or []),
         row.get("reposts_count"),
