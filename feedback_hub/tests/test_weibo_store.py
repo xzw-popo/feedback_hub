@@ -70,3 +70,26 @@ def test_stats_counts_brand_sentiment_and_latest_run():
     assert stats["brand_focus_counts"]["doubao"] == 1
     assert stats["sentiment_counts"]["positive"] == 1
     assert stats["topic_counts"]["ai_capability"] == 1
+
+
+def test_date_filters_fall_back_to_last_seen_when_created_at_is_missing():
+    conn = make_conn()
+
+    upsert_post(
+        conn,
+        {
+            "weibo_id": "1004",
+            "url": "https://weibo.com/1004",
+            "created_at_raw": "今天18:31",
+            "text": "微信键盘挺聪明",
+            "raw": {},
+        },
+        keyword="微信键盘",
+        searched_at=1782216800,
+    )
+
+    stats = get_stats(conn, from_="2026-06-23", to="2026-06-23")
+    posts = list_posts(conn, from_="2026-06-23", to="2026-06-23", limit=20, offset=0)
+
+    assert stats["total_posts"] == 1
+    assert posts["total"] == 1

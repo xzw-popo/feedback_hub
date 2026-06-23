@@ -151,11 +151,12 @@ def _build_filters(
 ) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
+    event_time_expr = "COALESCE(wp.created_at_ms, wp.last_seen_at * 1000)"
     if from_:
-        clauses.append("wp.created_at_ms >= ?")
+        clauses.append(f"{event_time_expr} >= ?")
         params.append(_parse_date_ms(from_, end_of_day=False))
     if to:
-        clauses.append("wp.created_at_ms <= ?")
+        clauses.append(f"{event_time_expr} <= ?")
         params.append(_parse_date_ms(to, end_of_day=True))
     if q:
         clauses.append("wp.text LIKE ?")
@@ -336,9 +337,11 @@ def get_stats(conn: Any, *, from_: str | None = None, to: str | None = None) -> 
         risk[level] = risk.get(level, 0) + 1
         for t in _loads(_row_get(row, "topics_json"), []):
             topic[t] = topic.get(t, 0) + 1
-        created_at_ms = _row_get(row, "created_at_ms")
-        if created_at_ms:
-            bucket = time.strftime("%Y-%m-%d", time.localtime(int(created_at_ms) / 1000))
+        event_ms = _row_get(row, "created_at_ms")
+        if event_ms is None:
+            event_ms = int(_row_get(row, "last_seen_at") or 0) * 1000
+        if event_ms:
+            bucket = time.strftime("%Y-%m-%d", time.localtime(int(event_ms) / 1000))
             trend.setdefault(bucket, {"total": 0, "wechat": 0, "doubao": 0, "comparison": 0})
             trend[bucket]["total"] += 1
             if brand_focus in ("wechat", "doubao", "comparison"):
