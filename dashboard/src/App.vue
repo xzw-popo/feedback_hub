@@ -44,6 +44,12 @@ const { healthy } = useApiHealth()
           >
             报告
           </router-link>
+          <router-link
+            to="/weibo"
+            class="nav-item"
+          >
+            微博舆情
+          </router-link>
         </nav>
       </aside>
       <main class="layout-main">

@@ -6,6 +6,8 @@ const routes = [
   { path: '/list', name: 'list', component: () => import('@/views/List.vue') },
   { path: '/simple', name: 'simple-list', component: () => import('@/views/SimpleList.vue') },
   { path: '/reports', name: 'reports', component: () => import('@/views/Reports.vue') },
+  { path: '/weibo', name: 'weibo-overview', component: () => import('@/views/WeiboOverview.vue') },
+  { path: '/weibo/list', name: 'weibo-list', component: () => import('@/views/WeiboList.vue') },
   {
     path: '/feedback/:id',
     name: 'detail',

@@ -31,6 +31,7 @@ from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
 from feedback_hub.importer import router as import_router
 from feedback_hub.search.api import router as search_router
 from feedback_hub.search.report_api import router as report_router
+from feedback_hub.weibo.api import make_router as make_weibo_router
 
 
 def _ph1() -> str:
@@ -131,6 +132,8 @@ def create_app(
     app.include_router(search_router)
     # 注册搜索报告 API
     app.include_router(report_router)
+    # 注册微博舆情 API
+    app.include_router(make_weibo_router(db_path))
 
     def _conn() -> Any:
         c = db.connect(db_path) if db_path else db.connect()
