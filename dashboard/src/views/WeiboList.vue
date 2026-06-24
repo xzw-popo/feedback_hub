@@ -95,10 +95,10 @@ onMounted(() => { void load() })
   <div class="page">
     <div class="weibo-list-header">
       <div>
-        <h1 class="page-title">微博列表</h1>
-        <div class="muted">搜索和筛选公开微博反馈</div>
+        <h1 class="page-title">微博舆情</h1>
+        <div class="muted">最近公开微博反馈，先扫舆情，再筛选和处理</div>
       </div>
-      <el-button type="primary" plain @click="$router.push('/weibo')">返回概览</el-button>
+      <el-button type="primary" plain @click="$router.push('/weibo/stats')">查看统计</el-button>
     </div>
 
     <div class="card filter-card">

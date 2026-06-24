@@ -15,6 +15,7 @@ from feedback_hub import config, db
 from feedback_hub.search.llm_client import (
     SearchLLMError,
     generate_regex_patterns,
+    generate_search_intent,
     score_relevance,
 )
 
@@ -394,6 +395,195 @@ def _build_keyword_where(
 # AI 搜索 SQL 构建
 # ---------------------------------------------------------------------------
 
+_COMPLAINT_INTENT_TERMS = {"投诉", "抱怨", "申诉", "举报", "问题反馈"}
+_GENERIC_FEEDBACK_INTENT_TERMS = {"反馈", "意见", "建议"}
+_COMPLAINT_TEXT_TERMS = ["不好", "不能", "无法", "用不了", "没反应", "不对", "问题"]
+_CANONICAL_PROBLEM_TERMS = [
+    "不好", "不能", "无法", "用不了", "没反应", "不对", "问题",
+    "异常", "故障", "失灵", "不准", "识别不了",
+]
+_PROBLEM_INTENT_TERMS = {
+    "不好", "不好用", "不能", "无法", "用不了", "没反应", "不对", "问题",
+    "异常", "故障", "失灵", "不准", "错误", "失败", "识别不了",
+}
+_TOPIC_CONCEPTS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "voice_input_recognition",
+        "aliases": ["语音输入识别", "语音输入", "语音识别", "语音转文字", "听写", "语音"],
+        "terms": ["语音输入识别", "语音输入", "语音识别", "语音转文字", "语音"],
+    },
+)
+
+
+def _normalize_intent_terms(intent: dict[str, list]) -> dict[str, list]:
+    """移除不应作为原文命中条件的泛化反馈意图词。"""
+    return {
+        "must": _drop_generic_term_groups(intent.get("must", [])),
+        "should": _drop_generic_term_groups(intent.get("should", [])),
+        "exclude": _drop_generic_terms(intent.get("exclude", [])),
+    }
+
+
+def _drop_generic_term_groups(groups: list) -> list[list[str]]:
+    normalized = []
+    if not isinstance(groups, list):
+        return normalized
+    for group in groups:
+        has_complaint_intent = (
+            isinstance(group, list)
+            and any(isinstance(term, str) and term.strip() in _COMPLAINT_INTENT_TERMS for term in group)
+        )
+        terms = _drop_generic_terms(group)
+        if has_complaint_intent:
+            terms = _merge_terms(terms, _COMPLAINT_TEXT_TERMS)
+        if terms:
+            normalized.append(terms)
+    return normalized
+
+
+def _merge_terms(left: list[str], right: list[str]) -> list[str]:
+    merged = list(left)
+    for term in right:
+        if term not in merged:
+            merged.append(term)
+    return merged
+
+
+def _drop_generic_terms(terms: list) -> list[str]:
+    if not isinstance(terms, list):
+        return []
+    return [
+        term.strip()
+        for term in terms
+        if isinstance(term, str)
+        and term.strip()
+        and term.strip() not in _COMPLAINT_INTENT_TERMS
+        and term.strip() not in _GENERIC_FEEDBACK_INTENT_TERMS
+    ]
+
+
+def _build_intent_where(intent: dict[str, list]) -> tuple[str, list[Any]]:
+    """将受控关键词意图翻译为 LIKE WHERE 子句。
+
+    must: 组内 OR，组间 AND
+    should: 没有 must 时作为 OR 召回
+    exclude: NOT IN 排除
+    """
+    where_parts: list[str] = []
+    all_params: list[Any] = []
+
+    must_groups = intent.get("must", [])
+    should_groups = intent.get("should", [])
+    include_groups = must_groups or should_groups
+
+    group_clauses: list[str] = []
+    for group in include_groups:
+        if not isinstance(group, list) or not group:
+            continue
+        term_clauses = []
+        for term in group:
+            if not isinstance(term, str) or not term.strip():
+                continue
+            term_clauses.append(f"text LIKE {_ph1()}")
+            all_params.append(f"%{term.strip()}%")
+        if term_clauses:
+            group_clauses.append(f"({' OR '.join(term_clauses)})")
+
+    if group_clauses:
+        joiner = " AND " if must_groups else " OR "
+        inner_where = joiner.join(group_clauses)
+        where_parts.append(
+            f"cl.conversation_id IN (SELECT DISTINCT conversation_id FROM feedback WHERE {inner_where})"
+        )
+
+    excludes = intent.get("exclude", [])
+    if isinstance(excludes, list) and excludes:
+        exclude_parts = []
+        for term in excludes:
+            if not isinstance(term, str) or not term.strip():
+                continue
+            exclude_parts.append(f"text LIKE {_ph1()}")
+            all_params.append(f"%{term.strip()}%")
+        if exclude_parts:
+            exclude_inner = " OR ".join(exclude_parts)
+            where_parts.append(
+                f"cl.conversation_id NOT IN (SELECT DISTINCT conversation_id FROM feedback WHERE {exclude_inner})"
+            )
+
+    if not where_parts:
+        return "", []
+
+    return " AND ".join(where_parts), all_params
+
+
+def _flatten_intent_terms(intent: dict[str, list] | None) -> list[str]:
+    if not intent:
+        return []
+    terms: list[str] = []
+    for key in ("must", "should", "exclude"):
+        value = intent.get(key, [])
+        if key == "exclude":
+            groups = [value]
+        else:
+            groups = value
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if isinstance(group, str):
+                group = [group]
+            if not isinstance(group, list):
+                continue
+            for term in group:
+                if isinstance(term, str) and term.strip() and term.strip() not in terms:
+                    terms.append(term.strip())
+    return terms
+
+
+def _contains_any(text: str, terms: list[str] | set[str]) -> bool:
+    return any(term and term in text for term in terms)
+
+
+def _build_canonical_search_plan(
+    text_query: str,
+    intent_terms: dict[str, list] | None,
+) -> dict[str, Any] | None:
+    """把 LLM 的语义输出收敛成稳定、可解释的领域搜索计划。"""
+    flattened_terms = _flatten_intent_terms(intent_terms)
+    semantic_text = " ".join([text_query, *flattened_terms])
+
+    topics: list[dict[str, Any]] = []
+    for concept in _TOPIC_CONCEPTS:
+        if _contains_any(semantic_text, concept["aliases"]):
+            topics.append(concept)
+
+    has_problem_intent = _contains_any(semantic_text, _PROBLEM_INTENT_TERMS)
+
+    if not topics:
+        return None
+
+    must = [topics[0]["terms"]]
+    intent: str | None = None
+    if has_problem_intent:
+        intent = "problem"
+        must.append(_CANONICAL_PROBLEM_TERMS)
+
+    return {
+        "mode": "canonical",
+        "topics": [topic["id"] for topic in topics],
+        "intent": intent,
+        "must": must,
+        "exclude": [],
+        "unknown_terms": [],
+    }
+
+
+def _build_search_plan_where(plan: dict[str, Any]) -> tuple[str, list[Any]]:
+    return _build_intent_where({
+        "must": plan.get("must", []),
+        "should": [],
+        "exclude": plan.get("exclude", []),
+    })
+
 def _build_regex_where(
     group_patterns: list[list[str]],
     group_logics: list[str],
@@ -463,15 +653,36 @@ def smart_search(req: SmartSearchRequest):
 
     parsed = _parse_structured_intent(req.query, req.filters)
     fallback_mode: str | None = None
+    intent_terms: dict[str, list] | None = None
+    search_plan: dict[str, Any] | None = None
+    group_patterns: list[list[str]] = []
+    group_logics: list[str] = []
+    group_logic = "OR"
 
     try:
-        group_patterns, group_logics, group_logic = generate_regex_patterns(parsed.text_query)
+        intent_terms = _normalize_intent_terms(generate_search_intent(parsed.text_query))
+        search_plan = _build_canonical_search_plan(parsed.text_query, intent_terms)
+        if search_plan:
+            search_where, search_params = _build_search_plan_where(search_plan)
+        else:
+            search_where, search_params = _build_intent_where(intent_terms)
+        if search_where:
+            fallback_mode = "structured_intent"
+        else:
+            raise SearchLLMError("LLM generated no executable intent terms")
     except SearchLLMError as e:
-        logger.warning("Smart search LLM failed: %s", e)
-        group_patterns, group_logics, group_logic = [], [], "OR"
-        fallback_mode = "query_keywords"
+        logger.warning("Smart search structured intent failed: %s", e)
+        search_where, search_params = "", []
 
-    search_where, search_params = _build_regex_where(group_patterns, group_logics, group_logic)
+    if not search_where:
+        try:
+            group_patterns, group_logics, group_logic = generate_regex_patterns(parsed.text_query)
+        except SearchLLMError as e:
+            logger.warning("Smart search regex LLM failed: %s", e)
+            group_patterns, group_logics, group_logic = [], [], "OR"
+            fallback_mode = "query_keywords"
+
+        search_where, search_params = _build_regex_where(group_patterns, group_logics, group_logic)
     if not search_where:
         # LLM 失败或生成的正则全部无效，回退为 LIKE。
         all_patterns = [p for grp in group_patterns for p in grp]
@@ -509,6 +720,8 @@ def smart_search(req: SmartSearchRequest):
             "text_query": parsed.text_query,
             "metadata_filters": parsed.filters.model_dump(by_alias=True),
             "fallback": fallback_mode,
+            "intent_terms": intent_terms,
+            "search_plan": search_plan,
         },
     }
 

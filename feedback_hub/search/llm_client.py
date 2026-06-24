@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from typing import Any
 
 import requests
@@ -70,6 +71,18 @@ def chat_completion(
 # 粗筛：自然语言 → 正则表达式
 # ---------------------------------------------------------------------------
 
+_INTENT_SYSTEM_PROMPT = """你是一个搜索意图解析器。根据用户想查找的反馈，提取可安全执行的关键词条件。
+
+返回 JSON（不要其他内容）：
+{"must": [["必须词或同义词1", "同义词2"]], "should": [["可选词或同义词"]], "exclude": ["排除词"]}
+
+规则：
+- must 是必须满足的条件组；组内任一词命中即可，组与组之间是 AND
+- should 是增强召回的条件组；仅当没有 must 时使用，组之间是 OR
+- exclude 是需要排除的词
+- 只返回普通词组，不要返回正则、SQL、解释文字
+- 每个词组不超过 30 个字符"""
+
 _REGEX_SYSTEM_PROMPT = """你是一个搜索条件生成器。根据用户的搜索意图生成正则表达式，覆盖各种同义/近义/口语化表述。
 
 返回 JSON（不要其他内容）：
@@ -91,6 +104,69 @@ _GREEDY_WILDCARD_RE = re.compile(r"\.[*+]")
 _MAX_GREEDY_WILDCARDS: int = 1
 
 
+@lru_cache(maxsize=512)
+def generate_search_intent(query: str) -> dict[str, list]:
+    """调用 LLM 将自然语言查询翻译为受控关键词意图。"""
+    messages = [
+        {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
+        {"role": "user", "content": query},
+    ]
+    reply = chat_completion(messages, temperature=0, max_tokens=2048)
+    return _parse_search_intent_reply(reply)
+
+
+def _parse_search_intent_reply(reply: str) -> dict[str, list]:
+    """解析 LLM 返回的关键词意图 JSON。"""
+    json_match = re.search(r"```(?:json)?\s*(.*?)```", reply, re.DOTALL)
+    text = json_match.group(1).strip() if json_match else reply.strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SearchLLMError(f"LLM returned invalid intent JSON: {reply[:200]}") from e
+
+    if not isinstance(data, dict):
+        raise SearchLLMError("LLM returned invalid intent format")
+
+    intent = {
+        "must": _normalize_term_groups(data.get("must", [])),
+        "should": _normalize_term_groups(data.get("should", [])),
+        "exclude": _normalize_terms(data.get("exclude", [])),
+    }
+    if not intent["must"] and not intent["should"] and not intent["exclude"]:
+        raise SearchLLMError("LLM generated no valid intent terms")
+    return intent
+
+
+def _normalize_term_groups(groups: Any) -> list[list[str]]:
+    if not isinstance(groups, list):
+        return []
+    normalized: list[list[str]] = []
+    for group in groups:
+        terms = _normalize_terms(group)
+        if terms:
+            normalized.append(terms)
+    return normalized
+
+
+def _normalize_terms(terms: Any) -> list[str]:
+    if isinstance(terms, str):
+        terms = [terms]
+    if not isinstance(terms, list):
+        return []
+
+    normalized: list[str] = []
+    for term in terms:
+        if not isinstance(term, str):
+            continue
+        term = re.sub(r"\s+", " ", term).strip()
+        if not term or len(term) > 30:
+            continue
+        if term not in normalized:
+            normalized.append(term)
+    return normalized
+
+
 def generate_regex_patterns(query: str) -> tuple[list[list[str]], list[str], str]:
     """调用 LLM 将自然语言查询翻译为分组正则表达式。
 
@@ -104,7 +180,7 @@ def generate_regex_patterns(query: str) -> tuple[list[list[str]], list[str], str
         {"role": "system", "content": _REGEX_SYSTEM_PROMPT},
         {"role": "user", "content": query},
     ]
-    reply = chat_completion(messages, temperature=0.1, max_tokens=8192)
+    reply = chat_completion(messages, temperature=0, max_tokens=8192)
     return _parse_regex_reply(reply)
 
 

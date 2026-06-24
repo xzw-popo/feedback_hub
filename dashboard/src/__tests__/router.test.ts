@@ -9,10 +9,12 @@ describe('router', () => {
   })
 
   it('exposes weibo public opinion routes', () => {
-    const overview = router.getRoutes().find(r => r.path === '/weibo')
-    const list = router.getRoutes().find(r => r.path === '/weibo/list')
+    const workspace = router.getRoutes().find(r => r.path === '/weibo')
+    const stats = router.getRoutes().find(r => r.path === '/weibo/stats')
+    const legacyList = router.getRoutes().find(r => r.path === '/weibo/list')
 
-    expect(overview?.name).toBe('weibo-overview')
-    expect(list?.name).toBe('weibo-list')
+    expect(workspace?.name).toBe('weibo')
+    expect(stats?.name).toBe('weibo-stats')
+    expect(legacyList?.redirect).toBe('/weibo')
   })
 })

@@ -51,7 +51,7 @@ async function load() {
 }
 
 function gotoList(params: Record<string, string>) {
-  router.push({ path: '/weibo/list', query: params })
+  router.push({ path: '/weibo', query: params })
 }
 
 watch(days, load)
@@ -62,14 +62,17 @@ onMounted(() => { void load() })
   <div class="page weibo-page">
     <div class="weibo-header">
       <div>
-        <h1 class="page-title">微博舆情</h1>
+        <h1 class="page-title">微博统计</h1>
         <div class="muted">公开微博反馈中的豆包、微信和对比讨论</div>
       </div>
-      <el-radio-group v-model="days">
-        <el-radio-button :value="7">近 7 天</el-radio-button>
-        <el-radio-button :value="14">近 14 天</el-radio-button>
-        <el-radio-button :value="30">近 30 天</el-radio-button>
-      </el-radio-group>
+      <div class="header-actions">
+        <el-button @click="$router.push('/weibo')">返回列表</el-button>
+        <el-radio-group v-model="days">
+          <el-radio-button :value="7">近 7 天</el-radio-button>
+          <el-radio-button :value="14">近 14 天</el-radio-button>
+          <el-radio-button :value="30">近 30 天</el-radio-button>
+        </el-radio-group>
+      </div>
     </div>
 
     <div v-loading="loading" class="kpi-grid weibo-kpis">
@@ -160,6 +163,11 @@ onMounted(() => { void load() })
   justify-content: space-between;
   margin-bottom: 16px;
 }
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
 .weibo-kpis {
   grid-template-columns: repeat(6, minmax(0, 1fr));
 }
@@ -229,4 +237,3 @@ onMounted(() => { void load() })
   }
 }
 </style>
-
