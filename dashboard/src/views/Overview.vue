@@ -108,10 +108,10 @@ onMounted(() => {
 })
 
 function gotoListAll() {
-  router.push('/list')
+  router.push('/')
 }
 function gotoListPending() {
-  router.push('/list?L1=待定')
+  router.push('/?L1=待定')
 }
 </script>
 

@@ -122,6 +122,9 @@ def extract_rows(resp: dict, *, start_ms: int, end_ms: int,
                 continue
             text = (content.get("text") or "").strip()
             tags_list = m.get("tags") or []
+            service_vid = sess.get("serviceVid") or DEFAULT_SERVICE_VID
+            user_vid = user.get("userVid") or sess.get("userVid")
+            external_chat_url = db.build_external_chat_url(channel, service_vid, user_vid)
             raw_extra = {
                 "url": content.get("url") or "",
                 "scheme": content.get("scheme") or "",
@@ -129,7 +132,7 @@ def extract_rows(resp: dict, *, start_ms: int, end_ms: int,
                 "raw_platform_code": ci.get("platform"),
                 "raw_os_code": ci.get("os"),
                 "service_channel": sess.get("channel") or "",
-                "service_vid": sess.get("serviceVid"),
+                "service_vid": service_vid,
                 "replyId": m.get("replyId"),
             }
             rows.append({
@@ -140,7 +143,9 @@ def extract_rows(resp: dict, *, start_ms: int, end_ms: int,
                 "ts_ms": ts,
                 "platform": _platform(ci),
                 "appversion": ci.get("appversion", ""),
-                "user_vid": user.get("userVid") or sess.get("userVid"),
+                "user_vid": user_vid,
+                "service_vid": service_vid,
+                "external_chat_url": external_chat_url,
                 "keyboard_source": ci.get("keyboardSource", ""),
                 "device_name": ci.get("deviceName", ""),
                 "channelid": ci.get("channelid", ""),

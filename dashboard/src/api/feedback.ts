@@ -14,6 +14,8 @@ export interface ConversationItem {
   user_vid: string | null
   appversion: string | null
   channel: string
+  service_vid: number | null
+  external_chat_url: string | null
   platform: string
   preview_text: string
 }

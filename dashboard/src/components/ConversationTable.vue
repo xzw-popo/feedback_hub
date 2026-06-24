@@ -21,6 +21,11 @@ function gotoDetail(row: ConversationItem) {
   router.push(`/feedback/${row.conversation_id}`)
 }
 
+function openOriginalChat(row: ConversationItem) {
+  if (!row.external_chat_url) return
+  window.open(row.external_chat_url, '_blank', 'noopener,noreferrer')
+}
+
 function scoreLabel(score: 1 | 2 | 3): string {
   return '⭐'.repeat(score)
 }
@@ -125,6 +130,22 @@ function scoreClass(score: 1 | 2 | 3): string {
           v-else
           class="muted"
         >—</span>
+      </template>
+    </el-table-column>
+    <el-table-column
+      label="操作"
+      width="112"
+    >
+      <template #default="{ row }">
+        <el-button
+          link
+          type="primary"
+          size="small"
+          :disabled="!row.external_chat_url"
+          @click.stop="openOriginalChat(row)"
+        >
+          链接
+        </el-button>
       </template>
     </el-table-column>
   </el-table>

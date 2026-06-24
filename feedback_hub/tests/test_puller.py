@@ -85,6 +85,17 @@ def test_extract_rows_raw_json_contains_extra_fields():
     assert raw["raw_platform_code"] == 1
 
 
+def test_extract_rows_builds_original_chat_url():
+    ts = 1747526400000
+    resp = _sample_resp(ts)
+    rows, _ = puller.extract_rows(resp, start_ms=ts - 1, end_ms=ts + 1, channel="wetype")
+    assert rows[0]["service_vid"] == 10000
+    assert rows[0]["external_chat_url"] == (
+        "https://wrfeedback.weread.woa.com/chat?"
+        "channel=wetype&serviceVid=10000&userVid=u1"
+    )
+
+
 def test_upsert_rows_returns_inserted_count(tmp_path):
     conn = db.connect(tmp_path / "x.db")
     db.init_schema(conn)

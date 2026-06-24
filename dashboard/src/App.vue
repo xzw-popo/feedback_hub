@@ -27,16 +27,10 @@ const { healthy } = useApiHealth()
             反馈列表
           </router-link>
           <router-link
-            to="/overview"
+            to="/weibo"
             class="nav-item"
           >
-            概览<span class="beta-tag">测试</span>
-          </router-link>
-          <router-link
-            to="/list"
-            class="nav-item"
-          >
-            反馈列表<span class="beta-tag">测试</span>
+            微博舆情
           </router-link>
           <router-link
             to="/reports"
@@ -45,10 +39,10 @@ const { healthy } = useApiHealth()
             报告
           </router-link>
           <router-link
-            to="/weibo"
+            to="/overview"
             class="nav-item"
           >
-            微博舆情
+            概览<span class="beta-tag">测试</span>
           </router-link>
         </nav>
       </aside>

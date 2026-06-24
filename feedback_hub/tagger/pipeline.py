@@ -86,6 +86,8 @@ def aggregate_conversation_label(
         "user_vid": meta.get("user_vid"),
         "appversion": meta.get("appversion"),
         "channel": meta.get("channel"),
+        "service_vid": meta.get("service_vid"),
+        "external_chat_url": meta.get("external_chat_url"),
         "aggregated_at": int(time.time()),
     }
 
@@ -252,6 +254,8 @@ def run_tagging(
             "ts_ms": r["ts_ms"], "msg_seq": r["msg_seq"],
             "user_vid": r["user_vid"], "appversion": r["appversion"],
             "channel": r["channel"],
+            "service_vid": r["service_vid"],
+            "external_chat_url": r["external_chat_url"],
         } for r in ml_rows]
         agg = aggregate_conversation_label(cid, rows_dicts)
         if agg is not None:

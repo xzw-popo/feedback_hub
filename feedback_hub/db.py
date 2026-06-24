@@ -10,11 +10,13 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from feedback_hub import config
 
@@ -45,8 +47,9 @@ def _ph(n: int) -> str:
 # 字段顺序与 schema.sql / schema_mysql.sql 保持一致
 FEEDBACK_COLUMNS: tuple[str, ...] = (
     "feedback_id", "conversation_id", "msg_seq", "channel", "ts_ms",
-    "platform", "appversion", "user_vid", "keyboard_source", "device_name",
-    "channelid", "enginever", "msgtype", "text", "tags", "raw_json", "pulled_at",
+    "platform", "appversion", "user_vid", "service_vid", "external_chat_url",
+    "keyboard_source", "device_name", "channelid", "enginever", "msgtype",
+    "text", "tags", "raw_json", "pulled_at",
 )
 MESSAGE_LABEL_COLUMNS: tuple[str, ...] = (
     "feedback_id", "L1", "L2", "severity", "confidence",
@@ -55,7 +58,8 @@ MESSAGE_LABEL_COLUMNS: tuple[str, ...] = (
 CONVERSATION_LABEL_COLUMNS: tuple[str, ...] = (
     "conversation_id", "L1", "L2", "severity", "confidence", "reason", "source",
     "msg_count", "first_ts_ms", "last_ts_ms",
-    "user_vid", "appversion", "channel", "aggregated_at",
+    "user_vid", "appversion", "channel", "service_vid", "external_chat_url",
+    "aggregated_at",
 )
 PUSH_LOG_COLUMNS: tuple[str, ...] = (
     "push_date", "rank", "signature",
@@ -204,6 +208,115 @@ def init_schema(conn: Any) -> None:
         conn.executescript(sql)
         conn.commit()
 
+    _ensure_compat_columns(conn)
+    _backfill_external_chat_fields(conn)
+
+
+def _ensure_compat_columns(conn: Any) -> None:
+    """给旧库补充新列；CREATE TABLE IF NOT EXISTS 不会更新既有表结构。"""
+    additions = {
+        "feedback": {
+            "service_vid": "BIGINT" if _db_mode() == "mysql" else "INTEGER",
+            "external_chat_url": "TEXT",
+        },
+        "conversation_label": {
+            "service_vid": "BIGINT" if _db_mode() == "mysql" else "INTEGER",
+            "external_chat_url": "TEXT",
+        },
+    }
+    for table, cols in additions.items():
+        existing = _table_columns(conn, table)
+        for col, ddl_type in cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}")
+    conn.commit()
+
+
+def _table_columns(conn: Any, table: str) -> set[str]:
+    if _db_mode() == "mysql":
+        rows = conn.execute(f"SHOW COLUMNS FROM {table}").fetchall()
+        return {r["Field"] if isinstance(r, dict) else r[0] for r in rows}
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"] for r in rows}
+
+
+def build_external_chat_url(
+    channel: str | None,
+    service_vid: int | str | None,
+    user_vid: str | None,
+) -> str | None:
+    """拼 wrfeedback 原始会话 URL。缺 user_vid 时无法定位用户会话。"""
+    if not user_vid:
+        return None
+    channel = channel or config.DEFAULT_CHANNEL
+    service_vid = service_vid or config.DEFAULT_SERVICE_VID
+    params = urlencode({
+        "channel": channel,
+        "serviceVid": service_vid,
+        "userVid": user_vid,
+    })
+    return f"https://wrfeedback.weread.woa.com/chat?{params}"
+
+
+def _service_vid_from_raw(raw_json: Any) -> int | None:
+    if not raw_json:
+        return None
+    try:
+        raw = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return None
+    service_vid = raw.get("service_vid")
+    if service_vid is None:
+        return None
+    try:
+        return int(service_vid)
+    except (TypeError, ValueError):
+        return None
+
+
+def _backfill_external_chat_fields(conn: Any) -> None:
+    """旧数据从 raw_json.service_vid 回填，保证新增列可直接查询。"""
+    rows = conn.execute(
+        "SELECT feedback_id, channel, user_vid, raw_json, service_vid, external_chat_url "
+        "FROM feedback WHERE user_vid IS NOT NULL "
+        "AND (service_vid IS NULL OR external_chat_url IS NULL)"
+    ).fetchall()
+    ph = "%s" if _db_mode() == "mysql" else "?"
+    for row in rows:
+        feedback_id = _row_get(row, "feedback_id")
+        service_vid = _row_get(row, "service_vid") or _service_vid_from_raw(_row_get(row, "raw_json"))
+        service_vid = service_vid or config.DEFAULT_SERVICE_VID
+        external_chat_url = _row_get(row, "external_chat_url") or build_external_chat_url(
+            _row_get(row, "channel"),
+            service_vid,
+            _row_get(row, "user_vid"),
+        )
+        conn.execute(
+            f"UPDATE feedback SET service_vid = {ph}, external_chat_url = {ph} "
+            f"WHERE feedback_id = {ph}",
+            (service_vid, external_chat_url, feedback_id),
+        )
+
+    conv_rows = conn.execute(
+        "SELECT cl.conversation_id, f.channel, f.user_vid, f.service_vid, f.external_chat_url "
+        "FROM conversation_label cl "
+        "JOIN feedback f ON f.conversation_id = cl.conversation_id AND f.msg_seq = 0 "
+        "WHERE cl.service_vid IS NULL OR cl.external_chat_url IS NULL"
+    ).fetchall()
+    for row in conv_rows:
+        service_vid = _row_get(row, "service_vid") or config.DEFAULT_SERVICE_VID
+        external_chat_url = _row_get(row, "external_chat_url") or build_external_chat_url(
+            _row_get(row, "channel"),
+            service_vid,
+            _row_get(row, "user_vid"),
+        )
+        conn.execute(
+            f"UPDATE conversation_label SET service_vid = {ph}, external_chat_url = {ph} "
+            f"WHERE conversation_id = {ph}",
+            (service_vid, external_chat_url, _row_get(row, "conversation_id")),
+        )
+    conn.commit()
+
 
 # ---------- Row 兼容层 ----------
 
@@ -308,7 +421,8 @@ def get_message_labels_for_conversation(
     """取一个会话的全部 message_label（带 ts_ms 用于排序）。"""
     ph = "%s" if _db_mode() == "mysql" else "?"
     cur = conn.execute(
-        f"SELECT ml.*, f.ts_ms, f.user_vid, f.appversion, f.channel, f.msg_seq "
+        f"SELECT ml.*, f.ts_ms, f.user_vid, f.appversion, f.channel, f.msg_seq, "
+        f"f.service_vid, f.external_chat_url "
         f"FROM message_label ml "
         f"JOIN feedback f ON f.feedback_id = ml.feedback_id "
         f"WHERE f.conversation_id = {ph} "

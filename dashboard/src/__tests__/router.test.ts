@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { router } from '@/router'
 
 describe('router', () => {
+  it('does not expose the old test feedback list route', () => {
+    const route = router.getRoutes().find(r => r.path === '/list')
+
+    expect(route).toBeUndefined()
+  })
+
   it('exposes reports as a top-level route', () => {
     const route = router.getRoutes().find(r => r.path === '/reports')
 

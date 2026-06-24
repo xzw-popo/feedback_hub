@@ -31,14 +31,16 @@ async function load() {
 }
 
 function goBack() {
-  router.push('/list')
+  router.push('/')
 }
 
-function copyLink() {
-  navigator.clipboard.writeText(window.location.href).then(
-    () => ElMessage.success('链接已复制'),
-    () => ElMessage.error('复制失败'),
-  )
+function openOriginalChat() {
+  const url = data.value?.conversation.external_chat_url
+  if (!url) {
+    ElMessage.error('缺少原始会话链接')
+    return
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 onMounted(load)
@@ -56,9 +58,10 @@ onMounted(load)
       <el-button
         v-if="data"
         type="primary"
-        @click="copyLink"
+        :disabled="!data.conversation.external_chat_url"
+        @click="openOriginalChat"
       >
-        📋 复制链接
+        打开原始会话
       </el-button>
     </div>
 

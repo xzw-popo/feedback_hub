@@ -99,6 +99,15 @@ def test_get_conversation_returns_messages(client):
     assert data["messages"][0]["text"] == "闪退了"
 
 
+def test_get_conversation_returns_original_chat_url(client):
+    data = client.get("/api/conversations/conv1").json()
+    assert data["conversation"]["service_vid"] == 10000
+    assert data["conversation"]["external_chat_url"] == (
+        "https://wrfeedback.weread.woa.com/chat?"
+        "channel=wetype&serviceVid=10000&userVid=u1"
+    )
+
+
 def test_get_conversation_404(client):
     r = client.get("/api/conversations/nonexistent")
     assert r.status_code == 404

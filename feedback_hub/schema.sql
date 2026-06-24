@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS feedback (
     platform        TEXT,
     appversion      TEXT,
     user_vid        TEXT,
+    service_vid     INTEGER,
+    external_chat_url TEXT,
     keyboard_source TEXT,
     device_name     TEXT,
     channelid       TEXT,
@@ -57,6 +59,8 @@ CREATE TABLE IF NOT EXISTS conversation_label (
     user_vid        TEXT,
     appversion      TEXT,                  -- 取该会话最早一条
     channel         TEXT NOT NULL,
+    service_vid     INTEGER,
+    external_chat_url TEXT,
     aggregated_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_clabel_l1_ts     ON conversation_label(L1, last_ts_ms);
