@@ -129,7 +129,14 @@ def _parse_dt(s: Optional[str], *, end_of_day: bool = False) -> Optional[int]:
     return None
 
 
-_VERSION_RE = re.compile(r"(?<![A-Za-z0-9])v?(\d+(?:\.\d+){1,4})(?![A-Za-z0-9])", re.IGNORECASE)
+_VERSION_RE = re.compile(r"(?<![A-Za-z0-9.])v?(\d+(?:\.\d+){1,4})(?![A-Za-z0-9.])", re.IGNORECASE)
+_COMPACT_PLATFORM_VERSION_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<platform>windows?|win(?:32|64)?|macos|mac|ios|android|小程序)"
+    r"\s*v?(?P<version>\d+(?:\.\d+){1,4})"
+    r"(?![A-Za-z0-9.])",
+    re.IGNORECASE,
+)
 _PLATFORM_ALIASES: tuple[tuple[str, str], ...] = (
     (r"(?<![A-Za-z0-9])windows?(?![A-Za-z0-9])", "Win"),
     (r"(?<![A-Za-z0-9])win(?:32|64)?(?![A-Za-z0-9])", "Win"),
@@ -176,12 +183,32 @@ def _normalize_text_query(query: str) -> str:
     return query.strip() or "反馈"
 
 
+def _canonical_platform(raw: str) -> str:
+    value = raw.strip().lower().replace(" ", "")
+    if value.startswith("win"):
+        return "Win"
+    if value in {"mac", "macos"}:
+        return "Mac"
+    if value == "ios":
+        return "iOS"
+    if value == "android":
+        return "Android"
+    if value == "小程序":
+        return "小程序"
+    return raw.strip()
+
+
 def _parse_structured_intent(query: str, filters: MetadataFilters) -> ParsedSearchIntent:
     """从自然语言查询中提取版本、平台、设备，并从正文意图中剥离这些片段。"""
     spans: list[tuple[int, int]] = []
     versions: list[str] = []
     platforms: list[str] = []
     devices: list[str] = []
+
+    for m in _COMPACT_PLATFORM_VERSION_RE.finditer(query):
+        platforms.append(_canonical_platform(m.group("platform")))
+        versions.append(m.group("version"))
+        spans.append(m.span())
 
     for m in _VERSION_RE.finditer(query):
         versions.append(m.group(1))
@@ -262,6 +289,19 @@ def _build_metadata_where(filters: MetadataFilters) -> tuple[str, list[Any]]:
             params.extend(f"%{d}%" for d in devices)
 
     return (" AND ".join(clauses)), params
+
+
+def _has_metadata_filter(filters: MetadataFilters) -> bool:
+    return any([
+        filters.from_,
+        filters.to,
+        filters.L1,
+        filters.L2,
+        filters.severity,
+        filters.platform,
+        filters.appversion,
+        filters.device_name,
+    ])
 
 
 def _execute_search_query(
@@ -658,6 +698,23 @@ def smart_search(req: SmartSearchRequest):
     group_patterns: list[list[str]] = []
     group_logics: list[str] = []
     group_logic = "OR"
+
+    if parsed.text_query == "反馈" and _has_metadata_filter(parsed.filters):
+        total, items = _execute_search_query("", [], parsed.filters, req.limit, req.offset)
+        return {
+            "total": total,
+            "items": items,
+            "debug": {
+                "regex_groups": [],
+                "group_logic": group_logic,
+                "regex_patterns": [],
+                "text_query": parsed.text_query,
+                "metadata_filters": parsed.filters.model_dump(by_alias=True),
+                "fallback": "metadata_only",
+                "intent_terms": None,
+                "search_plan": None,
+            },
+        }
 
     try:
         intent_terms = _normalize_intent_terms(generate_search_intent(parsed.text_query))

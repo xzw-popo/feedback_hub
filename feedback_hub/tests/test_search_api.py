@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from feedback_hub import config, db
 from feedback_hub.api import create_app
+from feedback_hub.search.api import MetadataFilters, _parse_structured_intent
 from feedback_hub.search.llm_client import SearchLLMError
 
 
@@ -137,6 +138,16 @@ def search_client(tmp_path, monkeypatch):
         platform="iOS",
         device_name="iPhone15,2",
     )
+    _seed(
+        conn,
+        "fb7",
+        "Windows 版本安装失败",
+        "conv-210-win",
+        base + 6000,
+        appversion="2.1.0.20",
+        platform="Win",
+        device_name="ThinkPad X1",
+    )
     conn.commit()
     conn.close()
     monkeypatch.setattr(config, "DB_PATH", db_path)
@@ -172,6 +183,51 @@ def test_smart_search_extracts_version_and_platform_from_query(search_client, mo
     assert seen_queries == ["查看 闪退"]
     assert data["total"] == 1
     assert [item["conversation_id"] for item in data["items"]] == ["conv-350-mac"]
+
+
+@pytest.mark.parametrize(
+    ("query", "platform", "appversion"),
+    [
+        ("win2.1.0 ", "Win", "2.1.0"),
+        ("iOS3.5.0", "iOS", "3.5.0"),
+    ],
+)
+def test_structured_intent_extracts_compact_platform_version(query, platform, appversion):
+    parsed = _parse_structured_intent(query, MetadataFilters())
+
+    assert parsed.text_query == "反馈"
+    assert parsed.filters.platform == platform
+    assert parsed.filters.appversion == appversion
+
+
+def test_smart_search_compact_platform_version_uses_metadata_only(search_client, monkeypatch):
+    def fail_generate_search_intent(query: str):
+        raise AssertionError("metadata-only search should not call structured intent LLM")
+
+    def fail_generate_regex_patterns(query: str):
+        raise AssertionError("metadata-only search should not call regex LLM")
+
+    monkeypatch.setattr(
+        "feedback_hub.search.api.generate_search_intent",
+        fail_generate_search_intent,
+    )
+    monkeypatch.setattr(
+        "feedback_hub.search.api.generate_regex_patterns",
+        fail_generate_regex_patterns,
+    )
+
+    resp = search_client.post(
+        "/api/smart-search",
+        json={"query": "win2.1.0 ", "filters": {}, "limit": 20, "offset": 0},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert [item["conversation_id"] for item in data["items"]] == ["conv-210-win"]
+    assert data["debug"]["fallback"] == "metadata_only"
+    assert data["debug"]["metadata_filters"]["platform"] == "Win"
+    assert data["debug"]["metadata_filters"]["appversion"] == "2.1.0"
 
 
 def test_smart_search_extracts_device_name_without_making_it_text_condition(search_client, monkeypatch):
