@@ -72,6 +72,9 @@ start_app() {
   export DB_MODE="${DB_MODE:-sqlite}"
   export PYTHONUNBUFFERED=1
 
+  echo "[runtime] Initializing database schema..."
+  "${VENV_DIR}/bin/python" -c "from feedback_hub import db; c = db.connect(); db.init_schema(c); c.close()"
+
   echo "[runtime] Starting Feedback Hub on 0.0.0.0:${APP_PORT}..."
   nohup "${VENV_DIR}/bin/python" -m uvicorn feedback_hub.api:app \
     --host 0.0.0.0 \

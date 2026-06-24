@@ -118,6 +118,14 @@ APP_PORT=8000 ./deploy_devcloud.sh
 
 这条命令是日常代码部署的标准入口。它会重新构建前端、上传项目、停止旧进程并启动新进程。
 
+部署脚本会在替换代码目录时保留远端运行态数据：
+
+- `/opt/feedback_hub/feedback_hub/data/`
+- `/opt/feedback_hub/.env`
+- `/opt/feedback_hub/.venv`
+
+因此日常代码部署不会覆盖远端 SQLite 数据库。需要同步本地数据库时，仍按「数据更新方案」单独执行数据库替换流程。
+
 部署后建议验证：
 
 ```bash

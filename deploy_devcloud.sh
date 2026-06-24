@@ -35,7 +35,7 @@ scp -P "$SSH_PORT" "$ARCHIVE" "${SSH_TARGET}:${REMOTE_ARCHIVE}"
 
 echo "[deploy] Extracting and restarting service..."
 ssh -p "$SSH_PORT" "$SSH_TARGET" \
-  "set -e; if [ -x '${REMOTE_DIR}/scripts/devcloud_runtime.sh' ]; then cd '${REMOTE_DIR}' && APP_PORT='${APP_PORT}' scripts/devcloud_runtime.sh stop || true; fi; rm -rf '${REMOTE_DIR}.new'; mkdir -p '${REMOTE_DIR}.new'; tar -xzf '${REMOTE_ARCHIVE}' -C '${REMOTE_DIR}.new'; if [ -d '${REMOTE_DIR}/.venv' ]; then mv '${REMOTE_DIR}/.venv' '${REMOTE_DIR}.new/.venv'; fi; rm -rf '${REMOTE_DIR}.bak'; if [ -d '${REMOTE_DIR}' ]; then mv '${REMOTE_DIR}' '${REMOTE_DIR}.bak'; fi; mv '${REMOTE_DIR}.new' '${REMOTE_DIR}'; cd '${REMOTE_DIR}'; chmod +x scripts/devcloud_runtime.sh; APP_PORT='${APP_PORT}' scripts/devcloud_runtime.sh restart"
+  "set -e; OLD='${REMOTE_DIR}'; NEW='${REMOTE_DIR}.new'; BAK='${REMOTE_DIR}.bak'; if [ -x \"\${OLD}/scripts/devcloud_runtime.sh\" ]; then cd \"\${OLD}\" && APP_PORT='${APP_PORT}' scripts/devcloud_runtime.sh stop || true; fi; rm -rf \"\${NEW}\"; mkdir -p \"\${NEW}\"; tar -xzf '${REMOTE_ARCHIVE}' -C \"\${NEW}\"; if [ -d \"\${OLD}/.venv\" ]; then mv \"\${OLD}/.venv\" \"\${NEW}/.venv\"; fi; if [ -f \"\${OLD}/.env\" ]; then mv \"\${OLD}/.env\" \"\${NEW}/.env\"; fi; if [ -d \"\${OLD}/feedback_hub/data\" ]; then mkdir -p \"\${NEW}/feedback_hub\"; rm -rf \"\${NEW}/feedback_hub/data\"; mv \"\${OLD}/feedback_hub/data\" \"\${NEW}/feedback_hub/data\"; fi; rm -rf \"\${BAK}\"; if [ -d \"\${OLD}\" ]; then mv \"\${OLD}\" \"\${BAK}\"; fi; mv \"\${NEW}\" \"\${OLD}\"; cd \"\${OLD}\"; chmod +x scripts/devcloud_runtime.sh; APP_PORT='${APP_PORT}' scripts/devcloud_runtime.sh restart"
 
 echo "[deploy] Done."
 echo "[deploy] URL: http://charvelxia-any2.devcloud.woa.com:${APP_PORT}/"
