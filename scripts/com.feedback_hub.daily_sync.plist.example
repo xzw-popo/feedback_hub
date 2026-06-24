@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.feedback_hub.daily_sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/charvel/Desktop/用户反馈_2026_0612/scripts/feedback_daily_sync.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/charvel/Desktop/用户反馈_2026_0612</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>APP_PORT</key>
+    <string>8000</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/logs/launchd_daily_sync_stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/logs/launchd_daily_sync_stderr.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
