@@ -109,7 +109,11 @@ onMounted(() => { void load() })
         clearable
         @keyup.enter="onApply"
       />
-      <el-select v-model="url.brand_focus" class="filter-select">
+      <el-select
+        v-model="url.brand_focus"
+        class="filter-select"
+        placeholder="品牌"
+      >
         <el-option
           v-for="option in BRAND_FOCUS_OPTIONS"
           :key="option.value"
@@ -117,7 +121,11 @@ onMounted(() => { void load() })
           :value="option.value"
         />
       </el-select>
-      <el-select v-model="url.sentiment" class="filter-select">
+      <el-select
+        v-model="url.sentiment"
+        class="filter-select"
+        placeholder="情绪"
+      >
         <el-option
           v-for="option in SENTIMENT_OPTIONS"
           :key="option.value"
@@ -125,7 +133,11 @@ onMounted(() => { void load() })
           :value="option.value"
         />
       </el-select>
-      <el-select v-model="url.risk_level" class="filter-select">
+      <el-select
+        v-model="url.risk_level"
+        class="filter-select"
+        placeholder="风险"
+      >
         <el-option
           v-for="option in RISK_LEVEL_OPTIONS"
           :key="option.value"
