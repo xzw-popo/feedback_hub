@@ -3,9 +3,15 @@ import { mount, flushPromises } from '@vue/test-utils'
 import Detail from '@/views/Detail.vue'
 import type { DetailResp } from '@/api/feedback'
 
+const push = vi.fn()
+const routeQuery = vi.hoisted(() => ({ from: '/?platform=Win&q=win2.1.0' as string | undefined }))
+
 vi.mock('@/api/feedback', () => ({ getConversation: vi.fn() }))
 vi.mock('element-plus', () => ({ ElMessage: { error: vi.fn(), success: vi.fn() } }))
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push }),
+  useRoute: () => ({ query: routeQuery }),
+}))
 
 import { getConversation } from '@/api/feedback'
 
@@ -51,6 +57,8 @@ function detailPayload(): DetailResp {
 
 describe('Detail', () => {
   beforeEach(() => {
+    push.mockClear()
+    routeQuery.from = '/?platform=Win&q=win2.1.0'
     mockedGetConversation.mockResolvedValue(detailPayload())
   })
 
@@ -83,5 +91,27 @@ describe('Detail', () => {
       '_blank',
       'noopener,noreferrer',
     )
+  })
+
+  it('returns to the source list route when opened from search results', async () => {
+    const wrapper = mount(Detail, {
+      props: { id: 'conv1' },
+      global: {
+        directives: {
+          loading: {},
+        },
+        stubs: {
+          L1Tag: true,
+          SeverityTag: true,
+          ElButton: { template: '<button :disabled="disabled" @click="$emit(\'click\')"><slot /></button>', props: ['disabled'] },
+          ElDivider: true,
+        },
+      },
+    })
+
+    await flushPromises()
+    await wrapper.findAll('button')[0].trigger('click')
+
+    expect(push).toHaveBeenCalledWith('/?platform=Win&q=win2.1.0')
   })
 })

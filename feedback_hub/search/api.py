@@ -94,6 +94,12 @@ def _l2_split(s: Optional[str]) -> list[str]:
 
 
 def _conv_to_item(r: Any, preview_text: str, platform: str = "") -> dict:
+    service_vid = _row_val(r, "service_vid") or config.DEFAULT_SERVICE_VID
+    external_chat_url = _row_val(r, "external_chat_url") or db.build_external_chat_url(
+        _row_val(r, "channel"),
+        service_vid,
+        _row_val(r, "user_vid"),
+    )
     return {
         "conversation_id": _row_val(r, "conversation_id"),
         "L1": _row_val(r, "L1"),
@@ -107,6 +113,8 @@ def _conv_to_item(r: Any, preview_text: str, platform: str = "") -> dict:
         "user_vid": _row_val(r, "user_vid"),
         "appversion": _row_val(r, "appversion"),
         "channel": _row_val(r, "channel"),
+        "service_vid": service_vid,
+        "external_chat_url": external_chat_url,
         "platform": platform,
         "preview_text": preview_text,
     }

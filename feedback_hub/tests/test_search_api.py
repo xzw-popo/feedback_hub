@@ -273,6 +273,11 @@ def test_smart_search_compact_platform_version_uses_metadata_only(search_client,
     data = resp.json()
     assert data["total"] == 1
     assert [item["conversation_id"] for item in data["items"]] == ["conv-210-win"]
+    assert data["items"][0]["service_vid"] == config.DEFAULT_SERVICE_VID
+    assert data["items"][0]["external_chat_url"] == (
+        "https://wrfeedback.weread.woa.com/chat?"
+        "channel=wetype&serviceVid=10000&userVid=u-conv-210-win"
+    )
     assert data["debug"]["fallback"] == "metadata_only"
     assert data["debug"]["metadata_filters"]["platform"] == "Win"
     assert data["debug"]["metadata_filters"]["appversion"] == "2.1.0"

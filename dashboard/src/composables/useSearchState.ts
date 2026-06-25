@@ -1,4 +1,4 @@
-import { ref, reactive, computed, provide, inject, type InjectionKey } from 'vue'
+import { reactive, computed, provide, inject, watch, type InjectionKey } from 'vue'
 import {
   keywordSearch,
   smartSearch,
@@ -58,6 +58,47 @@ export interface SearchState {
 
 const SEARCH_STATE_KEY: InjectionKey<ReturnType<typeof useSearchState>> =
   Symbol('searchState')
+const STORAGE_KEY = 'feedback_hub.search_state.v1'
+
+type SearchStateSnapshot = Pick<
+  SearchState,
+  'mode' | 'smartQuery' | 'keywordGroups' | 'keywordExcludes' | 'items' | 'total' | 'aiScores'
+>
+
+function canUseSessionStorage(): boolean {
+  return typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined'
+}
+
+function readSnapshot(): Partial<SearchStateSnapshot> {
+  if (!canUseSessionStorage()) return {}
+  try {
+    const raw = window.sessionStorage.getItem(STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as Partial<SearchStateSnapshot>
+    return {
+      mode: parsed.mode === 'smart' || parsed.mode === 'keyword' ? parsed.mode : 'none',
+      smartQuery: typeof parsed.smartQuery === 'string' ? parsed.smartQuery : '',
+      keywordGroups: Array.isArray(parsed.keywordGroups) && parsed.keywordGroups.length > 0
+        ? parsed.keywordGroups
+        : [{ keywords: [], logic: 'AND' }],
+      keywordExcludes: Array.isArray(parsed.keywordExcludes) ? parsed.keywordExcludes : [],
+      items: Array.isArray(parsed.items) ? parsed.items : [],
+      total: typeof parsed.total === 'number' ? parsed.total : 0,
+      aiScores: parsed.aiScores && typeof parsed.aiScores === 'object' ? parsed.aiScores : {},
+    }
+  } catch {
+    return {}
+  }
+}
+
+function writeSnapshot(snapshot: SearchStateSnapshot) {
+  if (!canUseSessionStorage()) return
+  try {
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
+  } catch {
+    // sessionStorage may be unavailable in private mode or full quota.
+  }
+}
 
 export function provideSearchState() {
   const state = useSearchState()
@@ -71,21 +112,36 @@ export function injectSearchState() {
   return state
 }
 
-function useSearchState() {
+export function useSearchState() {
+  const snapshot = readSnapshot()
   const state = reactive<SearchState>({
-    mode: 'none',
-    smartQuery: '',
+    mode: snapshot.mode ?? 'none',
+    smartQuery: snapshot.smartQuery ?? '',
     smartLoading: false,
-    keywordGroups: [{ keywords: [], logic: 'AND' }],
-    keywordExcludes: [],
+    keywordGroups: snapshot.keywordGroups ?? [{ keywords: [], logic: 'AND' }],
+    keywordExcludes: snapshot.keywordExcludes ?? [],
     keywordLoading: false,
-    items: [],
-    total: 0,
-    aiScores: {},
+    items: snapshot.items ?? [],
+    total: snapshot.total ?? 0,
+    aiScores: snapshot.aiScores ?? {},
     fineFiltering: false,
     fineFilterProgress: { done: 0, total: 0 },
     _fineFilterES: null,
   })
+
+  watch(
+    () => ({
+      mode: state.mode,
+      smartQuery: state.smartQuery,
+      keywordGroups: state.keywordGroups,
+      keywordExcludes: state.keywordExcludes,
+      items: state.items,
+      total: state.total,
+      aiScores: state.aiScores,
+    }),
+    writeSnapshot,
+    { deep: true },
+  )
 
   // ---- 是否有搜索条件 ----
   const hasSmartQuery = computed(() => state.smartQuery.trim().length > 0)
