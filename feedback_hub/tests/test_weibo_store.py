@@ -1,6 +1,7 @@
 import sqlite3
 
 from feedback_hub.weibo.store import (
+    apply_label,
     get_stats,
     init_schema,
     list_posts,
@@ -89,6 +90,46 @@ def test_repeated_upsert_updates_post_and_preserves_hits():
     posts = list_posts(conn, q="推荐", limit=20, offset=0)
     assert posts["total"] == 1
     assert posts["items"][0]["keywords"] == ["豆包输入法", "豆包"]
+
+
+def test_repeated_upsert_does_not_overwrite_existing_llm_label():
+    conn = make_conn()
+
+    upsert_post(
+        conn,
+        {"weibo_id": "1011", "url": "https://weibo.com/1011", "text": "豆包输入法 AI 好用", "raw": {}},
+        keyword="豆包输入法",
+        searched_at=100,
+    )
+    apply_label(
+        conn,
+        "1011",
+        {
+            "is_relevant": True,
+            "brand_focus": "doubao",
+            "sentiment": "positive",
+            "topics": ["ai_capability"],
+            "post_type": "review",
+            "risk_level": "normal",
+            "confidence": 0.91,
+            "summary": "LLM summary",
+            "reason": "LLM reason",
+            "label_source": "llm",
+        },
+        labeled_at=150,
+    )
+    conn.commit()
+
+    upsert_post(
+        conn,
+        {"weibo_id": "1011", "url": "https://weibo.com/1011", "text": "豆包输入法 AI 好用 推荐", "raw": {}},
+        keyword="豆包输入法",
+        searched_at=200,
+    )
+
+    item = list_posts(conn, limit=20, offset=0)["items"][0]
+    assert item["label_source"] == "llm"
+    assert item["reason"] == "LLM summary\n\nLLM reason"
 
 
 def test_stats_counts_brand_sentiment_and_latest_run():
