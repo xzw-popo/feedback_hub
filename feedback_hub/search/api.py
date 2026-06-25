@@ -133,19 +133,21 @@ _VERSION_RE = re.compile(r"(?<![A-Za-z0-9.])v?(\d+(?:\.\d+){1,4})(?![A-Za-z0-9.]
 _COMPACT_PLATFORM_VERSION_RE = re.compile(
     r"(?<![A-Za-z0-9])"
     r"(?P<platform>windows?|win(?:32|64)?|macos|mac|ios|android|小程序)"
-    r"\s*v?(?P<version>\d+(?:\.\d+){1,4})"
+    r"(?:\s*端)?\s*v?(?P<version>\d+(?:\.\d+){1,4})"
     r"(?![A-Za-z0-9.])",
     re.IGNORECASE,
 )
 _PLATFORM_ALIASES: tuple[tuple[str, str], ...] = (
-    (r"(?<![A-Za-z0-9])windows?(?![A-Za-z0-9])", "Win"),
-    (r"(?<![A-Za-z0-9])win(?:32|64)?(?![A-Za-z0-9])", "Win"),
-    (r"(?<![A-Za-z0-9])mac\s*os(?![A-Za-z0-9])", "Mac"),
-    (r"(?<![A-Za-z0-9])macos(?![A-Za-z0-9])", "Mac"),
-    (r"(?<![A-Za-z0-9])mac(?![A-Za-z0-9])", "Mac"),
-    (r"(?<![A-Za-z0-9])ios(?![A-Za-z0-9])", "iOS"),
-    (r"(?<![A-Za-z0-9])android(?![A-Za-z0-9])", "Android"),
-    (r"小程序", "小程序"),
+    (r"(?<![A-Za-z0-9])windows?(?:\s*端)?(?![A-Za-z0-9])", "Win"),
+    (r"(?<![A-Za-z0-9])win(?:32|64)?(?:\s*端)?(?![A-Za-z0-9])", "Win"),
+    (r"(?<![A-Za-z0-9])mac\s*os(?:\s*端)?(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])macos(?:\s*端)?(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])mac(?:\s*端)?(?![A-Za-z0-9])", "Mac"),
+    (r"(?<![A-Za-z0-9])ios(?:\s*端)?(?![A-Za-z0-9])", "iOS"),
+    (r"(?<![A-Za-z0-9])android(?:\s*端)?(?![A-Za-z0-9])", "Android"),
+    (r"(?<![A-Za-z0-9])and\s*端", "Android"),
+    (r"安卓(?:\s*端)?", "Android"),
+    (r"小程序(?:\s*端)?", "小程序"),
 )
 _DEVICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<![A-Za-z0-9])iPhone\s*\d+(?:,\d+)?(?![A-Za-z0-9])", re.IGNORECASE),
@@ -192,6 +194,8 @@ def _canonical_platform(raw: str) -> str:
     if value == "ios":
         return "iOS"
     if value == "android":
+        return "Android"
+    if value in {"and", "and端", "安卓"}:
         return "Android"
     if value == "小程序":
         return "小程序"
@@ -440,17 +444,188 @@ _GENERIC_FEEDBACK_INTENT_TERMS = {"反馈", "意见", "建议"}
 _COMPLAINT_TEXT_TERMS = ["不好", "不能", "无法", "用不了", "没反应", "不对", "问题"]
 _CANONICAL_PROBLEM_TERMS = [
     "不好", "不能", "无法", "用不了", "没反应", "不对", "问题",
-    "异常", "故障", "失灵", "不准", "识别不了",
+    "异常", "故障", "失灵", "不准", "识别不了", "失败", "中断", "太多", "过多",
 ]
 _PROBLEM_INTENT_TERMS = {
     "不好", "不好用", "不能", "无法", "用不了", "没反应", "不对", "问题",
-    "异常", "故障", "失灵", "不准", "错误", "失败", "识别不了",
+    "异常", "故障", "失灵", "不准", "错误", "失败", "识别不了", "中断", "太多", "过多",
 }
 _TOPIC_CONCEPTS: tuple[dict[str, Any], ...] = (
     {
+        "id": "typing_input_core",
+        "aliases": ["输入文字", "文字输入", "打字输入", "打字"],
+        "terms": ["输入文字", "文字输入", "打字输入", "打字"],
+    },
+    {
+        "id": "candidate_words",
+        "aliases": ["候选词", "联想词", "预测词", "候选栏", "候选"],
+        "terms": ["候选词", "联想词", "预测词", "候选栏", "候选"],
+    },
+    {
+        "id": "pinyin_input",
+        "aliases": ["拼音输入", "拼音", "全拼", "双拼"],
+        "terms": ["拼音输入", "拼音", "全拼", "双拼"],
+    },
+    {
+        "id": "handwriting_input",
+        "aliases": ["手写输入", "手写识别", "手写"],
+        "terms": ["手写输入", "手写识别", "手写"],
+    },
+    {
+        "id": "clipboard_input",
+        "aliases": ["剪贴板", "剪切板", "粘贴板", "粘贴", "复制粘贴", "复制"],
+        "terms": ["剪贴板", "剪切板", "粘贴板", "粘贴", "复制粘贴", "复制"],
+    },
+    {
         "id": "voice_input_recognition",
-        "aliases": ["语音输入识别", "语音输入", "语音识别", "语音转文字", "听写", "语音"],
-        "terms": ["语音输入识别", "语音输入", "语音识别", "语音转文字", "语音"],
+        "aliases": [
+            "语音输入识别", "语音输入", "声音输入", "说话输入", "语音录入",
+            "语音识别", "语音转文字", "语音键入", "声控", "听写", "语音",
+        ],
+        "terms": [
+            "语音输入识别", "语音输入", "声音输入", "说话输入", "语音录入",
+            "语音识别", "语音转文字", "语音键入", "声控", "语音",
+        ],
+    },
+    {
+        "id": "voice_permission",
+        "aliases": ["语音权限", "麦克风权限", "录音权限", "麦克风", "录音"],
+        "terms": ["语音权限", "麦克风权限", "录音权限", "麦克风", "录音"],
+    },
+    {
+        "id": "voice_latency",
+        "aliases": ["语音延迟", "识别慢", "转写慢", "语音慢"],
+        "terms": ["语音延迟", "识别慢", "转写慢", "语音慢"],
+    },
+    {
+        "id": "keyboard_popup",
+        "aliases": ["键盘弹出", "键盘不弹", "唤起键盘", "调起键盘", "弹不出键盘"],
+        "terms": ["键盘弹出", "键盘不弹", "唤起键盘", "调起键盘", "弹不出键盘"],
+    },
+    {
+        "id": "keyboard_switch",
+        "aliases": ["切换键盘", "切输入法", "输入法切换", "切换输入法"],
+        "terms": ["切换键盘", "切输入法", "输入法切换", "切换输入法"],
+    },
+    {
+        "id": "keyboard_layout",
+        "aliases": ["键盘布局", "按键布局", "九宫格", "26键", "全键盘"],
+        "terms": ["键盘布局", "按键布局", "九宫格", "26键", "全键盘"],
+    },
+    {
+        "id": "cursor_selection",
+        "aliases": ["光标", "选中", "移动光标", "选择文本"],
+        "terms": ["光标", "选中", "移动光标", "选择文本"],
+    },
+    {
+        "id": "crash",
+        "aliases": ["闪退", "崩溃", "异常退出", "自动关闭", "退出"],
+        "terms": ["闪退", "崩溃", "异常退出", "自动关闭", "退出"],
+    },
+    {
+        "id": "lag_freeze",
+        "aliases": ["卡顿", "卡死", "无响应", "反应慢", "卡"],
+        "terms": ["卡顿", "卡死", "无响应", "反应慢", "卡"],
+    },
+    {
+        "id": "startup_slow",
+        "aliases": ["启动慢", "打开慢", "加载慢", "启动速度"],
+        "terms": ["启动慢", "打开慢", "加载慢", "启动速度"],
+    },
+    {
+        "id": "battery_heat",
+        "aliases": ["耗电", "发热", "发烫", "耗电量"],
+        "terms": ["耗电", "发热", "发烫", "耗电量"],
+    },
+    {
+        "id": "keyboard_skin",
+        "aliases": ["键盘皮肤", "键盘主题", "皮肤", "主题"],
+        "terms": ["皮肤", "主题", "键盘皮肤", "键盘主题"],
+    },
+    {
+        "id": "dark_mode",
+        "aliases": ["深色模式", "夜间模式", "暗色模式"],
+        "terms": ["深色模式", "夜间模式", "暗色模式"],
+    },
+    {
+        "id": "font_display",
+        "aliases": ["字体", "字号", "显示异常", "看不清"],
+        "terms": ["字体", "字号", "显示异常", "看不清"],
+    },
+    {
+        "id": "dictionary_words",
+        "aliases": ["词库", "词频", "常用词", "专业词"],
+        "terms": ["词库", "词频", "常用词", "专业词"],
+    },
+    {
+        "id": "auto_correction",
+        "aliases": ["自动纠错", "纠错", "改错", "误改"],
+        "terms": ["自动纠错", "纠错", "改错", "误改"],
+    },
+    {
+        "id": "personal_words",
+        "aliases": ["用户词", "个人词库", "自定义词", "自定义短语"],
+        "terms": ["用户词", "个人词库", "自定义词", "自定义短语"],
+    },
+    {
+        "id": "emoji_symbol",
+        "aliases": ["emoji", "表情", "符号", "颜文字"],
+        "terms": ["emoji", "表情", "符号", "颜文字"],
+    },
+    {
+        "id": "account_login",
+        "aliases": ["登录", "账号", "微信登录", "登录失败"],
+        "terms": ["登录", "账号", "微信登录", "登录失败"],
+    },
+    {
+        "id": "sync_settings",
+        "aliases": ["词库同步", "配置同步", "云同步", "同步"],
+        "terms": ["同步", "云同步", "配置同步", "词库同步"],
+    },
+    {
+        "id": "vip_membership",
+        "aliases": ["会员", "权益", "付费", "订阅"],
+        "terms": ["会员", "权益", "付费", "订阅"],
+    },
+    {
+        "id": "install_update",
+        "aliases": ["安装", "更新", "升级", "版本更新"],
+        "terms": ["安装", "更新", "升级", "版本更新"],
+    },
+    {
+        "id": "version_regression",
+        "aliases": ["新版本", "更新后", "升级后", "版本问题"],
+        "terms": ["新版本", "更新后", "升级后", "版本问题"],
+    },
+    {
+        "id": "compatibility",
+        "aliases": ["兼容", "系统兼容", "应用兼容", "兼容性"],
+        "terms": ["兼容", "系统兼容", "应用兼容", "兼容性"],
+    },
+    {
+        "id": "privacy_permission",
+        "aliases": ["隐私", "权限", "授权", "权限弹窗"],
+        "terms": ["隐私", "权限", "授权", "权限弹窗"],
+    },
+    {
+        "id": "network_permission",
+        "aliases": ["网络权限", "联网", "无法联网", "网络"],
+        "terms": ["网络权限", "联网", "无法联网", "网络"],
+    },
+    {
+        "id": "clipboard_privacy",
+        "aliases": ["剪贴板隐私", "读取剪贴板", "剪贴板权限"],
+        "terms": ["剪贴板隐私", "读取剪贴板", "剪贴板权限"],
+    },
+    {
+        "id": "ads_promotion",
+        "aliases": ["广告", "广告弹窗", "推广", "活动弹窗"],
+        "terms": ["广告", "广告弹窗", "推广", "活动弹窗"],
+    },
+    {
+        "id": "activity_reward",
+        "aliases": ["活动", "奖励", "抽奖", "福利"],
+        "terms": ["活动", "奖励", "抽奖", "福利"],
     },
 )
 
@@ -583,6 +758,72 @@ def _contains_any(text: str, terms: list[str] | set[str]) -> bool:
     return any(term and term in text for term in terms)
 
 
+def _match_topics(text: str) -> list[dict[str, Any]]:
+    return [
+        concept
+        for concept in _TOPIC_CONCEPTS
+        if _contains_any(text, concept["aliases"])
+    ]
+
+
+def _is_generic_or_intent_term(term: str) -> bool:
+    lower_term = term.lower()
+    return (
+        term in _COMPLAINT_INTENT_TERMS
+        or term in _GENERIC_FEEDBACK_INTENT_TERMS
+        or term in _PROBLEM_INTENT_TERMS
+        or term in _CANONICAL_PROBLEM_TERMS
+        or lower_term in {"bug", "bugs", "feedback", "issue", "issues", "problem", "problems"}
+        or term in {
+            "相关", "有关", "搜索", "寻找", "查找", "看看", "看一下",
+            "评价", "体验", "评论", "报告", "回馈", "响应", "端", "客户端", "终端",
+            "内容", "情况", "弹出", "弹出窗口", "提示框", "对话框",
+        }
+        or bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9 _+-]{0,29}", term))
+    )
+
+
+def _topic_covers_term(term: str, topics: list[dict[str, Any]]) -> bool:
+    for topic in topics:
+        for known in [*topic["aliases"], *topic["terms"]]:
+            if term == known or term in known or known in term:
+                return True
+    return False
+
+
+def _uncovered_required_groups(
+    intent_terms: dict[str, list] | None,
+    topics: list[dict[str, Any]],
+) -> tuple[list[list[str]], list[str]]:
+    if not intent_terms:
+        return [], []
+
+    groups: list[list[str]] = []
+    unknown_terms: list[str] = []
+    for group in intent_terms.get("must", []):
+        if isinstance(group, str):
+            group = [group]
+        if not isinstance(group, list):
+            continue
+
+        required_terms: list[str] = []
+        for raw_term in group:
+            if not isinstance(raw_term, str):
+                continue
+            term = raw_term.strip()
+            if not term or _is_generic_or_intent_term(term) or _topic_covers_term(term, topics):
+                continue
+            if term not in required_terms:
+                required_terms.append(term)
+            if term not in unknown_terms:
+                unknown_terms.append(term)
+
+        if required_terms:
+            groups.append(required_terms)
+
+    return groups, unknown_terms
+
+
 def _build_canonical_search_plan(
     text_query: str,
     intent_terms: dict[str, list] | None,
@@ -591,17 +832,21 @@ def _build_canonical_search_plan(
     flattened_terms = _flatten_intent_terms(intent_terms)
     semantic_text = " ".join([text_query, *flattened_terms])
 
-    topics: list[dict[str, Any]] = []
-    for concept in _TOPIC_CONCEPTS:
-        if _contains_any(semantic_text, concept["aliases"]):
-            topics.append(concept)
+    topics = _match_topics(text_query)
+    if not topics:
+        topics = _match_topics(" ".join(flattened_terms))
 
     has_problem_intent = _contains_any(semantic_text, _PROBLEM_INTENT_TERMS)
 
     if not topics:
         return None
 
-    must = [topics[0]["terms"]]
+    must = []
+    for topic in topics:
+        if topic["terms"] not in must:
+            must.append(topic["terms"])
+    uncovered_groups, unknown_terms = _uncovered_required_groups(intent_terms, topics)
+    must.extend(uncovered_groups)
     intent: str | None = None
     if has_problem_intent:
         intent = "problem"
@@ -613,7 +858,7 @@ def _build_canonical_search_plan(
         "intent": intent,
         "must": must,
         "exclude": [],
-        "unknown_terms": [],
+        "unknown_terms": unknown_terms,
     }
 
 
