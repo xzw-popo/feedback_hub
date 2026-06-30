@@ -210,11 +210,20 @@ The first implementation slice is an offline experiment, not a production backfi
 4. Add a small CLI that labels sampled feedback to JSONL without writing to the database.
 5. Evaluate on manually reviewed samples before any schema migration or full backfill.
 
+The experiment uses rules as hints and guardrails, not as the main classifier:
+
+- Rules may skip LLM only for high-confidence invalid content such as empty text, test text, number-only text, punctuation-only text, or short filler.
+- Valid feedback still goes to the LLM even when rules detect obvious product areas or issue patterns.
+- Rule output is passed to the prompt as `rule_hints`, including `maybe_product_area`, `maybe_issue_pattern`, `maybe_value_signal`, `detected_platform`, `detected_version`, and `matched_terms`.
+- Prompt instructions must say that hints are not final labels and that the original feedback wins when hints conflict with the text.
+- Parser and post-processing remain the hard guardrails for enum validity and conditional fields.
+
 Experiment metrics:
 
 - JSON parse success rate.
 - Invalid enum rate.
 - Skip rate by `feedback_type`.
+- Rule skip rate and false-skip rate for high-confidence invalid content.
 - Distribution of `product_area` and `issue_pattern`.
 - Manual agreement on `feedback_type`, `product_area`, and `issue_pattern`.
 - Usefulness of `evidence_signal` for selecting report examples.
@@ -247,4 +256,3 @@ Cleanup sequence:
 - Do not infer root cause from user text.
 - Do not assign owner or team without a maintained owner map.
 - Do not use experimental fields as hard report filters until evaluation supports them.
-

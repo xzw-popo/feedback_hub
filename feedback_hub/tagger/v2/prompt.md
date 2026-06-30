@@ -27,6 +27,15 @@ Metadata:
 {{METADATA}}
 ```
 
+Rule hints:
+
+```json
+{{RULE_HINTS}}
+```
+
+Hints are not final labels. Use them only as conservative clues. If the original
+feedback conflicts with the hints, trust the original feedback.
+
 Return this JSON shape:
 
 ```json

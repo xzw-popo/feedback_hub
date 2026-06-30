@@ -33,7 +33,7 @@ def test_run_jsonl_experiment_writes_parsed_results(tmp_path):
 
     stats = run_jsonl_experiment(input_path, output_path, llm_call=fake_llm, limit=None)
 
-    assert stats == {"total": 1, "labeled": 1, "failed": 0}
+    assert stats == {"total": 1, "labeled": 1, "failed": 0, "skipped_by_rule": 0}
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["feedback_id"] == "f1"
     assert rows[0]["label"]["product_area"] == ["voice_input"]
