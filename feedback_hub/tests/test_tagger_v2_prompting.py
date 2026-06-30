@@ -16,3 +16,12 @@ def test_build_prompt_includes_feedback_text_and_schema():
 def test_build_prompt_escapes_braces_in_feedback_text():
     prompt = build_prompt("输入 {test} 会异常", metadata={})
     assert "输入 {test} 会异常" in prompt
+
+
+def test_build_prompt_includes_tightened_v02_rules():
+    prompt = build_prompt("符号库怎么快捷调出", metadata={})
+    assert "question_help" in prompt
+    assert "leave `issue_pattern` empty" in prompt
+    assert "Do not add `vague`" in prompt
+    assert "requires a concrete product, support, or engineering action" in prompt
+    assert "needs_review" in prompt

@@ -83,3 +83,59 @@ def test_no_json_returns_parse_error_fallback():
     assert result["feedback_type"] == "irrelevant_invalid"
     assert result["parse_error"] == "no_json_found"
     assert result["confidence"] == 0.0
+
+
+def test_question_help_clears_issue_pattern_without_explicit_failure():
+    result = parse_label_reply(
+        '{"feedback_type":"question_help","product_area":["emoji_expression"],'
+        '"issue_pattern":["hard_to_use_or_trigger"],"evidence_signal":["vague"],'
+        '"actionability":"actionable","confidence":0.9}'
+    )
+    assert result["product_area"] == ["emoji_expression"]
+    assert result["issue_pattern"] == []
+
+
+def test_question_help_keeps_failure_issue_pattern_when_actual_behavior_present():
+    result = parse_label_reply(
+        '{"feedback_type":"question_help","product_area":["input_core"],'
+        '"issue_pattern":["unavailable_or_broken"],'
+        '"evidence_signal":["has_actual_behavior"],"confidence":0.8}'
+    )
+    assert result["issue_pattern"] == ["unavailable_or_broken"]
+
+
+def test_sentiment_only_clears_issue_pattern():
+    result = parse_label_reply(
+        '{"feedback_type":"sentiment_only","product_area":["input_core"],'
+        '"issue_pattern":["incorrect_or_poor_result"],"confidence":0.9}'
+    )
+    assert result["product_area"] == ["input_core"]
+    assert result["issue_pattern"] == []
+
+
+def test_feature_request_defaults_missing_issue_pattern_to_missing_or_unsupported():
+    result = parse_label_reply(
+        '{"feedback_type":"feature_request","product_area":["input_core"],'
+        '"issue_pattern":[],"confidence":0.8}'
+    )
+    assert result["issue_pattern"] == ["missing_or_unsupported"]
+
+
+def test_vague_removed_when_strong_evidence_exists():
+    result = parse_label_reply(
+        '{"feedback_type":"bug_problem","product_area":["input_core"],'
+        '"issue_pattern":["incorrect_or_poor_result"],'
+        '"evidence_signal":["vague","has_actual_behavior"],"confidence":0.9}'
+    )
+    assert result["evidence_signal"] == ["has_actual_behavior"]
+
+
+def test_needs_review_for_low_confidence_and_unknowns():
+    result = parse_label_reply(
+        '{"feedback_type":"bug_problem","product_area":["other_unknown"],'
+        '"issue_pattern":["other_unknown"],"confidence":0.4}'
+    )
+    assert result["needs_review"] is True
+    assert "low_confidence" in result["review_reasons"]
+    assert "unknown_product_area" in result["review_reasons"]
+    assert "unknown_issue_pattern" in result["review_reasons"]

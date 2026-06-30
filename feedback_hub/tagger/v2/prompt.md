@@ -11,9 +11,15 @@ Core rules:
 - First decide `feedback_type`.
 - Only label `product_area` and `issue_pattern` when the feedback is analytically useful.
 - If `feedback_type` is `irrelevant_invalid`, set `product_area` and `issue_pattern` to null.
+- If `feedback_type` is `question_help`, leave `issue_pattern` empty unless the user explicitly reports failure, missing support, incompatibility, or inability to complete a task.
+- If `feedback_type` is `sentiment_only`, leave `issue_pattern` empty.
+- If `feedback_type` is `feature_request`, prefer `issue_pattern=["missing_or_unsupported"]` for new capability or new scenario requests.
 - Route pure skin/theme or pure account-login feedback to `other_low_priority` unless it affects sync, data recovery, permissions, or compatibility.
 - Do not infer root cause, owner, new issue, or rising trend.
 - `observable_impact` and `actionability` describe only what is visible in the feedback text.
+- Do not add `vague` when the feedback clearly states actual behavior, expected behavior, context, scenario, comparison, repro steps, or workaround.
+- `actionability="actionable"` requires a concrete product, support, or engineering action. Simple questions, vague preferences, and pure sentiment should usually be `insufficient_info` or `unknown`.
+- Set `needs_review=true` when confidence is 0.5 or lower, or when product/issue is `other_unknown`.
 
 Feedback text:
 
@@ -51,6 +57,8 @@ Return this JSON shape:
   "actionability": "actionable | external_constraint | product_policy | insufficient_info | unknown",
   "evidence_span": "short original text span",
   "reason": "short reason",
-  "confidence": 0.0
+  "confidence": 0.0,
+  "needs_review": false,
+  "review_reasons": ["low_confidence | unknown_product_area | unknown_issue_pattern"]
 }
 ```
