@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from feedback_hub.topic_discovery.refinement import (
+    build_low_information_pool,
     detect_low_information_review_reasons,
     select_targeted_topics,
 )
@@ -95,3 +96,33 @@ def test_select_targeted_topics_unions_risk_sources_without_duplicates() -> None
     assert by_id["d8"]["selection_reasons"] == ["low_information_candidate"]
     assert by_id["d1"]["baseline_decision"]["verdict"] == "uncertain"
     assert by_id["d1"]["candidates"][0]["topic_id"] == "t1"
+
+
+def test_build_low_information_pool_preserves_evidence_and_media() -> None:
+    topic = _topic("d1", "用户提及一个异常但未说明对象")
+    topic.update({
+        "conversation_ids": ["c1"],
+        "evidence_links": ["https://example.test/chat"],
+        "members": [
+            {"summary": "看图", "has_media_evidence": True},
+            {"summary": "补充文本", "has_media_evidence": False},
+        ],
+    })
+    decisions = [{
+        "daily_topic_id": "d1",
+        "verdict": "low_information",
+        "historical_topic_id": None,
+        "confidence": 0.88,
+        "reason": "文本无法确定对象和症状",
+    }]
+
+    pool = build_low_information_pool([topic], decisions)
+
+    assert pool[0]["daily_topic_id"] == "d1"
+    assert pool[0]["conversation_ids"] == ["c1"]
+    assert pool[0]["evidence_links"] == ["https://example.test/chat"]
+    assert pool[0]["has_media_evidence"] is True
+    assert pool[0]["media_appendix_eligible"] is True
+    assert pool[0]["decision_reason"] == "文本无法确定对象和症状"
+    assert pool[0]["decision_confidence"] == 0.88
+    assert pool[0]["members"] == topic["members"]

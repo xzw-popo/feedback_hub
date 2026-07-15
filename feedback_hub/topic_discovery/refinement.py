@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 from typing import Any
 
 
@@ -96,6 +97,37 @@ def select_targeted_topics(
         for daily_topic_id in sorted(reasons_by_id)
         if reasons_by_id[daily_topic_id]
     ]
+
+
+def build_low_information_pool(
+    daily_topics: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    topic_by_id = _unique_map(daily_topics, "daily_topic_id", "daily topic")
+    decision_by_id = _unique_map(decisions, "daily_topic_id", "decision")
+    unknown_ids = set(decision_by_id) - set(topic_by_id)
+    if unknown_ids:
+        raise ValueError(f"decisions reference unknown daily topics: {sorted(unknown_ids)}")
+
+    pool = []
+    for daily_topic_id in sorted(decision_by_id):
+        decision = decision_by_id[daily_topic_id]
+        if str(decision.get("verdict") or "") != "low_information":
+            continue
+        topic = deepcopy(topic_by_id[daily_topic_id])
+        has_media = any(
+            bool(member.get("has_media_evidence"))
+            for member in topic.get("members") or []
+            if isinstance(member, dict)
+        )
+        topic.update({
+            "decision_reason": str(decision.get("reason") or "").strip(),
+            "decision_confidence": float(decision.get("confidence") or 0.0),
+            "has_media_evidence": has_media,
+            "media_appendix_eligible": has_media,
+        })
+        pool.append(topic)
+    return pool
 
 
 def _decision_similarity(
