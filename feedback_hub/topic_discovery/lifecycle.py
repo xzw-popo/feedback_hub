@@ -45,14 +45,8 @@ def match_daily_topics(
 ) -> list[dict[str, Any]]:
     """Translate explicit model decisions into auditable lifecycle events."""
     ordered_daily = sorted(daily_topics, key=lambda topic: str(topic.get("daily_topic_id") or ""))
-    if not historical_topics:
-        _topics, events = seed_topic_store(
-            ordered_daily,
-            str(ordered_daily[0].get("source_date") or "") if ordered_daily else "",
-        )
-        return events
     if decisions is None:
-        raise ValueError("explicit decisions are required when historical topics exist")
+        raise ValueError("explicit decisions are required for every lifecycle run")
 
     daily_ids = [str(topic.get("daily_topic_id") or "") for topic in ordered_daily]
     decision_ids = [str(decision.get("daily_topic_id") or "") for decision in decisions]

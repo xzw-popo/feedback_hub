@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from feedback_hub.topic_discovery.refinement import (
     audit_refined_decisions,
+    audit_low_information_upgrades,
     build_low_information_pool,
     detect_low_information_review_reasons,
     overlay_revised_decisions,
@@ -130,6 +132,51 @@ def test_build_low_information_pool_preserves_evidence_and_media() -> None:
     assert pool[0]["decision_reason"] == "文本无法确定对象和症状"
     assert pool[0]["decision_confidence"] == 0.88
     assert pool[0]["members"] == topic["members"]
+
+
+def test_low_information_upgrade_audit_flags_similarity_without_merging() -> None:
+    current = _topic("d2", "语音输入后文字不上屏")
+    current["evidence_links"] = ["https://example.test/current"]
+    held = {
+        "daily_topic_id": "d1",
+        "title": "语音有问题，看图",
+        "evidence_links": ["https://example.test/held"],
+    }
+
+    rows = audit_low_information_upgrades(
+        [current],
+        [held],
+        np.asarray([[1.0, 0.0]], dtype="float32"),
+        np.asarray([[0.8, 0.6]], dtype="float32"),
+        threshold=0.78,
+    )
+
+    assert rows == [{
+        "audit_flag": "possible_low_information_upgrade",
+        "current_daily_topic_id": "d2",
+        "prior_daily_topic_id": "d1",
+        "cosine_similarity": pytest.approx(0.8),
+        "current_evidence_links": ["https://example.test/current"],
+        "prior_evidence_links": ["https://example.test/held"],
+    }]
+    assert "topic_id" not in rows[0]
+
+
+def test_low_information_upgrade_audit_normalizes_vectors_and_sorts() -> None:
+    current = [_topic("d2", "甲"), _topic("d3", "乙")]
+    held = [{"daily_topic_id": "d1"}]
+
+    rows = audit_low_information_upgrades(
+        current,
+        held,
+        np.asarray([[2.0, 0.0], [1.0, 1.0]], dtype="float32"),
+        np.asarray([[3.0, 0.0]], dtype="float32"),
+        threshold=0.7,
+    )
+
+    assert [row["current_daily_topic_id"] for row in rows] == ["d2", "d3"]
+    assert rows[0]["cosine_similarity"] == pytest.approx(1.0)
+    assert rows[1]["cosine_similarity"] == pytest.approx(2**-0.5)
 
 
 def test_overlay_revised_decisions_replaces_only_targeted_rows() -> None:

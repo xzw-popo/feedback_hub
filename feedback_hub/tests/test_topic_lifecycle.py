@@ -53,6 +53,53 @@ def test_match_daily_topics_requires_explicit_decisions_with_history() -> None:
         match_daily_topics([_daily("daily:2026-07-12:0001")], historical)
 
 
+def test_match_daily_topics_requires_explicit_decisions_with_empty_history() -> None:
+    with pytest.raises(ValueError, match="explicit decisions"):
+        match_daily_topics([_daily("daily:2026-07-12:0001")], [])
+
+
+def test_empty_history_applies_new_and_low_information_decisions() -> None:
+    daily_topics = [
+        _daily("daily:2026-07-12:0001", "明确的新需求"),
+        _daily("daily:2026-07-12:0002", "无法使用"),
+    ]
+    decisions = [
+        {
+            "daily_topic_id": "daily:2026-07-12:0001",
+            "verdict": "new_topic",
+            "historical_topic_id": None,
+        },
+        {
+            "daily_topic_id": "daily:2026-07-12:0002",
+            "verdict": "low_information",
+            "historical_topic_id": None,
+        },
+    ]
+
+    events = match_daily_topics(daily_topics, [], decisions)
+    store = apply_topic_events([], daily_topics, events)
+
+    assert [event["event_type"] for event in events] == [
+        "topic_created",
+        "low_information_held",
+    ]
+    assert [event["topic_id"] for event in events] == ["topic:000001", None]
+    assert [topic["topic_id"] for topic in store] == ["topic:000001"]
+
+
+def test_empty_history_rejects_verdict_that_requires_history() -> None:
+    with pytest.raises(ValueError, match="unknown historical_topic_id"):
+        match_daily_topics(
+            [_daily("daily:2026-07-12:0001")],
+            [],
+            decisions=[{
+                "daily_topic_id": "daily:2026-07-12:0001",
+                "verdict": "same_topic",
+                "historical_topic_id": "topic:000001",
+            }],
+        )
+
+
 def test_match_daily_topics_maps_all_supported_decisions() -> None:
     historical, _events = seed_topic_store([_daily("daily:2026-07-11:0001")], "2026-07-11")
     daily_topics = [

@@ -78,6 +78,24 @@ def test_build_lifecycle_candidate_plan_keeps_top_matches_and_no_match_topics() 
     assert plan["stats"]["deterministic_new_topics"] == 0
 
 
+def test_build_lifecycle_candidate_plan_batches_empty_history_for_eligibility() -> None:
+    daily = [_daily("d1", "明确需求"), _daily("d2", "无法使用")]
+    daily_embeddings = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype="float32")
+    historical_embeddings = np.empty((0, 2), dtype="float32")
+
+    plan = build_lifecycle_candidate_plan(
+        daily,
+        [],
+        daily_embeddings,
+        historical_embeddings,
+    )
+
+    assert len(plan["candidate_rows"]) == 2
+    assert all(not row["candidates"] for row in plan["candidate_rows"])
+    assert [item["daily_topic_id"] for item in plan["batches"][0]["items"]] == ["d1", "d2"]
+    assert plan["stats"]["model_decision_topics"] == 2
+
+
 def test_lifecycle_prompt_treats_history_as_memory_not_fixed_taxonomy() -> None:
     batch = {
         "batch_id": "match:0001",

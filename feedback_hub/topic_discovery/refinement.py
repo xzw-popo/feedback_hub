@@ -5,6 +5,8 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any
 
+import numpy as np
+
 
 _AMBIGUITY_MARKERS = (
     "意图不明确",
@@ -181,6 +183,65 @@ def overlay_revised_decisions(
     return output
 
 
+def audit_low_information_upgrades(
+    current_topics: list[dict[str, Any]],
+    prior_low_information: list[dict[str, Any]],
+    current_embeddings: np.ndarray,
+    prior_embeddings: np.ndarray,
+    *,
+    threshold: float = 0.78,
+) -> list[dict[str, Any]]:
+    if current_embeddings.ndim != 2 or current_embeddings.shape[0] != len(current_topics):
+        raise ValueError("current embedding rows must match current topics")
+    if prior_embeddings.ndim != 2 or prior_embeddings.shape[0] != len(prior_low_information):
+        raise ValueError("prior embedding rows must match prior low-information topics")
+    if current_embeddings.shape[1] != prior_embeddings.shape[1]:
+        raise ValueError("upgrade embedding dimensions must match")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("upgrade threshold must be between 0 and 1")
+    if not np.isfinite(current_embeddings).all() or not np.isfinite(prior_embeddings).all():
+        raise ValueError("upgrade embeddings must be finite")
+    if not current_topics or not prior_low_information:
+        return []
+
+    current_vectors = _normalize_rows(current_embeddings)
+    prior_vectors = _normalize_rows(prior_embeddings)
+    similarities = np.einsum(
+        "ik,jk->ij",
+        current_vectors.astype("float64"),
+        prior_vectors.astype("float64"),
+        dtype=np.float64,
+    )
+    rows = []
+    for current_index, current in enumerate(current_topics):
+        current_id = str(current.get("daily_topic_id") or "")
+        if not current_id:
+            raise ValueError("current topic requires daily_topic_id")
+        for prior_index, prior in enumerate(prior_low_information):
+            prior_id = str(prior.get("daily_topic_id") or "")
+            if not prior_id:
+                raise ValueError("prior low-information topic requires daily_topic_id")
+            similarity = float(similarities[current_index, prior_index])
+            if similarity < threshold:
+                continue
+            rows.append({
+                "audit_flag": "possible_low_information_upgrade",
+                "current_daily_topic_id": current_id,
+                "prior_daily_topic_id": prior_id,
+                "cosine_similarity": similarity,
+                "current_evidence_links": _dedupe_strings(current.get("evidence_links") or []),
+                "prior_evidence_links": _dedupe_strings(prior.get("evidence_links") or []),
+            })
+    return sorted(
+        rows,
+        key=lambda row: (
+            -float(row["cosine_similarity"]),
+            str(row["current_daily_topic_id"]),
+            str(row["prior_daily_topic_id"]),
+        ),
+    )
+
+
 def audit_refined_decisions(
     daily_topics: list[dict[str, Any]],
     historical_topics: list[dict[str, Any]],
@@ -348,6 +409,25 @@ def _first_evidence_link(topic: dict[str, Any]) -> str:
         if links:
             return links[0]
     return ""
+
+
+def _normalize_rows(values: np.ndarray) -> np.ndarray:
+    vectors = values.astype("float64")
+    norms = np.linalg.norm(vectors, axis=1)
+    if len(norms) and np.any(norms <= 1e-12):
+        raise ValueError("upgrade embeddings cannot contain zero vectors")
+    return (vectors / norms[:, None]).astype("float32")
+
+
+def _dedupe_strings(values: list[Any]) -> list[str]:
+    output = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            output.append(text)
+    return output
 
 
 def _unique_map(
