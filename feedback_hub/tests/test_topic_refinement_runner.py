@@ -7,6 +7,7 @@ import pytest
 from scripts.run_topic_boundary_refinement import (
     build_artifact_paths,
     build_refinement_batches,
+    build_retry_batches,
     summarize_refinement,
 )
 
@@ -96,6 +97,36 @@ def test_build_artifact_paths_uses_isolated_contract_names(tmp_path: Path) -> No
     assert paths["pool"].name == "low_information_pool.jsonl"
     assert paths["manifest"].name == "manifest.json"
     assert set(path.parent for path in paths.values()) == {tmp_path}
+
+
+def test_build_retry_batches_splits_only_failed_primary_rows() -> None:
+    model_rows = [
+        {
+            "batch_id": "refine:0001",
+            "items": [{"daily_topic_id": f"d{i}"} for i in range(1, 8)],
+            "decisions": [],
+            "match_error": None,
+            "match_parse_error": "invalid JSON",
+        },
+        {
+            "batch_id": "refine:0002",
+            "items": [{"daily_topic_id": "d8"}],
+            "decisions": [{"daily_topic_id": "d8", "verdict": "new_topic"}],
+            "match_error": None,
+            "match_parse_error": None,
+        },
+    ]
+
+    retries = build_retry_batches(model_rows, retry_batch_size=3)
+
+    assert [row["batch_id"] for row in retries] == [
+        "retry:refine:0001:0001",
+        "retry:refine:0001:0002",
+        "retry:refine:0001:0003",
+    ]
+    assert [
+        item["daily_topic_id"] for batch in retries for item in batch["items"]
+    ] == [f"d{i}" for i in range(1, 8)]
 
 
 def test_summarize_refinement_reconciles_changes_and_flags() -> None:

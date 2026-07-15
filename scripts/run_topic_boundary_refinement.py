@@ -44,6 +44,8 @@ def build_artifact_paths(output_dir: str | Path) -> dict[str, Path]:
         "targeted": root / "targeted_topics.jsonl",
         "batches": root / "revised_lifecycle_batches.jsonl",
         "model_rows": root / "revised_lifecycle_model_rows.jsonl",
+        "retry_batches": root / "revised_lifecycle_retry_batches.jsonl",
+        "retry_model_rows": root / "revised_lifecycle_retry_model_rows.jsonl",
         "revised": root / "revised_decisions.jsonl",
         "full": root / "full_overlaid_decisions.jsonl",
         "pool": root / "low_information_pool.jsonl",
@@ -117,6 +119,37 @@ def build_refinement_batches(
         }
         for start in range(0, len(items), max_batch_size)
     ]
+
+
+def build_retry_batches(
+    model_rows: list[dict[str, Any]],
+    *,
+    retry_batch_size: int = 3,
+) -> list[dict[str, Any]]:
+    if retry_batch_size < 1:
+        raise ValueError("retry_batch_size must be positive")
+    retries = []
+    seen_ids = set()
+    for row in model_rows:
+        if not row.get("match_error") and not row.get("match_parse_error"):
+            continue
+        parent_batch_id = str(row.get("batch_id") or "")
+        if not parent_batch_id:
+            raise ValueError("failed model row requires batch_id")
+        items = list(row.get("items") or [])
+        for item in items:
+            daily_topic_id = str(item.get("daily_topic_id") or "")
+            if not daily_topic_id or daily_topic_id in seen_ids:
+                raise ValueError("failed model rows require unique daily_topic_id values")
+            seen_ids.add(daily_topic_id)
+        for start in range(0, len(items), retry_batch_size):
+            retries.append({
+                "batch_id": (
+                    f"retry:{parent_batch_id}:{start // retry_batch_size + 1:04d}"
+                ),
+                "items": items[start:start + retry_batch_size],
+            })
+    return retries
 
 
 def summarize_refinement(
@@ -319,6 +352,28 @@ def _write_manifest(
     })
 
 
+def _model_stats_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    processed: int = 0,
+    resumed: int = 0,
+) -> dict[str, Any]:
+    call_failed = sum(bool(row.get("match_error")) for row in rows)
+    parse_failed = sum(bool(row.get("match_parse_error")) for row in rows)
+    return {
+        "batches": len(rows),
+        "decisions": sum(len(row.get("decisions") or []) for row in rows),
+        "call_failed": call_failed,
+        "parse_failed": parse_failed,
+        "route_counts": dict(sorted(Counter(
+            str(row.get("knot_route") or "") for row in rows
+        ).items())),
+        "processed": processed,
+        "resumed": resumed,
+        "retryable_failed": call_failed + parse_failed,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Rerun targeted topic lifecycle boundaries."
@@ -339,6 +394,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fallback-batch-size", type=int, default=0)
     return parser.parse_args()
 
 
@@ -401,6 +457,7 @@ def main() -> int:
         "request_timeout": args.request_timeout,
         "resume": args.resume,
         "prepare_only": args.prepare_only,
+        "fallback_batch_size": args.fallback_batch_size,
     }
     if args.prepare_only:
         preparation = {
@@ -433,17 +490,48 @@ def main() -> int:
 
     if batches and not routes:
         raise SystemExit("no Knot route token is configured")
-    model_rows, model_stats = run_lifecycle_batches_multi_channel(
-        batches,
-        routes=routes,
-        output_path=paths["model_rows"],
-        concurrency_per_route=args.concurrency_per_route,
-        max_retries=args.max_retries,
-        request_timeout=args.request_timeout,
-        resume=args.resume,
-    )
+    if args.resume and args.fallback_batch_size and paths["model_rows"].exists():
+        model_rows = _read_jsonl(paths["model_rows"])
+        model_stats = _model_stats_from_rows(model_rows, resumed=len(model_rows))
+    else:
+        model_rows, model_stats = run_lifecycle_batches_multi_channel(
+            batches,
+            routes=routes,
+            output_path=paths["model_rows"],
+            concurrency_per_route=args.concurrency_per_route,
+            max_retries=args.max_retries,
+            request_timeout=args.request_timeout,
+            resume=args.resume,
+        )
     if model_stats["call_failed"] or model_stats["parse_failed"]:
-        raise RuntimeError(f"unresolved lifecycle model rows: {model_stats}")
+        if args.fallback_batch_size < 1:
+            raise RuntimeError(f"unresolved lifecycle model rows: {model_stats}")
+        retry_batches = build_retry_batches(
+            model_rows,
+            retry_batch_size=args.fallback_batch_size,
+        )
+        _write_jsonl(paths["retry_batches"], retry_batches)
+        retry_rows, retry_stats = run_lifecycle_batches_multi_channel(
+            retry_batches,
+            routes=routes,
+            output_path=paths["retry_model_rows"],
+            concurrency_per_route=args.concurrency_per_route,
+            max_retries=args.max_retries,
+            request_timeout=args.request_timeout,
+            resume=args.resume,
+        )
+        if retry_stats["call_failed"] or retry_stats["parse_failed"]:
+            raise RuntimeError(f"unresolved fallback lifecycle rows: {retry_stats}")
+        successful_primary = [
+            row for row in model_rows
+            if not row.get("match_error") and not row.get("match_parse_error")
+        ]
+        model_rows = successful_primary + retry_rows
+        model_stats = {
+            **_model_stats_from_rows(model_rows),
+            "primary": model_stats,
+            "fallback": retry_stats,
+        }
 
     revised_decisions = [
         {**decision, "decision_source": "targeted_refinement"}
