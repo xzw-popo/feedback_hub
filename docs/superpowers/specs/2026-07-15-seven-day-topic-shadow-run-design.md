@@ -19,8 +19,8 @@ This iteration answers four questions:
 2. Can daily topics be discovered without relying on a fixed topic taxonomy?
 3. Can the topic store distinguish continuing, new, possible-subtopic,
    uncertain, and low-information feedback across seven sequential days?
-4. Can the model-call layer continue safely when either or both Knot agents
-   reach quota, while preserving exact output coverage and route provenance?
+4. Can the model-call layer detect Knot quota exhaustion, pause safely, and
+   preserve exact output coverage and route provenance for later resumption?
 
 The shadow run does not decide the final report layout or claim that every
 eligible topic belongs in a report.
@@ -82,16 +82,16 @@ multiple platforms, both media and non-media cases, and both candidate-bearing
 and candidate-free cases. Include at least two rows for each verdict and at
 least five reviewed rows whose verdict references a historical topic.
 
-The self-owned API is approved as a full lifecycle fallback only when:
+The self-owned API is eligible for a future full lifecycle fallback only when:
 
 - exact lifecycle-verdict agreement is at least 17 of 20 rows; and
 - among rows whose reviewed verdict references history, exact
   `historical_topic_id` agreement is at least 80%.
 
-If either threshold fails, the self-owned API may still process conversation
-issue extraction, but lifecycle work pauses when both Knot routes are
-unavailable. The canary uses the same task prompt, schema, and strict parser as
-the shadow run.
+The canary is calibration only in this shadow run. Passing the thresholds does
+not authorize automatic fallback. If either threshold fails, record the
+quality result and do not use the self-owned API for shadow-run traffic. The
+canary uses the same task prompt, schema, and strict parser as the shadow run.
 
 ## 4. Input Data
 
@@ -216,19 +216,24 @@ The call layer exposes three logical routes:
 
 1. Knot agent A, maximum four concurrent calls;
 2. Knot agent B, maximum four concurrent calls;
-3. the self-owned OpenAI-compatible API, used only as fallback, with default
-   concurrency 32 and a configurable ceiling no higher than 100.
+3. the self-owned OpenAI-compatible API, calibrated for a possible later
+   fallback but disabled for automatic shadow-run traffic.
 
 New work is balanced across currently available Knot routes. A route is marked
 quota-exhausted for the remainder of the run only after an explicit quota/rate
-limit response recognized by the adapter. New work then moves to the other
-Knot route. The self-owned API receives new work only after both Knot routes
-are quota-exhausted or administratively unavailable.
+limit response recognized by the adapter. On the first explicit quota signal
+from either Knot route, stop scheduling new work across all routes, allow only
+already in-flight requests to finish, persist a `paused_quota_exhausted` run
+state, and return control to the user. Do not continue on the other Knot route
+and do not send shadow-run work to the self-owned API without new user
+approval.
 
 ### 6.3 Retry classification
 
 - Timeouts, connection failures, and HTTP 5xx responses retry on the original
   route with bounded exponential backoff.
+- An explicit Knot quota response is not retried and triggers the global pause
+  described above.
 - A parse or exact-coverage failure is not treated as quota exhaustion.
 - Lifecycle batches contain at most five topics. A failed parse retries once;
   if it still fails, the batch is split into batches of at most three topics.
@@ -294,8 +299,9 @@ daily report.
   clustering buckets, and lifecycle topics.
 - If a day cannot finalize, later dates do not start because their historical
   memory would be invalid.
-- If the self-owned API also fails after bounded retries, leave the checkpoint
-  resumable and stop the shadow run without fabricating labels.
+- If either Knot route has an unresolved non-quota call failure after bounded
+  retries, leave the checkpoint resumable and stop the shadow run without
+  fabricating labels or switching to the self-owned API.
 
 ## 9. Verification and Acceptance Criteria
 
@@ -305,7 +311,9 @@ daily report.
 - first-day `low_information` topics receive no stable topic ID;
 - user evidence excludes customer-service-authored messages;
 - media and source links survive every stage;
-- route quota transitions and self-API fallback are deterministic;
+- quota classification and route provenance are deterministic;
+- the first explicit Knot quota response stops new scheduling and writes a
+  resumable paused state;
 - transient errors remain on their original route;
 - malformed JSON causes retry and batch splitting, not semantic fallback;
 - checkpoint resume never duplicates a completed work item;
@@ -346,8 +354,10 @@ is hidden.
 Based on the completed 2026-07-12 and 2026-07-13 experiments, a full replay is
 expected to require roughly 6,000 to 7,000 model requests, dominated by
 conversation extraction. The two Knot agents may therefore exhaust their
-nominal daily quota during a same-day historical replay. This is expected and
-is the reason the calibrated self-owned API is part of the call architecture.
+nominal daily quota during a same-day historical replay. This is expected; the
+first explicit quota signal pauses this run so the user can decide whether to
+wait, resume on remaining Knot capacity, or authorize the calibrated self-owned
+API.
 
 The implementation must report actual request counts and route share rather
 than treating this estimate as a limit.
