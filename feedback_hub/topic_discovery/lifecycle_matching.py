@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
 from pathlib import Path
-import threading
-import time
 from typing import Any, Callable
 
 import numpy as np
 
-from feedback_hub.data.knot_label_eval.knot_batch import run_incremental_jobs
-from feedback_hub.data.knot_label_eval.run_knot_feature_canary import call_knot
+from feedback_hub.topic_discovery.model_routes import (
+    ModelRoute,
+    QuotaExhaustedError,
+    call_knot_route,
+    invoke_model_route,
+    normalize_knot_routes,
+    run_pauseable_model_jobs,
+)
 
 
 _FENCE_JSON_RE = re.compile(r"```json\s*(.+?)\s*```", re.DOTALL | re.IGNORECASE)
@@ -61,7 +64,7 @@ def build_lifecycle_candidate_plan(
     *,
     threshold: float = 0.55,
     top_k: int = 5,
-    max_batch_size: int = 10,
+    max_batch_size: int = 5,
 ) -> dict[str, Any]:
     if daily_embeddings.shape[0] != len(daily_topics):
         raise ValueError("daily embedding rows must match daily topics")
@@ -135,7 +138,7 @@ def build_lifecycle_match_prompt(batch: dict[str, Any]) -> str:
     return "\n".join([
         "You match newly discovered WeType daily topics against historical topics.",
         "The historical topic store is memory, not a fixed taxonomy. New topics are expected.",
-        "Return JSON only and decide every supplied daily_topic_id exactly once.",
+        "Return exactly one legal JSON object and decide every supplied daily_topic_id once.",
         "First test memory eligibility. Use low_information when the text lacks enough product object, request, symptom, trigger, or expectation to define an independently actionable topic.",
         "Low-information feedback is not irrelevant. It is held outside stable topic memory and may still enter a media appendix.",
         "Use same_topic only when the current and historical topics describe the same independently actionable product problem and the same product object or capability.",
@@ -148,6 +151,8 @@ def build_lifecycle_match_prompt(batch: dict[str, Any]) -> str:
         "Use uncertain only when one historical candidate is plausible but the supplied evidence cannot resolve the boundary; provide that candidate ID.",
         "Do not claim rising trend or confirmed novelty from one comparison.",
         "For same_topic, possible_subtopic, and uncertain, historical_topic_id must be one supplied candidate. For new_topic and low_information it must be null.",
+        "Do not use literal ASCII double quotes inside reason text; use Chinese corner quotes 「」 when quotation is necessary.",
+        "Never invent a daily_topic_id or historical_topic_id.",
         "Keep the reason under 80 Chinese characters.",
         "",
         f"Match batch: {batch.get('batch_id')}",
@@ -156,7 +161,6 @@ def build_lifecycle_match_prompt(batch: dict[str, Any]) -> str:
         "```",
         "",
         "Return shape:",
-        "```json",
         json.dumps({
             "decisions": [{
                 "daily_topic_id": "daily topic id",
@@ -166,7 +170,6 @@ def build_lifecycle_match_prompt(batch: dict[str, Any]) -> str:
                 "reason": "concise boundary reason",
             }]
         }, ensure_ascii=False),
-        "```",
     ])
 
 
@@ -225,81 +228,89 @@ def parse_lifecycle_match_reply(
 def run_lifecycle_batches_multi_channel(
     batches: list[dict[str, Any]],
     *,
-    routes: list[dict[str, str]],
+    routes: list[Any],
     output_path: str | Path,
     concurrency_per_route: int = 4,
     max_retries: int = 4,
     request_timeout: int = 300,
     resume: bool = False,
-    call_fn: Callable[..., str] = call_knot,
+    call_fn: Callable[..., Any] = call_knot_route,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if not routes:
-        raise ValueError("at least one Knot route is required")
     if request_timeout < 1:
         raise ValueError("request_timeout must be positive")
-    normalized_routes = []
-    names = set()
-    for route in routes:
-        name = str(route.get("name") or "")
-        api_url = str(route.get("api_url") or "")
-        token = str(route.get("token") or "")
-        if not name or not api_url or not token or name in names:
-            raise ValueError("each lifecycle route requires a unique name, api_url, and token")
-        names.add(name)
-        normalized_routes.append({
-            "name": name,
-            "api_url": api_url,
-            "token": token,
-            "api_user": str(route.get("api_user") or ""),
-            "model": str(route.get("model") or ""),
-        })
-    semaphores = {
-        route["name"]: threading.BoundedSemaphore(concurrency_per_route)
-        for route in normalized_routes
-    }
+    normalized_routes = normalize_knot_routes(routes)
     jobs = [
         (index, str(batch.get("batch_id") or ""), batch)
         for index, batch in enumerate(batches)
     ]
 
-    def worker(index: int, key: str, batch: dict[str, Any]):
-        route = normalized_routes[index % len(normalized_routes)]
-        allowed_daily_ids = {
-            str(item.get("daily_topic_id") or item.get("daily_topic", {}).get("daily_topic_id") or "")
-            for item in batch.get("items") or []
-        }
-        allowed_historical_ids = {
-            str(candidate.get("topic_id") or "")
-            for item in batch.get("items") or []
-            for candidate in item.get("candidates") or []
-            if candidate.get("topic_id")
-        }
-        started = time.time()
-        try:
-            with semaphores[route["name"]]:
-                raw_reply = call_fn(
-                    build_lifecycle_match_prompt(batch),
-                    api_url=route["api_url"],
-                    token=route["token"],
-                    model=route["model"],
-                    api_user=route["api_user"],
+    def worker(index: int, key: str, batch: dict[str, Any], route: ModelRoute):
+        raw_replies: list[str] = []
+        model_attempts = 0
+        parse_attempts = 0
+        retry_chain: list[str] = []
+        elapsed_ms = 0
+
+        def call_and_parse(target_batch: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+            nonlocal model_attempts, parse_attempts, elapsed_ms
+            allowed_daily_ids = {
+                str(item.get("daily_topic_id") or item.get("daily_topic", {}).get("daily_topic_id") or "")
+                for item in target_batch.get("items") or []
+            }
+            allowed_historical_ids = {
+                str(candidate.get("topic_id") or "")
+                for item in target_batch.get("items") or []
+                for candidate in item.get("candidates") or []
+                if candidate.get("topic_id")
+            }
+            last_parse_error = None
+            for _parse_attempt in range(2):
+                reply = invoke_model_route(
+                    build_lifecycle_match_prompt(target_batch),
+                    route=route,
+                    call_fn=call_fn,
                     max_retries=max_retries,
                     timeout=request_timeout,
                 )
-            decisions = parse_lifecycle_match_reply(
-                raw_reply,
-                allowed_daily_topic_ids=allowed_daily_ids,
-                allowed_historical_topic_ids=allowed_historical_ids,
-            )
+                raw_replies.append(reply.content)
+                model_attempts += reply.attempts
+                parse_attempts += 1
+                elapsed_ms += reply.elapsed_ms
+                retry_chain.extend(reply.retry_chain)
+                try:
+                    return parse_lifecycle_match_reply(
+                        reply.content,
+                        allowed_daily_topic_ids=allowed_daily_ids,
+                        allowed_historical_topic_ids=allowed_historical_ids,
+                    ), None
+                except ValueError as exc:
+                    last_parse_error = f"{type(exc).__name__}: {exc}"
+            return [], last_parse_error
+
+        split_after_parse_failure = False
+        try:
+            decisions, parse_error = call_and_parse(batch)
+            if parse_error and len(batch.get("items") or []) > 3:
+                split_after_parse_failure = True
+                decisions = []
+                split_errors = []
+                items = list(batch.get("items") or [])
+                for split_index, start in enumerate(range(0, len(items), 3), 1):
+                    split_batch = {
+                        "batch_id": f"{key}:split:{split_index}",
+                        "items": items[start:start + 3],
+                    }
+                    split_decisions, split_error = call_and_parse(split_batch)
+                    decisions.extend(split_decisions)
+                    if split_error:
+                        split_errors.append(split_error)
+                parse_error = "; ".join(split_errors) or None
+            raw_reply = raw_replies[-1] if raw_replies else ""
             call_error = None
-            parse_error = None
-        except ValueError as exc:
-            raw_reply = locals().get("raw_reply", "")
-            decisions = []
-            call_error = None
-            parse_error = f"{type(exc).__name__}: {exc}"
+        except QuotaExhaustedError:
+            raise
         except Exception as exc:
-            raw_reply = ""
+            raw_reply = raw_replies[-1] if raw_replies else ""
             decisions = []
             call_error = f"{type(exc).__name__}: {exc}"
             parse_error = None
@@ -309,28 +320,41 @@ def run_lifecycle_batches_multi_channel(
             "match_raw_reply": raw_reply,
             "match_error": call_error,
             "match_parse_error": parse_error,
-            "knot_route": route["name"],
-            "elapsed_ms": int((time.time() - started) * 1000),
+            "match_parse_attempts": parse_attempts,
+            "match_split_after_parse_failure": split_after_parse_failure,
+            "route_source": route.name,
+            "endpoint_class": route.endpoint_class,
+            "model": route.model or "agent_default",
+            "prompt_version": "topic_lifecycle_v2",
+            "attempts": model_attempts,
+            "retry_chain": retry_chain,
+            "elapsed_ms": elapsed_ms,
         }
         return row, call_error or parse_error
 
-    rows, batch_stats = run_incremental_jobs(
+    rows, batch_stats = run_pauseable_model_jobs(
         jobs,
         worker,
+        routes=normalized_routes,
         output_path=output_path,
-        concurrency=len(normalized_routes) * concurrency_per_route,
+        concurrency_per_route=concurrency_per_route,
         resume=resume,
-        progress_every=5,
     )
     return rows, {
         "batches": len(rows),
         "decisions": sum(len(row.get("decisions") or []) for row in rows),
         "call_failed": sum(bool(row.get("match_error")) for row in rows),
         "parse_failed": sum(bool(row.get("match_parse_error")) for row in rows),
-        "route_counts": dict(sorted(Counter(str(row.get("knot_route") or "") for row in rows).items())),
+        "route_counts": dict(batch_stats["route_counts"]),
         "processed": batch_stats["processed"],
         "resumed": batch_stats["resumed"],
         "retryable_failed": batch_stats["failed"],
+        "run_status": batch_stats["run_status"],
+        "remaining": batch_stats["remaining"],
+        **({
+            "quota_route": batch_stats["quota_route"],
+            "quota_status_code": batch_stats["quota_status_code"],
+        } if batch_stats["run_status"] == "paused_quota_exhausted" else {}),
     }
 
 

@@ -206,6 +206,68 @@ def call_openai_compatible_route(
     )
 
 
+def normalize_knot_routes(routes: list[Any]) -> list[ModelRoute]:
+    normalized: list[ModelRoute] = []
+    names: set[str] = set()
+    for value in routes:
+        if isinstance(value, ModelRoute):
+            route = value
+        elif isinstance(value, dict):
+            route = ModelRoute(
+                name=str(value.get("name") or ""),
+                endpoint_class="knot_agent",
+                api_url=str(value.get("api_url") or ""),
+                credential=str(value.get("token") or value.get("credential") or ""),
+                model=str(value.get("model") or ""),
+                api_user=str(value.get("api_user") or ""),
+            )
+        else:
+            raise ValueError("model route must be a ModelRoute or mapping")
+        if (
+            not route.name
+            or route.endpoint_class != "knot_agent"
+            or not route.api_url
+            or not route.credential
+            or route.name in names
+        ):
+            raise ValueError("each Knot route requires a unique name, api_url, and token")
+        names.add(route.name)
+        normalized.append(route)
+    if not normalized:
+        raise ValueError("at least one Knot route is required")
+    return normalized
+
+
+def invoke_model_route(
+    prompt: str,
+    *,
+    route: ModelRoute,
+    call_fn: Callable[..., Any] = call_knot_route,
+    max_retries: int = 4,
+    timeout: int = 300,
+) -> ModelReply:
+    started = time.time()
+    result = call_fn(
+        prompt,
+        route=route,
+        max_retries=max_retries,
+        timeout=timeout,
+    )
+    if isinstance(result, ModelReply):
+        return result
+    if isinstance(result, str):
+        return ModelReply(
+            content=result,
+            route_name=route.name,
+            endpoint_class=route.endpoint_class,
+            model=route.model or "agent_default",
+            attempts=1,
+            elapsed_ms=int((time.time() - started) * 1000),
+            retry_chain=(),
+        )
+    raise TypeError("model call must return ModelReply or str")
+
+
 def run_pauseable_model_jobs(
     jobs: list[Job],
     worker: Worker,

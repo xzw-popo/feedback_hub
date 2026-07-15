@@ -12,6 +12,7 @@ from feedback_hub.topic_discovery.lifecycle_matching import (
     parse_lifecycle_match_reply,
     run_lifecycle_batches_multi_channel,
 )
+from feedback_hub.topic_discovery.model_routes import QuotaExhaustedError
 
 
 def _daily(topic_id: str, title: str) -> dict:
@@ -102,6 +103,10 @@ def test_lifecycle_prompt_treats_history_as_memory_not_fixed_taxonomy() -> None:
     assert "Feature requests may match across platforms" in prompt
     assert "d1" in prompt
     assert "t1" in prompt
+    assert "Return exactly one legal JSON object" in prompt
+    assert "ASCII double quotes inside reason" in prompt
+    assert "Chinese corner quotes" in prompt
+    assert "Return shape:\n{" in prompt
 
 
 def test_parse_lifecycle_match_reply_requires_exact_daily_coverage_and_valid_history() -> None:
@@ -209,6 +214,7 @@ def test_run_lifecycle_batches_multi_channel_balances_routes(tmp_path) -> None:
     assert stats["decisions"] == 4
     assert stats["call_failed"] == 0
     assert stats["parse_failed"] == 0
+    assert {row["route_source"] for row in rows} == {"a", "b"}
 
     with pytest.raises(ValueError, match="historical"):
         parse_lifecycle_match_reply(
@@ -216,3 +222,71 @@ def test_run_lifecycle_batches_multi_channel_balances_routes(tmp_path) -> None:
             allowed_daily_topic_ids={"d1"},
             allowed_historical_topic_ids={"t1"},
         )
+
+
+def test_run_lifecycle_batches_multi_channel_propagates_quota_pause(tmp_path) -> None:
+    batch = {
+        "batch_id": "match:0001",
+        "items": [{
+            "daily_topic_id": "d1",
+            "daily_topic": _daily("d1", "新主题"),
+            "candidates": [],
+        }],
+    }
+
+    def quota_call(prompt, **kwargs):
+        raise QuotaExhaustedError(kwargs["route"].name, 429, "quota")
+
+    output = tmp_path / "matches.jsonl"
+    rows, stats = run_lifecycle_batches_multi_channel(
+        [batch],
+        routes=[{"name": "a", "api_url": "https://a.test", "token": "secret"}],
+        output_path=output,
+        concurrency_per_route=1,
+        call_fn=quota_call,
+    )
+
+    assert rows == []
+    assert stats["run_status"] == "paused_quota_exhausted"
+    assert not output.exists()
+
+
+def test_lifecycle_runner_retries_parse_then_splits_to_three(tmp_path) -> None:
+    batch = {
+        "batch_id": "match:0001",
+        "items": [{
+            "daily_topic_id": f"d{index}",
+            "daily_topic": _daily(f"d{index}", "新主题"),
+            "candidates": [],
+        } for index in range(1, 6)],
+    }
+    calls = []
+
+    def fake_call(prompt, **kwargs):
+        calls.append(prompt)
+        if len(calls) <= 2:
+            return '{"decisions":['
+        items = json.loads(prompt.split("```json\n", 1)[1].split("\n```", 1)[0])
+        return json.dumps({
+            "decisions": [{
+                "daily_topic_id": item["daily_topic_id"],
+                "verdict": "new_topic",
+                "historical_topic_id": None,
+                "confidence": 0.9,
+                "reason": "无历史候选",
+            } for item in items]
+        }, ensure_ascii=False)
+
+    rows, stats = run_lifecycle_batches_multi_channel(
+        [batch],
+        routes=[{"name": "a", "api_url": "https://a.test", "token": "secret"}],
+        output_path=tmp_path / "matches.jsonl",
+        concurrency_per_route=1,
+        call_fn=fake_call,
+    )
+
+    assert len(calls) == 4
+    assert len(rows[0]["decisions"]) == 5
+    assert rows[0]["match_parse_attempts"] == 4
+    assert rows[0]["match_split_after_parse_failure"] is True
+    assert stats["parse_failed"] == 0
