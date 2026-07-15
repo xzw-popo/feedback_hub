@@ -27,6 +27,25 @@ _SELECTION_REASON_ORDER = (
     "low_information_candidate",
 )
 
+_AUDIT_FLAG_ORDER = (
+    "many_to_one_same_topic",
+    "generic_operation_boundary_risk",
+    "platform_boundary_risk",
+    "low_confidence_same_topic",
+    "high_similarity_new_topic",
+    "low_information_media",
+)
+
+_GENERIC_OPERATION_GROUPS = (
+    ("sorting", ("排序", "sort")),
+    ("sizing", ("大小", "尺寸", "高度", "字号", "字体大小", "size")),
+    ("switches", ("开关", "开启", "关闭", "启用", "禁用", "switch")),
+    ("entry_points", ("入口", "快捷键", "唤起", "entry", "shortcut")),
+    ("visibility", ("显示", "隐藏", "可见", "visibility")),
+    ("synchronization", ("同步", "sync")),
+    ("customization", ("自定义", "定制", "custom")),
+)
+
 
 def detect_low_information_review_reasons(topic: dict[str, Any]) -> list[str]:
     text = "\n".join([
@@ -130,6 +149,107 @@ def build_low_information_pool(
     return pool
 
 
+def overlay_revised_decisions(
+    all_daily_topic_ids: list[str],
+    baseline_decisions: list[dict[str, Any]],
+    revised_decisions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expected_ids = [str(value) for value in all_daily_topic_ids]
+    if not expected_ids or len(expected_ids) != len(set(expected_ids)) or any(not value for value in expected_ids):
+        raise ValueError("all_daily_topic_ids must be unique and non-empty")
+    baseline_by_id = _unique_map(
+        baseline_decisions, "daily_topic_id", "baseline decision"
+    )
+    revised_by_id = _unique_map(
+        revised_decisions, "daily_topic_id", "revised decision"
+    ) if revised_decisions else {}
+    expected = set(expected_ids)
+    if set(baseline_by_id) != expected:
+        raise ValueError("baseline decisions must exactly cover all daily topics")
+    if not set(revised_by_id).issubset(expected):
+        raise ValueError("revised decisions contain unknown daily topics")
+
+    output = []
+    for daily_topic_id in sorted(expected):
+        if daily_topic_id in revised_by_id:
+            decision = deepcopy(revised_by_id[daily_topic_id])
+            decision["decision_source"] = "targeted_refinement"
+        else:
+            decision = deepcopy(baseline_by_id[daily_topic_id])
+            decision["decision_source"] = "baseline_reused"
+        output.append(decision)
+    return output
+
+
+def audit_refined_decisions(
+    daily_topics: list[dict[str, Any]],
+    historical_topics: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    *,
+    low_confidence_threshold: float = 0.8,
+    high_similarity_threshold: float = 0.78,
+) -> list[dict[str, Any]]:
+    topic_by_id = _unique_map(daily_topics, "daily_topic_id", "daily topic")
+    history_by_id = _unique_map(historical_topics, "topic_id", "historical topic")
+    decision_by_id = _unique_map(decisions, "daily_topic_id", "decision")
+    candidate_by_id = _unique_map(candidate_rows, "daily_topic_id", "candidate row")
+    expected = set(topic_by_id)
+    if set(decision_by_id) != expected or set(candidate_by_id) != expected:
+        raise ValueError("topics, decisions, and candidate rows must have exact coverage")
+
+    same_counts = Counter(
+        str(decision.get("historical_topic_id") or "")
+        for decision in decisions
+        if decision.get("verdict") == "same_topic" and decision.get("historical_topic_id")
+    )
+    audit_rows = []
+    for daily_topic_id in sorted(expected):
+        topic = topic_by_id[daily_topic_id]
+        decision = decision_by_id[daily_topic_id]
+        candidate_row = candidate_by_id[daily_topic_id]
+        verdict = str(decision.get("verdict") or "")
+        selected_history_id = str(decision.get("historical_topic_id") or "") or None
+        candidates = list(candidate_row.get("candidates") or [])
+        if selected_history_id is None and candidates:
+            selected_history_id = str(candidates[0].get("topic_id") or "") or None
+        history = history_by_id.get(str(selected_history_id or ""), {})
+        similarity = _decision_similarity(decision, candidate_row)
+        flags = set()
+
+        if verdict == "same_topic" and same_counts[str(decision.get("historical_topic_id") or "")] > 1:
+            flags.add("many_to_one_same_topic")
+        if verdict in {"same_topic", "possible_subtopic"}:
+            if _has_shared_generic_operation(topic, history) and _features_are_disjoint(topic, history):
+                flags.add("generic_operation_boundary_risk")
+            if _is_cross_platform_bug(topic, history):
+                flags.add("platform_boundary_risk")
+        if verdict == "same_topic" and float(decision.get("confidence") or 0.0) < low_confidence_threshold:
+            flags.add("low_confidence_same_topic")
+        if verdict == "new_topic" and similarity >= high_similarity_threshold:
+            flags.add("high_similarity_new_topic")
+        has_media = _has_media(topic)
+        if verdict == "low_information" and has_media:
+            flags.add("low_information_media")
+        if not flags:
+            continue
+
+        audit_rows.append({
+            "daily_topic_id": daily_topic_id,
+            "verdict": verdict,
+            "selected_historical_topic_id": selected_history_id,
+            "selected_similarity": similarity,
+            "audit_flags": [flag for flag in _AUDIT_FLAG_ORDER if flag in flags],
+            "current_title": str(topic.get("title") or "").strip(),
+            "historical_title": str(
+                history.get("canonical_title") or history.get("title") or ""
+            ).strip(),
+            "evidence_link": _first_evidence_link(topic),
+            "has_media_evidence": has_media,
+        })
+    return audit_rows
+
+
 def _decision_similarity(
     decision: dict[str, Any],
     candidate_row: dict[str, Any],
@@ -148,6 +268,86 @@ def _decision_similarity(
         return float(candidate.get("cosine_similarity") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _has_shared_generic_operation(
+    current: dict[str, Any], historical: dict[str, Any]
+) -> bool:
+    current_text = "\n".join([
+        str(current.get("title") or ""),
+        str(current.get("description") or ""),
+    ]).lower()
+    historical_text = "\n".join([
+        str(historical.get("canonical_title") or historical.get("title") or ""),
+        str(historical.get("canonical_description") or historical.get("description") or ""),
+    ]).lower()
+    return any(
+        any(alias in current_text for alias in aliases)
+        and any(alias in historical_text for alias in aliases)
+        for _name, aliases in _GENERIC_OPERATION_GROUPS
+    )
+
+
+def _features_are_disjoint(
+    current: dict[str, Any], historical: dict[str, Any]
+) -> bool:
+    return bool(
+        (current_features := _count_keys(current, "feature_candidate_counts", {"unknown_feature"}))
+        and (historical_features := _count_keys(historical, "feature_candidate_counts", {"unknown_feature"}))
+        and current_features.isdisjoint(historical_features)
+    )
+
+
+def _is_cross_platform_bug(
+    current: dict[str, Any], historical: dict[str, Any]
+) -> bool:
+    current_types = _count_keys(current, "feedback_type_counts", set())
+    historical_types = _count_keys(historical, "feedback_type_counts", set())
+    is_bug = bool({"bug_problem", "mixed"} & current_types) and bool(
+        {"bug_problem", "mixed"} & historical_types
+    )
+    current_platforms = _count_keys(current, "platform_counts", {"unknown", "unknown_platform"})
+    historical_platforms = _count_keys(historical, "platform_counts", {"unknown", "unknown_platform"})
+    return bool(
+        is_bug
+        and current_platforms
+        and historical_platforms
+        and current_platforms.isdisjoint(historical_platforms)
+    )
+
+
+def _count_keys(
+    row: dict[str, Any], field_name: str, excluded: set[str]
+) -> set[str]:
+    counts = row.get(field_name) or {}
+    if not isinstance(counts, dict):
+        return set()
+    return {
+        str(key)
+        for key, value in counts.items()
+        if str(key) not in excluded and bool(value)
+    }
+
+
+def _has_media(topic: dict[str, Any]) -> bool:
+    return bool(topic.get("has_media_evidence")) or any(
+        bool(member.get("has_media_evidence"))
+        for member in topic.get("members") or []
+        if isinstance(member, dict)
+    )
+
+
+def _first_evidence_link(topic: dict[str, Any]) -> str:
+    direct = [str(value) for value in topic.get("evidence_links") or [] if value]
+    if direct:
+        return direct[0]
+    for member in topic.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        links = [str(value) for value in member.get("evidence_links") or [] if value]
+        if links:
+            return links[0]
+    return ""
 
 
 def _unique_map(

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from feedback_hub.topic_discovery.refinement import (
+    audit_refined_decisions,
     build_low_information_pool,
     detect_low_information_review_reasons,
+    overlay_revised_decisions,
     select_targeted_topics,
 )
 
@@ -126,3 +130,125 @@ def test_build_low_information_pool_preserves_evidence_and_media() -> None:
     assert pool[0]["decision_reason"] == "文本无法确定对象和症状"
     assert pool[0]["decision_confidence"] == 0.88
     assert pool[0]["members"] == topic["members"]
+
+
+def test_overlay_revised_decisions_replaces_only_targeted_rows() -> None:
+    baseline = [
+        {"daily_topic_id": "d1", "verdict": "new_topic", "confidence": 0.8},
+        {"daily_topic_id": "d2", "verdict": "same_topic", "confidence": 0.9},
+    ]
+    revised = [{
+        "daily_topic_id": "d1",
+        "verdict": "low_information",
+        "historical_topic_id": None,
+        "confidence": 0.92,
+    }]
+
+    result = overlay_revised_decisions(["d2", "d1"], baseline, revised)
+
+    assert [row["daily_topic_id"] for row in result] == ["d1", "d2"]
+    assert [row["verdict"] for row in result] == ["low_information", "same_topic"]
+    assert result[0]["decision_source"] == "targeted_refinement"
+    assert result[1]["decision_source"] == "baseline_reused"
+    assert "decision_source" not in baseline[0]
+
+
+@pytest.mark.parametrize(
+    ("all_ids", "baseline", "revised"),
+    [
+        (["d1", "d2"], [{"daily_topic_id": "d1"}], []),
+        (["d1"], [{"daily_topic_id": "d1"}, {"daily_topic_id": "d1"}], []),
+        (["d1"], [{"daily_topic_id": "d1"}], [{"daily_topic_id": "d2"}]),
+        (
+            ["d1"],
+            [{"daily_topic_id": "d1"}],
+            [{"daily_topic_id": "d1"}, {"daily_topic_id": "d1"}],
+        ),
+    ],
+)
+def test_overlay_revised_decisions_rejects_invalid_coverage(
+    all_ids: list[str], baseline: list[dict], revised: list[dict]
+) -> None:
+    with pytest.raises(ValueError):
+        overlay_revised_decisions(all_ids, baseline, revised)
+
+
+def test_audit_refined_decisions_flags_boundary_risks_without_rewriting() -> None:
+    topics = [
+        _topic("d1", "语音输入重复输出"),
+        _topic("d2", "调整键盘大小"),
+        _topic("d3", "Win语音输入不上屏"),
+        _topic("d4", "候选词消失"),
+        _topic("d5", "新增U模式拆字"),
+        _topic("d6", "看图，无法判断"),
+        _topic("d7", "语音输入重复两遍"),
+    ]
+    topics[1].update({
+        "feature_candidate_counts": {"keyboard_height_layout": 1},
+        "feedback_type_counts": {"feature_request": 1},
+    })
+    topics[2].update({
+        "feature_candidate_counts": {"voice_input": 1},
+        "feedback_type_counts": {"bug_problem": 1},
+        "platform_counts": {"Win": 1},
+    })
+    topics[5]["members"] = [{"summary": "看图", "has_media_evidence": True}]
+    historical = [
+        {
+            "topic_id": "t1",
+            "canonical_title": "语音输入文字重复",
+            "feature_candidate_counts": {"voice_input": 2},
+            "feedback_type_counts": {"bug_problem": 2},
+            "platform_counts": {"Win": 2},
+        },
+        {
+            "topic_id": "t2",
+            "canonical_title": "调整候选词字体大小",
+            "feature_candidate_counts": {"candidate_suggestions": 1},
+            "feedback_type_counts": {"feature_request": 1},
+            "platform_counts": {"Win": 1},
+        },
+        {
+            "topic_id": "t3",
+            "canonical_title": "Mac语音输入不上屏",
+            "feature_candidate_counts": {"voice_input": 1},
+            "feedback_type_counts": {"bug_problem": 1},
+            "platform_counts": {"Mac": 1},
+        },
+        {
+            "topic_id": "t4",
+            "canonical_title": "候选词消失",
+            "feature_candidate_counts": {"candidate_suggestions": 1},
+            "feedback_type_counts": {"bug_problem": 1},
+            "platform_counts": {"Win": 1},
+        },
+    ]
+    decisions = [
+        {"daily_topic_id": "d1", "verdict": "same_topic", "historical_topic_id": "t1", "confidence": 0.9},
+        {"daily_topic_id": "d2", "verdict": "same_topic", "historical_topic_id": "t2", "confidence": 0.9},
+        {"daily_topic_id": "d3", "verdict": "same_topic", "historical_topic_id": "t3", "confidence": 0.9},
+        {"daily_topic_id": "d4", "verdict": "same_topic", "historical_topic_id": "t4", "confidence": 0.7},
+        {"daily_topic_id": "d5", "verdict": "new_topic", "historical_topic_id": None, "confidence": 0.9},
+        {"daily_topic_id": "d6", "verdict": "low_information", "historical_topic_id": None, "confidence": 0.9},
+        {"daily_topic_id": "d7", "verdict": "same_topic", "historical_topic_id": "t1", "confidence": 0.9},
+    ]
+    candidate_rows = [
+        _candidate_row(topics[0], ("t1", 0.88)),
+        _candidate_row(topics[1], ("t2", 0.82)),
+        _candidate_row(topics[2], ("t3", 0.84)),
+        _candidate_row(topics[3], ("t4", 0.81)),
+        _candidate_row(topics[4], ("t1", 0.81)),
+        _candidate_row(topics[5]),
+        _candidate_row(topics[6], ("t1", 0.86)),
+    ]
+
+    audit = audit_refined_decisions(topics, historical, decisions, candidate_rows)
+
+    by_id = {row["daily_topic_id"]: row for row in audit}
+    assert by_id["d1"]["audit_flags"] == ["many_to_one_same_topic"]
+    assert "generic_operation_boundary_risk" in by_id["d2"]["audit_flags"]
+    assert "platform_boundary_risk" in by_id["d3"]["audit_flags"]
+    assert "low_confidence_same_topic" in by_id["d4"]["audit_flags"]
+    assert "high_similarity_new_topic" in by_id["d5"]["audit_flags"]
+    assert by_id["d6"]["audit_flags"] == ["low_information_media"]
+    assert decisions[0]["verdict"] == "same_topic"
