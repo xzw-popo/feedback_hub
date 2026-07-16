@@ -2,9 +2,21 @@
 from __future__ import annotations
 
 from itertools import combinations
-from typing import Any
+import json
+from pathlib import Path
+import re
+from typing import Any, Callable
 
 import numpy as np
+
+from feedback_hub.topic_discovery.model_routes import (
+    ModelRoute,
+    QuotaExhaustedError,
+    call_model_route,
+    invoke_model_route,
+    normalize_model_routes,
+    run_pauseable_model_jobs,
+)
 
 
 _RELATION_PRIORITY = {
@@ -12,6 +24,18 @@ _RELATION_PRIORITY = {
     "parent_subtopic": 1,
     "semantic_similarity": 2,
 }
+
+_REPORT_DECISIONS = {"main", "observe", "exclude", "manual_review"}
+_SIGNAL_TYPES = {
+    "new_bug",
+    "rising_or_repeated_bug",
+    "demand_opportunity",
+    "high_value_single",
+    "not_reportable",
+}
+_TREND_CLAIMS = {"none", "new_signal", "repeated", "persistent", "reappeared", "rising"}
+_FENCE_JSON_RE = re.compile(r"```json\s*(.+?)\s*```", re.DOTALL | re.IGNORECASE)
+_BRACE_RE = re.compile(r"\{[\s\S]*\}")
 
 
 def build_candidate_relation_plan(
@@ -60,6 +84,262 @@ def build_candidate_relation_plan(
             "buckets": len(buckets),
             "singletons": len(singleton_candidate_ids),
         },
+    }
+
+
+def build_insight_editor_prompt(bucket: dict[str, Any]) -> str:
+    """Build a strict topic-level report editing prompt."""
+    compact_items = [_compact_candidate(item) for item in bucket.get("items") or []]
+    return "\n".join([
+        "You edit daily product insights from atomic WeType feedback topics.",
+        "Return exactly one legal JSON object and cover every supplied candidate_id exactly once.",
+        "Atomic topics answer what users reported; report insights answer what deserves proactive product attention today.",
+        "Report grouping must not modify topic memory, stable topic IDs, members, or lifecycle events.",
+        "A lifecycle verdict of new_topic does not prove a product-level new issue.",
+        "Do not merge merely because candidates share a feature, platform, sentiment, or broad feedback type.",
+        "Merge candidates only when one report explanation can preserve their actionable product meaning without hiding different fixes or decisions.",
+        "Bug reports and requests remain separate unless they clearly express one capability gap and grouping does not hide their nature.",
+        "Use main only for evidence that genuinely deserves proactive attention. Use observe for useful but not main-report evidence.",
+        "Use manual_review when evidence or grouping remains ambiguous. Use exclude for low-value or non-reportable candidates.",
+        "A concrete single feedback may be high value, but strong wording alone does not prove importance or severity.",
+        "Use only a trend_claim allowed by every grouped candidate. Never claim rising when rising is not allowed.",
+        "Do not infer image or video contents, population impact, fix priority, root cause, or facts absent from the evidence.",
+        "Allowed report_decision values: main | observe | exclude | manual_review.",
+        "Allowed signal_type values: new_bug | rising_or_repeated_bug | demand_opportunity | high_value_single | not_reportable.",
+        "Keep headline under 28 Chinese characters, summary under 120 Chinese characters, and selection_reason under 100 Chinese characters.",
+        "Use only supplied candidate_id and issue_unit_id values.",
+        "Do not use literal ASCII double quotes inside free-text fields; use Chinese corner quotes when needed.",
+        "",
+        f"Editor bucket: {bucket.get('bucket_id')}",
+        "```json",
+        json.dumps(compact_items, ensure_ascii=False, sort_keys=True),
+        "```",
+        "",
+        "Return shape:",
+        json.dumps({
+            "insights": [{
+                "report_decision": "main | observe | exclude | manual_review",
+                "signal_type": "new_bug | rising_or_repeated_bug | demand_opportunity | high_value_single | not_reportable",
+                "headline": "concise factual title",
+                "summary": "what happened and why it matters",
+                "selection_reason": "why this belongs in this decision layer",
+                "trend_claim": "none | new_signal | repeated | persistent | reappeared | rising",
+                "source_candidate_ids": ["supplied candidate id"],
+                "representative_issue_unit_ids": ["supplied issue unit id"],
+                "confidence": 0.0,
+                "needs_human_review": False,
+            }]
+        }, ensure_ascii=False),
+    ])
+
+
+def parse_insight_editor_reply(
+    reply: str,
+    *,
+    allowed_candidate_ids: set[str],
+    allowed_trend_claims: dict[str, set[str]],
+    allowed_issue_unit_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    raw = _extract_json(reply)
+    if raw is None:
+        raise ValueError("no JSON found in insight editor reply")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid insight editor JSON: {exc}") from exc
+    values = payload.get("insights") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        raise ValueError("insights must be a list")
+
+    rows: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("insight must be an object")
+        decision = str(value.get("report_decision") or "")
+        signal_type = str(value.get("signal_type") or "")
+        trend_claim = str(value.get("trend_claim") or "")
+        if decision not in _REPORT_DECISIONS:
+            raise ValueError(f"unsupported report decision: {decision}")
+        if signal_type not in _SIGNAL_TYPES:
+            raise ValueError(f"unsupported signal type: {signal_type}")
+        if trend_claim not in _TREND_CLAIMS:
+            raise ValueError(f"unsupported trend claim: {trend_claim}")
+        headline = str(value.get("headline") or "").strip()
+        if not headline:
+            raise ValueError("insight headline is required")
+        source_candidate_ids = _dedupe_strings(value.get("source_candidate_ids") or [])
+        if not source_candidate_ids or any(
+            candidate_id not in allowed_candidate_ids for candidate_id in source_candidate_ids
+        ):
+            raise ValueError("insight contains unknown or empty candidate IDs")
+        issue_unit_ids = _dedupe_strings(value.get("representative_issue_unit_ids") or [])
+        if allowed_issue_unit_ids is not None and any(
+            issue_unit_id not in allowed_issue_unit_ids for issue_unit_id in issue_unit_ids
+        ):
+            raise ValueError("insight contains unknown issue unit IDs")
+        legal_claims = set(allowed_trend_claims[source_candidate_ids[0]])
+        for candidate_id in source_candidate_ids[1:]:
+            legal_claims.intersection_update(allowed_trend_claims[candidate_id])
+        if trend_claim not in legal_claims:
+            raise ValueError("unsupported trend claim")
+        rows.append({
+            "report_decision": decision,
+            "signal_type": signal_type,
+            "headline": headline[:120],
+            "summary": str(value.get("summary") or "").strip()[:500],
+            "selection_reason": str(value.get("selection_reason") or "").strip()[:400],
+            "trend_claim": trend_claim,
+            "source_candidate_ids": source_candidate_ids,
+            "representative_issue_unit_ids": issue_unit_ids,
+            "confidence": _clamp(value.get("confidence")),
+            "needs_human_review": bool(value.get("needs_human_review")) or decision == "manual_review",
+        })
+
+    covered = [candidate_id for row in rows for candidate_id in row["source_candidate_ids"]]
+    if len(covered) != len(set(covered)) or set(covered) != allowed_candidate_ids:
+        raise ValueError("insight candidates must provide exact coverage")
+    return rows
+
+
+def run_insight_editor_multi_channel(
+    buckets: list[dict[str, Any]],
+    *,
+    routes: list[Any],
+    output_path: str | Path,
+    concurrency_per_route: int = 4,
+    max_retries: int = 4,
+    request_timeout: int = 300,
+    resume: bool = False,
+    call_fn: Callable[..., Any] = call_model_route,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run strict editor buckets through the shared pauseable route scheduler."""
+    if request_timeout < 1:
+        raise ValueError("request_timeout must be positive")
+    normalized_routes = normalize_model_routes(routes)
+    jobs = [
+        (index, str(bucket.get("bucket_id") or ""), bucket)
+        for index, bucket in enumerate(buckets)
+    ]
+
+    def worker(index: int, key: str, bucket: dict[str, Any], route: ModelRoute):
+        del index
+        raw_replies: list[str] = []
+        model_attempts = 0
+        parse_attempts = 0
+        retry_chain: list[str] = []
+        elapsed_ms = 0
+
+        def call_and_parse(target: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+            nonlocal model_attempts, parse_attempts, elapsed_ms
+            items = list(target.get("items") or [])
+            allowed_candidates = {str(item.get("candidate_id") or "") for item in items}
+            allowed_trends = {
+                str(item.get("candidate_id") or ""): set(item.get("allowed_trend_claims") or ["none"])
+                for item in items
+            }
+            allowed_issues = {
+                str(unit.get("issue_unit_id") or "")
+                for item in items
+                for unit in item.get("representative_issue_units") or []
+                if unit.get("issue_unit_id")
+            }
+            last_error = None
+            for _attempt in range(2):
+                reply = invoke_model_route(
+                    build_insight_editor_prompt(target),
+                    route=route,
+                    call_fn=call_fn,
+                    max_retries=max_retries,
+                    timeout=request_timeout,
+                )
+                raw_replies.append(reply.content)
+                model_attempts += reply.attempts
+                parse_attempts += 1
+                elapsed_ms += reply.elapsed_ms
+                retry_chain.extend(reply.retry_chain)
+                try:
+                    decisions = parse_insight_editor_reply(
+                        reply.content,
+                        allowed_candidate_ids=allowed_candidates,
+                        allowed_trend_claims=allowed_trends,
+                        allowed_issue_unit_ids=allowed_issues,
+                    )
+                    _validate_main_links(decisions, items)
+                    return decisions, None
+                except ValueError as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+            return [], last_error
+
+        split_after_parse_failure = False
+        try:
+            decisions, parse_error = call_and_parse(bucket)
+            if parse_error and len(bucket.get("items") or []) > 3:
+                split_after_parse_failure = True
+                decisions = []
+                split_errors = []
+                items = list(bucket.get("items") or [])
+                for split_index, start in enumerate(range(0, len(items), 3), 1):
+                    split_bucket = {
+                        "bucket_id": f"{key}:split:{split_index}",
+                        "items": items[start:start + 3],
+                    }
+                    split_decisions, split_error = call_and_parse(split_bucket)
+                    decisions.extend(split_decisions)
+                    if split_error:
+                        split_errors.append(split_error)
+                parse_error = "; ".join(split_errors) or None
+            call_error = None
+        except QuotaExhaustedError:
+            raise
+        except Exception as exc:
+            decisions = []
+            call_error = f"{type(exc).__name__}: {exc}"
+            parse_error = None
+
+        for decision_index, decision in enumerate(decisions, 1):
+            decision["insight_id"] = f"insight:{key}:{decision_index:02d}"
+        row = {
+            **bucket,
+            "insights": decisions,
+            "editor_raw_reply": raw_replies[-1] if raw_replies else "",
+            "editor_error": call_error,
+            "editor_parse_error": parse_error,
+            "parse_status": "ok" if call_error is None and parse_error is None else "failed",
+            "editor_parse_attempts": parse_attempts,
+            "editor_split_after_parse_failure": split_after_parse_failure,
+            "route_source": route.name,
+            "endpoint_class": route.endpoint_class,
+            "model": route.model or "agent_default",
+            "prompt_version": "daily_insight_editor_v1",
+            "attempts": model_attempts,
+            "retry_chain": retry_chain,
+            "elapsed_ms": elapsed_ms,
+        }
+        return row, call_error or parse_error
+
+    rows, scheduler_stats = run_pauseable_model_jobs(
+        jobs,
+        worker,
+        routes=normalized_routes,
+        output_path=output_path,
+        concurrency_per_route=concurrency_per_route,
+        resume=resume,
+    )
+    return rows, {
+        "batches": len(rows),
+        "decisions": sum(len(row.get("insights") or []) for row in rows),
+        "call_failed": sum(bool(row.get("editor_error")) for row in rows),
+        "parse_failed": sum(bool(row.get("editor_parse_error")) for row in rows),
+        "route_counts": dict(scheduler_stats["route_counts"]),
+        "processed": scheduler_stats["processed"],
+        "resumed": scheduler_stats["resumed"],
+        "retryable_failed": scheduler_stats["failed"],
+        "run_status": scheduler_stats["run_status"],
+        "remaining": scheduler_stats["remaining"],
+        **({
+            "quota_route": scheduler_stats["quota_route"],
+            "quota_status_code": scheduler_stats["quota_status_code"],
+        } if scheduler_stats["run_status"] == "paused_quota_exhausted" else {}),
     }
 
 
@@ -240,3 +520,78 @@ def _bounded_components(
     ]
     singletons = [ids[indexes[0]] for indexes in ordered if len(indexes) == 1]
     return buckets, singletons
+
+
+def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "daily_topic_id": candidate.get("daily_topic_id"),
+        "stable_topic_id": candidate.get("stable_topic_id"),
+        "parent_topic_ids": candidate.get("parent_topic_ids") or [],
+        "title": candidate.get("title"),
+        "description": candidate.get("description"),
+        "today_conversation_count": candidate.get("today_conversation_count"),
+        "baseline_dates": candidate.get("baseline_dates") or [],
+        "baseline_daily_counts": candidate.get("baseline_daily_counts") or [],
+        "historical_active_dates": candidate.get("historical_active_dates") or [],
+        "lifecycle_verdict": candidate.get("lifecycle_verdict"),
+        "feedback_type_counts": candidate.get("feedback_type_counts") or {},
+        "feature_candidate_counts": candidate.get("feature_candidate_counts") or {},
+        "platform_counts": candidate.get("platform_counts") or {},
+        "appversion_counts": candidate.get("appversion_counts") or {},
+        "recall_reasons": candidate.get("recall_reasons") or [],
+        "candidate_band": candidate.get("candidate_band"),
+        "allowed_trend_claims": candidate.get("allowed_trend_claims") or ["none"],
+        "feature_policy": candidate.get("feature_policy") or {},
+        "has_media_evidence": bool(candidate.get("has_media_evidence")),
+        "needs_review": bool(candidate.get("needs_review")),
+        "source_links": candidate.get("source_links") or [],
+        "representative_issue_units": candidate.get("representative_issue_units") or [],
+    }
+
+
+def _validate_main_links(
+    insights: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> None:
+    candidate_by_id = {
+        str(candidate.get("candidate_id") or ""): candidate
+        for candidate in candidates
+    }
+    for insight in insights:
+        if insight["report_decision"] != "main":
+            continue
+        links = {
+            str(link).strip()
+            for candidate_id in insight["source_candidate_ids"]
+            for link in candidate_by_id[candidate_id].get("source_links") or []
+            if str(link).strip()
+        }
+        if not links:
+            raise ValueError("main insight requires a source link")
+
+
+def _extract_json(reply: str) -> str | None:
+    fenced = _FENCE_JSON_RE.search(reply)
+    if fenced:
+        return fenced.group(1).strip()
+    braced = _BRACE_RE.search(reply)
+    return braced.group(0).strip() if braced else None
+
+
+def _dedupe_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _clamp(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
