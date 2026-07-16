@@ -197,9 +197,12 @@ def _render_insight(index: int, insight: dict[str, Any], *, compact: bool = Fals
     lines = [f"### {index}. {insight.get('headline')}", ""]
     lines.append(f"- 类型：{label}")
     lines.append(f"- 判断：{insight.get('global_report_summary') or insight.get('summary')}")
-    lines.append(
-        f"- 依据：{insight.get('global_selection_reason') or insight.get('selection_reason')}"
-    )
+    if compact:
+        lines.append("- 状态：未进入今日重点，保留观察")
+    else:
+        lines.append(
+            f"- 依据：{insight.get('global_selection_reason') or insight.get('selection_reason')}"
+        )
     lines.append(
         f"- 频次：当日 {int(insight.get('today_conversation_count') or 0)} 个去重会话；"
         f"基线逐日 {_json_text(insight.get('baseline_daily_counts') or [])}"

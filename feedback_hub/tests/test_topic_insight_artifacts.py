@@ -173,6 +173,27 @@ def test_report_contains_global_reason_sources_and_media_appendix() -> None:
     assert "https://feedback/media" in text
 
 
+def test_report_observation_hides_local_priority_and_internal_reasoning() -> None:
+    selected = artifacts.partition_selected_insights(
+        [_insight("i1", "observe", candidate_id="c1")],
+        {"c1": _candidate("c1")},
+        _selection(),
+        shortlist=_shortlist("i1"),
+    )
+    selected["observe"][0]["selection_reason"] = "primary候选，需优先修复"
+
+    text = artifacts.render_daily_report(
+        "2026-07-14",
+        selected,
+        [],
+        {"baseline_start": "2026-07-07", "baseline_end": "2026-07-13", "route_counts": {}},
+    )
+
+    assert "状态：未进入今日重点，保留观察" in text
+    assert "primary候选" not in text
+    assert "需优先修复" not in text
+
+
 def test_review_workbook_has_selection_audit_links_and_human_columns(tmp_path) -> None:
     candidate = _candidate("c1")
     selected = artifacts.partition_selected_insights(
