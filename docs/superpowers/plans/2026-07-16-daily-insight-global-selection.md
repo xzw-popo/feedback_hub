@@ -37,7 +37,7 @@
 - `parse_insight_editor_reply(reply: str, *, allowed_candidate_ids: set[str], allowed_trend_claims: dict[str, set[str]], allowed_issue_unit_ids: set[str] | None = None) -> list[dict[str, Any]]` accepts `nominate` and rejects legacy `main` in new replies.
 - Local link validation applies to `nominate` because only linked insights can advance.
 
-- [ ] **Step 1: Write failing prompt, parser, and link-validation tests**
+- [x] **Step 1: Write failing prompt, parser, and link-validation tests**
 
 ```python
 def _reply(decision: str, *, candidate_id: str, trend_claim: str) -> str:
@@ -89,13 +89,13 @@ def test_nominate_requires_a_source_link() -> None:
         )
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail**
+- [x] **Step 2: Run the focused tests and verify they fail**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_insight_editor.py -q`
 
 Expected: FAIL because the prompt and parser still use `main`.
 
-- [ ] **Step 3: Update the local schema and prompt semantics**
+- [x] **Step 3: Update the local schema and prompt semantics**
 
 ```python
 _REPORT_DECISIONS = {"nominate", "observe", "exclude", "manual_review"}
@@ -121,13 +121,13 @@ def _validate_nominate_links(decisions, items):
 
 Change prompt copy to state that `nominate` means “advance to global comparison” and not “final report inclusion”. Rename `_validate_main_links` and update its caller. Set `prompt_version` to `daily_insight_editor_v2_nominate`.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_insight_editor.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the local-decision migration**
+- [x] **Step 5: Commit the local-decision migration**
 
 ```bash
 git add feedback_hub/topic_discovery/insight_editor.py feedback_hub/tests/test_topic_insight_editor.py
@@ -149,7 +149,7 @@ git commit -m "refactor: make daily insight main decisions nominations"
 - `parse_global_selection_reply(reply: str, shortlist: list[dict[str, Any]]) -> dict[str, Any]` validates zero to five ranked supplied IDs.
 - `run_global_selection_multi_channel(shortlist, *, routes, output_path, resume=False, call_fn=call_model_route) -> tuple[dict, dict]` persists one resumable global job.
 
-- [ ] **Step 1: Write failing shortlist tests for lane limits and local-decision independence**
+- [x] **Step 1: Write failing shortlist tests for lane limits and local-decision independence**
 
 ```python
 def _insight(
@@ -274,13 +274,13 @@ def test_shortlist_excludes_review_linkless_and_excluded_rows() -> None:
     assert build_global_shortlist(insights, candidates) == []
 ```
 
-- [ ] **Step 2: Run shortlist tests and verify import failure**
+- [x] **Step 2: Run shortlist tests and verify import failure**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_global_selection.py -q`
 
 Expected: FAIL because `global_selection.py` does not exist.
 
-- [ ] **Step 3: Implement evidence enrichment and four independent lane sort keys**
+- [x] **Step 3: Implement evidence enrichment and four independent lane sort keys**
 
 ```python
 DEFAULT_LANE_LIMITS = {
@@ -324,7 +324,7 @@ Use lexicographic keys, not a weighted score:
 - demand: current conversations, active baseline days, baseline total, confidence, then tie-break;
 - high-value single: evidence-span count, known context, source-link count, confidence, then tie-break.
 
-- [ ] **Step 4: Write failing global prompt and parser tests**
+- [x] **Step 4: Write failing global prompt and parser tests**
 
 ```python
 def _shortlist_row(insight_id: str, *, source_candidate_ids: list[str] | None = None) -> dict:
@@ -407,7 +407,7 @@ def test_global_parser_rejects_overlapping_source_candidates() -> None:
         parse_global_selection_reply(_selection_reply(["i1", "i2"]), shortlist)
 ```
 
-- [ ] **Step 5: Implement strict prompt, parser, and one-job resumable runner**
+- [x] **Step 5: Implement strict prompt, parser, and one-job resumable runner**
 
 ```python
 def parse_global_selection_reply(reply, shortlist):
@@ -433,13 +433,13 @@ def parse_global_selection_reply(reply, shortlist):
 
 Use `run_pauseable_model_jobs` with one stable job key, two parse attempts, route provenance, `prompt_version="daily_insight_global_selection_v1"`, and explicit `call_error`/`parse_error`. Never synthesize an empty successful selection from a failed call.
 
-- [ ] **Step 6: Run the new module tests**
+- [x] **Step 6: Run the new module tests**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_global_selection.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit shortlist and selector logic**
+- [x] **Step 7: Commit shortlist and selector logic**
 
 ```bash
 git add feedback_hub/topic_discovery/global_selection.py feedback_hub/tests/test_topic_global_selection.py
@@ -455,12 +455,12 @@ git commit -m "feat: globally select daily report insights"
 - Modify: `feedback_hub/tests/test_topic_insight_artifacts.py`
 
 **Interfaces:**
-- Replace `select_main_insights(insights, candidates, *, max_items=5)` with `partition_selected_insights(insights, candidates, global_selection, *, shortlist_ids) -> dict[str, list[dict[str, Any]]]`.
+- Replace `select_main_insights(insights, candidates, *, max_items=5)` with `partition_selected_insights(insights, candidates, global_selection, *, shortlist) -> dict[str, list[dict[str, Any]]]`.
 - `main` order comes only from global `rank`.
 - Nonselected `nominate` and `observe` rows remain in `observe`; manual and excluded rows remain separate.
 - Workbook rows include local decision, shortlist membership, global rank, global reason, and editorial note.
 
-- [ ] **Step 1: Replace truncation tests with global-selection tests**
+- [x] **Step 1: Replace truncation tests with global-selection tests**
 
 ```python
 def test_partition_uses_only_ranked_global_selection_for_main() -> None:
@@ -482,7 +482,7 @@ def test_partition_uses_only_ranked_global_selection_for_main() -> None:
         insights,
         {f"c{i}": _candidate(f"c{i}") for i in range(1, 4)},
         selection,
-        shortlist_ids={"i1", "i2"},
+        shortlist=_shortlist("i1", "i2"),
     )
     assert [row["insight_id"] for row in selected["main"]] == ["i2"]
     assert {row["insight_id"] for row in selected["observe"]} == {"i1", "i3"}
@@ -494,24 +494,25 @@ def test_partition_does_not_fill_unused_slots() -> None:
         [_insight("i1", "nominate", candidate_id="c1")],
         {"c1": _candidate("c1")},
         {"selected_insights": [], "selection_summary": "今日不推送"},
-        shortlist_ids={"i1"},
+        shortlist=_shortlist("i1"),
     )
     assert selected["main"] == []
     assert selected["observe"][0]["artifact_reason"] == "not_selected_globally"
 ```
 
-- [ ] **Step 2: Run artifact tests and verify failure**
+- [x] **Step 2: Run artifact tests and verify failure**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_insight_artifacts.py -q`
 
 Expected: FAIL because `partition_selected_insights` does not exist.
 
-- [ ] **Step 3: Implement selection-driven partitioning and remove `main_limit_overflow`**
+- [x] **Step 3: Implement selection-driven partitioning and remove `main_limit_overflow`**
 
 ```python
-def partition_selected_insights(insights, candidates, global_selection, *, shortlist_ids):
+def partition_selected_insights(insights, candidates, global_selection, *, shortlist):
     normalized = enrich_insights_with_evidence(insights, candidates)
     by_id = {row["insight_id"]: row for row in normalized}
+    shortlist_by_id = {row["insight_id"]: row for row in shortlist}
     selected_rows = global_selection.get("selected_insights") or []
     main = []
     selected_ids = set()
@@ -533,7 +534,7 @@ def partition_selected_insights(insights, candidates, global_selection, *, short
         copy = dict(row)
         copy["report_decision"] = "observe"
         copy["artifact_reason"] = (
-            "not_selected_globally" if row["insight_id"] in shortlist_ids
+            "not_selected_globally" if row["insight_id"] in shortlist_by_id
             else "not_shortlisted"
         )
         observe.append(copy)
@@ -555,7 +556,7 @@ def partition_selected_insights(insights, candidates, global_selection, *, short
 
 Delete the old type/confidence cap path. Keep deterministic evidence attachment in one implementation by importing `enrich_insights_with_evidence` from `global_selection.py`.
 
-- [ ] **Step 4: Update Markdown and XLSX assertions**
+- [x] **Step 4: Update Markdown and XLSX assertions**
 
 ```python
 def test_report_uses_global_reason_and_workbook_exposes_selection_audit(tmp_path) -> None:
@@ -591,13 +592,13 @@ def test_report_uses_global_reason_and_workbook_exposes_selection_audit(tmp_path
 
 The report “依据” line uses `global_selection_reason` for main items and local `selection_reason` for observations. Keep the workbook at four sheets and preserve all existing human-review columns and hyperlinks.
 
-- [ ] **Step 5: Run artifact tests**
+- [x] **Step 5: Run artifact tests**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_insight_artifacts.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit global-selection artifact rendering**
+- [x] **Step 6: Commit global-selection artifact rendering**
 
 ```bash
 git add feedback_hub/topic_discovery/insight_artifacts.py feedback_hub/tests/test_topic_insight_artifacts.py
@@ -619,7 +620,7 @@ git commit -m "feat: render globally selected daily insights"
 - `run_summary.json` adds shortlist, selection, local/global route, and legacy migration counts.
 - Report and workbook are generated only after successful global selection.
 
-- [ ] **Step 1: Write failing end-to-end tests for success, blocked selection, and legacy resume**
+- [x] **Step 1: Write failing end-to-end tests for success, blocked selection, and legacy resume**
 
 ```python
 def _fake_two_stage_call(prompt, **_kwargs):
@@ -668,13 +669,13 @@ def test_legacy_main_rows_migrate_to_nominate_without_local_recall(tmp_path) -> 
     assert count == 1
 ```
 
-- [ ] **Step 2: Run runner tests and verify failure**
+- [x] **Step 2: Run runner tests and verify failure**
 
 Run: `python3 -m pytest feedback_hub/tests/test_daily_insight_run.py -q`
 
 Expected: FAIL because no global stage or migration exists.
 
-- [ ] **Step 3: Integrate migration, shortlist, global call, and blocked status**
+- [x] **Step 3: Integrate migration, shortlist, global call, and blocked status**
 
 ```python
 model_rows, legacy_migrations = _normalize_legacy_local_decisions(model_rows)
@@ -716,13 +717,13 @@ selected = partition_selected_insights(
     insights,
     candidate_by_id,
     selection,
-    shortlist_ids={row["insight_id"] for row in shortlist},
+    shortlist=shortlist,
 )
 ```
 
 When shortlist is empty, write an explicit successful empty `global_selection.json` without calling a model. On non-resume runs, remove stale report, workbook, shortlist, global selection, and global model-row files before work begins. Merge local and global route counts into a display total while preserving separate `local_route_counts` and `global_route_counts`.
 
-- [ ] **Step 4: Update CLI summary fields without adding credentials**
+- [x] **Step 4: Update CLI summary fields without adding credentials**
 
 ```python
 print(json.dumps({
@@ -738,13 +739,13 @@ print(json.dumps({
 }, ensure_ascii=False))
 ```
 
-- [ ] **Step 5: Run runner and CLI tests**
+- [x] **Step 5: Run runner and CLI tests**
 
 Run: `python3 -m pytest feedback_hub/tests/test_daily_insight_run.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the complete focused regression suite**
+- [x] **Step 6: Run the complete focused regression suite**
 
 Run:
 
@@ -761,7 +762,7 @@ python3 -m pytest \
 
 Expected: PASS with no failed tests.
 
-- [ ] **Step 7: Commit runner integration**
+- [x] **Step 7: Commit runner integration**
 
 ```bash
 git add \
@@ -776,7 +777,7 @@ git commit -m "feat: finalize daily insights with global selection"
 ### Task 5: Resume 2026-07-14, review the global shortlist, and verify artifacts
 
 **Files:**
-- Reuse: `outputs/topic_shadow_run_20260708_20260714/`
+- Reuse: `feedback_hub/data/topic_shadow_run_20260707_20260714/v1/run/`
 - Reuse: `feedback_hub/data/label_v2_samples/feature_knowledge_template_20260701.xlsx`
 - Update generated output: `outputs/daily_insight_signal_20260714/`
 
@@ -784,11 +785,11 @@ git commit -m "feat: finalize daily insights with global selection"
 - Existing 171 local model rows are resumed and migrated; only the global selection stage should make a new model request.
 - Final artifacts include `global_shortlist.jsonl`, `global_selection.json`, revised Markdown, XLSX, and summary.
 
-- [ ] **Step 1: Resume the real run using environment-only credentials**
+- [x] **Step 1: Resume the real run using environment-only credentials**
 
 ```bash
 python3 scripts/run_daily_insight_signal.py \
-  --run-root outputs/topic_shadow_run_20260708_20260714 \
+  --run-root feedback_hub/data/topic_shadow_run_20260707_20260714/v1/run \
   --report-date 2026-07-14 \
   --catalog feedback_hub/data/label_v2_samples/feature_knowledge_template_20260701.xlsx \
   --output-dir outputs/daily_insight_signal_20260714 \
@@ -801,7 +802,7 @@ python3 scripts/run_daily_insight_signal.py \
 
 Expected: local scheduler reports all 171 rows resumed; global scheduler processes one request unless the shortlist is empty; `run_status` is `completed` or an explicit quota pause.
 
-- [ ] **Step 2: Verify coverage, limits, ranks, links, and legacy migration**
+- [x] **Step 2: Verify coverage, limits, ranks, links, and legacy migration**
 
 ```bash
 python3 - <<'PY'
@@ -836,7 +837,7 @@ PY
 
 Expected: 248 candidates remain exactly covered, shortlist is at most 30, selection is zero to five, and no persisted local decision remains `main`.
 
-- [ ] **Step 3: Verify workbook structure and clickable feedback links**
+- [x] **Step 3: Verify workbook structure and clickable feedback links**
 
 ```bash
 python3 - <<'PY'
@@ -862,7 +863,7 @@ PY
 
 Expected: four review sheets and only valid HTTP(S) hyperlinks.
 
-- [ ] **Step 4: Review the final five-or-fewer items against the shortlist**
+- [x] **Step 4: Review the final five-or-fewer items against the shortlist**
 
 Record a concise review in `outputs/daily_insight_signal_20260714/codex_global_selection_review_20260716.md` covering:
 
@@ -872,7 +873,7 @@ Record a concise review in `outputs/daily_insight_signal_20260714/codex_global_s
 - whether any two selected items overlap in product meaning;
 - whether the final mix reflects actual relative value rather than a forced type quota.
 
-- [ ] **Step 5: Run secret and syntax verification**
+- [x] **Step 5: Run secret and syntax verification**
 
 ```bash
 python3 -m py_compile \
@@ -889,6 +890,6 @@ rg -n --hidden --glob '!*.xlsx' --glob '!*.npz' \
 
 Expected: compilation succeeds and the secret scan returns no matches.
 
-- [ ] **Step 6: Update task status and report the reviewed result**
+- [x] **Step 6: Update task status and report the reviewed result**
 
 Mark the global-selection implementation and 2026-07-14 result review complete only after all tests and artifact checks pass. Report the final selected count, shortlist count, route used for the global call, and any remaining manual-review caveats without exposing credentials.
