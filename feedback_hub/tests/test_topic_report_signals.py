@@ -112,7 +112,9 @@ def test_build_topic_signal_features_counts_unique_conversations_and_history() -
 
     assert len(rows) == 1
     assert rows[0]["today_conversation_count"] == 2
+    assert rows[0]["today_conversation_ids"] == ["c2", "c3"]
     assert rows[0]["baseline_daily_counts"] == [0, 0, 0, 0, 0, 0, 2]
+    assert rows[0]["baseline_conversation_ids_by_date"]["2026-07-13"] == ["c1", "c2"]
     assert rows[0]["historical_active_dates"] == ["2026-07-13"]
     assert rows[0]["stable_topic_id"] == "topic:000001"
     assert rows[0]["lifecycle_verdict"] == "same_topic"

@@ -67,16 +67,16 @@ def build_topic_signal_features(
         stable_topic_id = stable_id_by_daily_id.get(daily_topic_id)
         stable_topic = stable_by_id.get(stable_topic_id or "", {})
         source_daily_ids = _dedupe(stable_topic.get("source_daily_topic_ids") or [daily_topic_id])
-        daily_counts: dict[str, int] = {}
+        daily_conversation_ids: dict[str, set[str]] = {}
         historical_active_dates: list[str] = []
         for source_daily_id in source_daily_ids:
             source = daily_topic_rows.get(source_daily_id)
             if source is None:
                 continue
             source_date, source_topic = source
-            count = len(set(_strings(source_topic.get("conversation_ids") or [])))
-            daily_counts[source_date] = daily_counts.get(source_date, 0) + count
-            if source_date < report_date and count:
+            conversation_ids = set(_strings(source_topic.get("conversation_ids") or []))
+            daily_conversation_ids.setdefault(source_date, set()).update(conversation_ids)
+            if source_date < report_date and conversation_ids:
                 historical_active_dates.append(source_date)
 
         decision = decision_by_id.get(daily_topic_id, {})
@@ -103,9 +103,14 @@ def build_topic_signal_features(
             "title": str(topic.get("title") or "").strip(),
             "description": str(topic.get("description") or "").strip(),
             "today_conversation_count": len(set(_strings(topic.get("conversation_ids") or []))),
+            "today_conversation_ids": sorted(set(_strings(topic.get("conversation_ids") or []))),
             "today_issue_unit_count": len(member_ids),
             "baseline_dates": baseline_dates,
-            "baseline_daily_counts": [daily_counts.get(value, 0) for value in baseline_dates],
+            "baseline_daily_counts": [len(daily_conversation_ids.get(value, set())) for value in baseline_dates],
+            "baseline_conversation_ids_by_date": {
+                value: sorted(daily_conversation_ids.get(value, set()))
+                for value in baseline_dates
+            },
             "historical_active_dates": sorted(set(historical_active_dates)),
             "lifecycle_verdict": str(decision.get("verdict") or ""),
             "lifecycle_historical_topic_id": decision.get("historical_topic_id"),
