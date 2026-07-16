@@ -129,6 +129,8 @@ def build_global_shortlist(
         raise ValueError("shortlist lane limits exceed max_items")
 
     enriched = enrich_insights_with_evidence(insights, candidates)
+    for row in enriched:
+        row.update(_report_priority(row))
     eligible = [
         row for row in enriched
         if row.get("report_decision") not in {"exclude", "manual_review"}
@@ -166,10 +168,13 @@ def build_global_selection_prompt(shortlist: list[dict[str, Any]]) -> str:
         "There is no fixed type quota. Do not select an item merely to create category diversity or fill five slots.",
         "Compare product impact, actionability, evidence quality, today's information gain, user task, and duplication with other items.",
         "Frequency is evidence but is not a complete importance score. Local nominate is not final inclusion, and a strong observe may be selected.",
+        "Do not cite model confidence in selection_reason or report_summary; it is internal routing evidence, not a product conclusion.",
+        "Treat low report_priority as a product-policy warning. Skin, visual-theme, and account-login preferences should not be selected merely for frequency; select them only for clear breakage or unusual new evidence.",
         "You must not change headline, signal_type, or trend_claim, and you must not add facts, root causes, severity, or population impact.",
         "Do not select needs_human_review items, linkless items, or two insights that overlap on source_candidate_ids.",
         "Use only supplied insight_id values. Return exactly one JSON object with no Markdown or extra text.",
         "selection_reason must explain why the item wins relative to the other supplied candidates, not only why it is valid in isolation.",
+        "report_summary must restate only the supplied issue facts and must omit frequency numbers because deterministic counts are rendered separately.",
         "Keep selection_reason under 120 Chinese characters and editorial_note under 80 Chinese characters.",
         "",
         "```json",
@@ -183,6 +188,7 @@ def build_global_selection_prompt(shortlist: list[dict[str, Any]]) -> str:
                 "rank": 1,
                 "selection_reason": "why this is more important today than other shortlist items",
                 "editorial_note": "optional evidence boundary or wording note",
+                "report_summary": "fact-only issue summary without frequency numbers",
             }],
             "selection_summary": "overall tradeoff for today's selection",
         }, ensure_ascii=False),
@@ -223,11 +229,17 @@ def parse_global_selection_reply(
         reason = str(value.get("selection_reason") or "").strip()
         if not reason:
             raise ValueError("global selection reason is required")
+        if "置信度" in reason or "confidence" in reason.lower():
+            raise ValueError("global selection reason cannot cite model confidence")
+        report_summary = str(value.get("report_summary") or "").strip()
+        if not report_summary:
+            raise ValueError("global report summary is required")
         normalized.append({
             "insight_id": insight_id,
             "rank": rank,
             "selection_reason": reason[:500],
             "editorial_note": str(value.get("editorial_note") or "").strip()[:300],
+            "report_summary": report_summary[:500],
         })
     normalized.sort(key=lambda row: row["rank"])
     if [row["rank"] for row in normalized] != list(range(1, len(normalized) + 1)):
@@ -426,6 +438,28 @@ def _compact_shortlist_row(row: dict[str, Any]) -> dict[str, Any]:
         "shortlist_lanes": row.get("shortlist_lanes") or [],
         "shortlist_lane_rank": row.get("shortlist_lane_rank"),
         "shortlist_rank_fields": row.get("shortlist_rank_fields") or {},
+        "report_priority": row.get("report_priority") or "normal",
+        "report_priority_reasons": row.get("report_priority_reasons") or [],
+    }
+
+
+def _report_priority(row: dict[str, Any]) -> dict[str, Any]:
+    text = " ".join(_dedupe_strings([
+        row.get("headline"),
+        row.get("summary"),
+        *(row.get("source_topic_titles") or []),
+        *(unit.get("summary") for unit in row.get("representative_issue_units") or []),
+    ])).lower()
+    reasons = []
+    if any(term in text for term in (
+        "皮肤", "皮膚", "皮肤商城", "主题商城", "外观选择", "外观定制", "个性主题",
+    )):
+        reasons.append("other_low_priority:skin_visual_customization")
+    if any(term in text for term in ("账号登录", "帳號登錄", "登录账号", "登陆账号")):
+        reasons.append("other_low_priority:account_login")
+    return {
+        "report_priority": "low" if reasons else "normal",
+        "report_priority_reasons": reasons,
     }
 
 

@@ -177,6 +177,7 @@ def _fake_two_stage_call(prompt, **kwargs):
             "rank": 1,
             "selection_reason": "相对比较后证据最明确",
             "editorial_note": "保持证据边界",
+            "report_summary": "用户反馈语音输入后没有文字上屏",
         }],
         "selection_summary": "本日选择一条",
     }, ensure_ascii=False)

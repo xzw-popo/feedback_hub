@@ -67,6 +67,7 @@ def _selection(*insight_ids: str) -> dict:
             "rank": index,
             "selection_reason": f"全局比较后选择{insight_id}",
             "editorial_note": "保持谨慎表达",
+            "report_summary": f"全局事实摘要{insight_id}",
         } for index, insight_id in enumerate(insight_ids, 1)],
         "selection_summary": "完成全局比较",
     }
@@ -100,6 +101,7 @@ def test_partition_uses_only_ranked_global_selection_for_main() -> None:
     assert [row["insight_id"] for row in selected["observe"]] == ["i3"]
     assert selected["main"][0]["local_report_decision"] == "observe"
     assert selected["main"][0]["global_selection_reason"] == "全局比较后选择i2"
+    assert selected["main"][0]["global_report_summary"] == "全局事实摘要i2"
     assert selected["main"][0]["shortlist_lanes"] == ["new_bug"]
 
 
@@ -165,6 +167,7 @@ def test_report_contains_global_reason_sources_and_media_appendix() -> None:
     )
 
     assert "全局比较后选择i1" in text
+    assert "判断：全局事实摘要i1" in text
     assert "[查看原反馈](https://feedback/main)" in text
     assert "媒体附录" in text
     assert "https://feedback/media" in text
@@ -200,6 +203,7 @@ def test_review_workbook_has_selection_audit_links_and_human_columns(tmp_path) -
         "local_report_decision",
         "global_rank",
         "global_selection_reason",
+        "global_report_summary",
         "editorial_note",
         "shortlist_lanes",
         "human_report_decision",

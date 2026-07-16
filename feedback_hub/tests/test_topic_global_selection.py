@@ -125,6 +125,7 @@ def _selection_reply(ids: list[str], *, ranks: list[int] | None = None) -> str:
             "rank": ranks[index] if ranks is not None else index + 1,
             "selection_reason": "相对证据更强",
             "editorial_note": "保持谨慎表达",
+            "report_summary": "用户反馈明确问题，需要产品关注",
         })
     return json.dumps({
         "selected_insights": selected,
@@ -180,6 +181,16 @@ def test_shortlist_excludes_review_linkless_and_excluded_rows() -> None:
     assert api.build_global_shortlist(insights, candidates) == []
 
 
+def test_shortlist_marks_skin_preferences_as_low_product_priority() -> None:
+    insight = _insight("skin", "nominate", "demand_opportunity", today=8, baseline=[10] * 7)
+    insight["headline"] = "用户持续请求增加键盘皮肤与外观选择"
+
+    row = _api().build_global_shortlist([insight], _candidates_for([insight]))[0]
+
+    assert row["report_priority"] == "low"
+    assert row["report_priority_reasons"] == ["other_low_priority:skin_visual_customization"]
+
+
 def test_global_prompt_requests_relative_selection_without_new_facts() -> None:
     prompt = _api().build_global_selection_prompt([_shortlist_row("i1")])
 
@@ -188,6 +199,9 @@ def test_global_prompt_requests_relative_selection_without_new_facts() -> None:
     assert "compare every shortlist item" in prompt
     assert "must not change headline, signal_type, or trend_claim" in prompt
     assert "fixed type quota" in prompt
+    assert "Do not cite model confidence" in prompt
+    assert "low report_priority" in prompt
+    assert "report_summary" in prompt
 
 
 def test_global_parser_accepts_ranked_subset_and_empty_day() -> None:
@@ -197,6 +211,7 @@ def test_global_parser_accepts_ranked_subset_and_empty_day() -> None:
     selected = api.parse_global_selection_reply(_selection_reply(["i2"]), shortlist)
 
     assert selected["selected_insights"][0]["insight_id"] == "i2"
+    assert selected["selected_insights"][0]["report_summary"] == "用户反馈明确问题，需要产品关注"
     assert api.parse_global_selection_reply(
         '{"selected_insights": [], "selection_summary": "今日不推送"}',
         shortlist,
@@ -230,6 +245,17 @@ def test_global_parser_rejects_review_and_overlapping_source_candidates() -> Non
     ]
     with pytest.raises(ValueError, match="overlap"):
         api.parse_global_selection_reply(_selection_reply(["i1", "i2"]), shortlist)
+
+
+def test_global_parser_rejects_model_confidence_as_report_reason() -> None:
+    reply = json.loads(_selection_reply(["i1"]))
+    reply["selected_insights"][0]["selection_reason"] = "模型置信度0.9，因此进入报告"
+
+    with pytest.raises(ValueError, match="model confidence"):
+        _api().parse_global_selection_reply(
+            json.dumps(reply, ensure_ascii=False),
+            [_shortlist_row("i1")],
+        )
 
 
 def test_global_selection_runner_records_route_and_parsed_result(tmp_path) -> None:

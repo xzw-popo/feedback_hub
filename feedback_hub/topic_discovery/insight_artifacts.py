@@ -78,6 +78,7 @@ def partition_selected_insights(
             "report_decision": "main",
             "global_rank": int(selection["rank"]),
             "global_selection_reason": str(selection.get("selection_reason") or "").strip(),
+            "global_report_summary": str(selection.get("report_summary") or "").strip(),
             "editorial_note": str(selection.get("editorial_note") or "").strip(),
         })
         main.append(row)
@@ -195,7 +196,7 @@ def _render_insight(index: int, insight: dict[str, Any], *, compact: bool = Fals
     label = _TYPE_LABELS.get(str(insight.get("signal_type") or ""), "观察信号")
     lines = [f"### {index}. {insight.get('headline')}", ""]
     lines.append(f"- 类型：{label}")
-    lines.append(f"- 判断：{insight.get('summary')}")
+    lines.append(f"- 判断：{insight.get('global_report_summary') or insight.get('summary')}")
     lines.append(
         f"- 依据：{insight.get('global_selection_reason') or insight.get('selection_reason')}"
     )
@@ -215,7 +216,7 @@ def _write_main_sheet(sheet, selected: dict[str, list[dict[str, Any]]]) -> None:
     headers = [
         "report_layer", "insight_id", "signal_type", "headline", "summary",
         "local_report_decision", "selection_reason", "global_rank",
-        "global_selection_reason", "editorial_note", "shortlist_lanes",
+        "global_selection_reason", "global_report_summary", "editorial_note", "shortlist_lanes",
         "shortlist_lane_rank", "shortlist_rank_fields", "trend_claim", "today_conversation_count",
         "baseline_daily_counts", "source_candidate_ids", "source_topic_titles",
         "platform_counts", "appversion_counts", "feature_candidate_counts",
@@ -228,7 +229,7 @@ def _write_main_sheet(sheet, selected: dict[str, list[dict[str, Any]]]) -> None:
             values = [
                 layer, row.get("insight_id"), row.get("signal_type"), row.get("headline"), row.get("summary"),
                 row.get("local_report_decision"), row.get("selection_reason"), row.get("global_rank"),
-                row.get("global_selection_reason"), row.get("editorial_note"),
+                row.get("global_selection_reason"), row.get("global_report_summary"), row.get("editorial_note"),
                 _json_text(row.get("shortlist_lanes") or []), row.get("shortlist_lane_rank"),
                 _json_text(row.get("shortlist_rank_fields") or {}),
                 row.get("trend_claim"), row.get("today_conversation_count"),
