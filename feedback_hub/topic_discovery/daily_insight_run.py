@@ -1,6 +1,8 @@
 """Run an offline, resumable daily insight experiment from shadow artifacts."""
 from __future__ import annotations
 
+from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, timedelta
 import json
@@ -11,9 +13,13 @@ import numpy as np
 
 from feedback_hub.tagger.v2.feature_catalog import FeatureCatalog
 from feedback_hub.topic_discovery.insight_artifacts import (
+    partition_selected_insights,
     render_daily_report,
-    select_main_insights,
     write_review_workbook,
+)
+from feedback_hub.topic_discovery.global_selection import (
+    build_global_shortlist,
+    run_global_selection_multi_channel,
 )
 from feedback_hub.topic_discovery.insight_editor import (
     build_candidate_relation_plan,
@@ -55,9 +61,10 @@ def run_daily_insight_experiment(
     config.output_dir.mkdir(parents=True, exist_ok=True)
     report_path = config.output_dir / f"daily_report_draft_{config.report_date.strftime('%Y%m%d')}.md"
     workbook_path = config.output_dir / "daily_insight_review.xlsx"
-    if not config.resume:
-        report_path.unlink(missing_ok=True)
-        workbook_path.unlink(missing_ok=True)
+    selection_path = config.output_dir / "global_selection.json"
+    report_path.unlink(missing_ok=True)
+    workbook_path.unlink(missing_ok=True)
+    selection_path.unlink(missing_ok=True)
 
     days = load_shadow_days(config.run_root, config.report_date, config.baseline_days)
     report_day = days[-1]
@@ -124,6 +131,7 @@ def run_daily_insight_experiment(
         _write_json(config.output_dir / "run_summary.json", summary)
         return summary
 
+    model_rows, legacy_main_migrations = _normalize_legacy_local_decisions(model_rows)
     insights = [
         insight
         for row in model_rows
@@ -134,7 +142,52 @@ def run_daily_insight_experiment(
     _write_jsonl(config.output_dir / "insight_decisions.jsonl", insights)
 
     candidate_by_id = {str(row["candidate_id"]): row for row in candidates}
-    selected = select_main_insights(insights, candidate_by_id, max_items=5)
+    shortlist = build_global_shortlist(insights, candidate_by_id)
+    _write_jsonl(config.output_dir / "global_shortlist.jsonl", shortlist)
+    global_selection, selection_stats = run_global_selection_multi_channel(
+        shortlist,
+        routes=list(config.routes),
+        output_path=config.output_dir / "global_selection_model_rows.jsonl",
+        resume=config.resume,
+        call_fn=call_fn,
+    )
+    selection_incomplete = (
+        selection_stats["run_status"] != "completed"
+        or int(selection_stats.get("call_failed") or 0) > 0
+        or int(selection_stats.get("parse_failed") or 0) > 0
+        or int(selection_stats.get("retryable_failed") or 0) > 0
+    )
+    if selection_incomplete:
+        status = (
+            "paused_quota_exhausted"
+            if selection_stats["run_status"] == "paused_quota_exhausted"
+            else "selection_blocked"
+        )
+        summary = _base_summary(
+            config,
+            features,
+            candidates,
+            relation_plan,
+            model_stats,
+            status,
+        )
+        summary.update(_selection_summary_fields(
+            insights=insights,
+            shortlist=shortlist,
+            legacy_main_migrations=legacy_main_migrations,
+            local_stats=model_stats,
+            global_stats=selection_stats,
+        ))
+        _write_json(config.output_dir / "run_summary.json", summary)
+        return summary
+
+    _write_json(selection_path, global_selection)
+    selected = partition_selected_insights(
+        insights,
+        candidate_by_id,
+        global_selection,
+        shortlist=shortlist,
+    )
     summary = _base_summary(
         config,
         features,
@@ -143,6 +196,13 @@ def run_daily_insight_experiment(
         model_stats,
         "completed",
     )
+    summary.update(_selection_summary_fields(
+        insights=insights,
+        shortlist=shortlist,
+        legacy_main_migrations=legacy_main_migrations,
+        local_stats=model_stats,
+        global_stats=selection_stats,
+    ))
     summary.update({
         "insight_decisions": len(insights),
         "main_insights": len(selected["main"]),
@@ -169,6 +229,44 @@ def run_daily_insight_experiment(
         media_appendix=report_day["media_appendix"],
     )
     return summary
+
+
+def _normalize_legacy_local_decisions(
+    model_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Migrate persisted local main decisions without mutating checkpoints."""
+    rows = deepcopy(model_rows)
+    migrations = 0
+    for row in rows:
+        for insight in row.get("insights") or []:
+            if insight.get("report_decision") == "main":
+                insight["legacy_report_decision"] = "main"
+                insight["report_decision"] = "nominate"
+                migrations += 1
+    return rows, migrations
+
+
+def _selection_summary_fields(
+    *,
+    insights: list[dict[str, Any]],
+    shortlist: list[dict[str, Any]],
+    legacy_main_migrations: int,
+    local_stats: dict[str, Any],
+    global_stats: dict[str, Any],
+) -> dict[str, Any]:
+    local_routes = dict(local_stats.get("route_counts") or {})
+    global_routes = dict(global_stats.get("route_counts") or {})
+    route_counts: Counter[str] = Counter(local_routes)
+    route_counts.update(global_routes)
+    return {
+        "insight_decisions": len(insights),
+        "shortlist_insights": len(shortlist),
+        "legacy_main_migrations": legacy_main_migrations,
+        "local_route_counts": local_routes,
+        "global_route_counts": global_routes,
+        "global_selection_stats": dict(global_stats),
+        "route_counts": dict(sorted(route_counts.items())),
+    }
 
 
 def load_shadow_days(

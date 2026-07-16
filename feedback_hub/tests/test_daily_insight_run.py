@@ -10,8 +10,10 @@ from openpyxl import Workbook
 
 from feedback_hub.topic_discovery.daily_insight_run import (
     DailyInsightConfig,
+    _normalize_legacy_local_decisions,
     run_daily_insight_experiment,
 )
+from scripts import run_daily_insight_signal as daily_cli
 from scripts.run_daily_insight_signal import build_routes
 
 
@@ -149,14 +151,14 @@ def _config(tmp_path: Path) -> DailyInsightConfig:
     )
 
 
-def _fake_editor_call(prompt, **_kwargs):
+def _fake_local_nomination_call(prompt, **_kwargs):
     items = json.loads(prompt.split("```json\n", 1)[1].split("\n```", 1)[0])
     return json.dumps({"insights": [{
-        "report_decision": "observe",
+        "report_decision": "nominate",
         "signal_type": "new_bug",
         "headline": item["title"],
         "summary": item["description"],
-        "selection_reason": "实验观察",
+        "selection_reason": "进入全局比较",
         "trend_claim": "none",
         "source_candidate_ids": [item["candidate_id"]],
         "representative_issue_unit_ids": [item["representative_issue_units"][0]["issue_unit_id"]],
@@ -165,15 +167,34 @@ def _fake_editor_call(prompt, **_kwargs):
     } for item in items]}, ensure_ascii=False)
 
 
+def _fake_two_stage_call(prompt, **kwargs):
+    if "GLOBAL DAILY INSIGHT SELECTION" not in prompt:
+        return _fake_local_nomination_call(prompt, **kwargs)
+    items = json.loads(prompt.split("```json\n", 1)[1].split("\n```", 1)[0])
+    return json.dumps({
+        "selected_insights": [{
+            "insight_id": items[0]["insight_id"],
+            "rank": 1,
+            "selection_reason": "相对比较后证据最明确",
+            "editorial_note": "保持证据边界",
+        }],
+        "selection_summary": "本日选择一条",
+    }, ensure_ascii=False)
+
+
 def test_run_daily_insight_experiment_writes_complete_artifact_set(tmp_path) -> None:
     config = _config(tmp_path)
 
-    summary = run_daily_insight_experiment(config, call_fn=_fake_editor_call)
+    summary = run_daily_insight_experiment(config, call_fn=_fake_two_stage_call)
 
     assert summary["run_status"] == "completed"
     assert summary["feature_topics"] == 2
     assert summary["candidate_topics"] == 2
+    assert summary["shortlist_insights"] == 2
+    assert summary["main_insights"] == 1
     assert (config.output_dir / "topic_signal_features.jsonl").exists()
+    assert (config.output_dir / "global_shortlist.jsonl").exists()
+    assert (config.output_dir / "global_selection.json").exists()
     assert (config.output_dir / "daily_insight_review.xlsx").exists()
     assert (config.output_dir / "daily_report_draft_20260714.md").exists()
 
@@ -186,6 +207,38 @@ def test_run_stops_before_report_when_editor_has_unresolved_failure(tmp_path) ->
     assert summary["run_status"] == "incomplete_model_failures"
     assert not (config.output_dir / "daily_report_draft_20260714.md").exists()
     assert (config.output_dir / "run_summary.json").exists()
+
+
+def test_global_selection_failure_blocks_report_without_fallback(tmp_path) -> None:
+    config = _config(tmp_path)
+
+    def call(prompt, **kwargs):
+        if "GLOBAL DAILY INSIGHT SELECTION" in prompt:
+            return "not json"
+        return _fake_local_nomination_call(prompt, **kwargs)
+
+    summary = run_daily_insight_experiment(config, call_fn=call)
+
+    assert summary["run_status"] == "selection_blocked"
+    assert summary["shortlist_insights"] == 2
+    assert not (config.output_dir / "daily_report_draft_20260714.md").exists()
+    assert not (config.output_dir / "daily_insight_review.xlsx").exists()
+    assert (config.output_dir / "global_shortlist.jsonl").exists()
+    assert (config.output_dir / "run_summary.json").exists()
+
+
+def test_legacy_main_rows_migrate_to_nominate() -> None:
+    rows = [{
+        "batch_key": "legacy",
+        "insights": [{"insight_id": "i1", "report_decision": "main"}],
+    }]
+
+    normalized, count = _normalize_legacy_local_decisions(rows)
+
+    assert normalized[0]["insights"][0]["report_decision"] == "nominate"
+    assert normalized[0]["insights"][0]["legacy_report_decision"] == "main"
+    assert count == 1
+    assert rows[0]["insights"][0]["report_decision"] == "main"
 
 
 def test_cli_routes_read_credentials_only_from_named_environment(monkeypatch) -> None:
@@ -205,3 +258,21 @@ def test_cli_routes_read_credentials_only_from_named_environment(monkeypatch) ->
     assert len(routes) == 1
     assert routes[0]["name"] == "openai_primary"
     assert routes[0]["token"] == "secret-from-env"
+
+
+def test_cli_output_summary_separates_local_and_global_routes(tmp_path) -> None:
+    payload = daily_cli.build_output_summary({
+        "run_status": "completed",
+        "report_date": "2026-07-14",
+        "feature_topics": 404,
+        "candidate_topics": 248,
+        "shortlist_insights": 30,
+        "main_insights": 4,
+        "local_route_counts": {"agent_a": 59},
+        "global_route_counts": {"agent_c": 1},
+    }, tmp_path)
+
+    assert payload["shortlist_insights"] == 30
+    assert payload["local_route_counts"] == {"agent_a": 59}
+    assert payload["global_route_counts"] == {"agent_c": 1}
+    assert payload["output_dir"] == str(tmp_path)

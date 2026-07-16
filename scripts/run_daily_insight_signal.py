@@ -48,6 +48,23 @@ def build_routes(args: argparse.Namespace) -> list[dict[str, Any]]:
     return routes
 
 
+def build_output_summary(summary: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+    """Build a credential-free CLI result summary."""
+    return {
+        "run_status": summary["run_status"],
+        "report_date": summary["report_date"],
+        "feature_topics": summary["feature_topics"],
+        "candidate_topics": summary["candidate_topics"],
+        "shortlist_insights": summary.get("shortlist_insights"),
+        "main_insights": summary.get("main_insights"),
+        "observe_insights": summary.get("observe_insights"),
+        "manual_review_insights": summary.get("manual_review_insights"),
+        "local_route_counts": summary.get("local_route_counts") or {},
+        "global_route_counts": summary.get("global_route_counts") or {},
+        "output_dir": str(output_dir),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a resumable daily insight signal experiment.")
     parser.add_argument("--run-root", required=True)
@@ -86,17 +103,7 @@ def main() -> int:
         resume=args.resume,
     )
     summary = run_daily_insight_experiment(config)
-    print(json.dumps({
-        "run_status": summary["run_status"],
-        "report_date": summary["report_date"],
-        "feature_topics": summary["feature_topics"],
-        "candidate_topics": summary["candidate_topics"],
-        "main_insights": summary.get("main_insights"),
-        "observe_insights": summary.get("observe_insights"),
-        "manual_review_insights": summary.get("manual_review_insights"),
-        "route_counts": summary.get("route_counts") or {},
-        "output_dir": str(config.output_dir),
-    }, ensure_ascii=False))
+    print(json.dumps(build_output_summary(summary, config.output_dir), ensure_ascii=False))
     if summary["run_status"] == "paused_quota_exhausted":
         return 75
     return 0 if summary["run_status"] == "completed" else 1
