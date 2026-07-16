@@ -1,14 +1,15 @@
 """Select daily insights and render Markdown and XLSX review artifacts."""
 from __future__ import annotations
 
-from collections import Counter
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from feedback_hub.topic_discovery.global_selection import enrich_insights_with_evidence
 
 
 _TYPE_ORDER = {
@@ -28,43 +29,75 @@ _TYPE_LABELS = {
 }
 
 
-def select_main_insights(
+def partition_selected_insights(
     insights: list[dict[str, Any]],
     candidates: dict[str, dict[str, Any]],
+    global_selection: dict[str, Any],
     *,
-    max_items: int = 5,
+    shortlist: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Attach deterministic evidence, cap main items, and partition decisions."""
-    if not 0 <= max_items <= 5:
-        raise ValueError("max_items must be between 0 and 5")
-    insight_ids = [str(row.get("insight_id") or "") for row in insights]
-    if not all(insight_ids) or len(insight_ids) != len(set(insight_ids)):
-        raise ValueError("insight_id must be present and unique")
+    """Partition local insights using only a validated global ranked selection."""
+    normalized = enrich_insights_with_evidence(insights, candidates)
+    by_id = {str(row["insight_id"]): row for row in normalized}
+    shortlist_by_id = {str(row.get("insight_id") or ""): row for row in shortlist}
+    if not all(shortlist_by_id) or len(shortlist_by_id) != len(shortlist):
+        raise ValueError("shortlist insight_id must be present and unique")
+    if any(insight_id not in by_id for insight_id in shortlist_by_id):
+        raise ValueError("shortlist references an unknown insight")
+    for insight_id, shortlist_row in shortlist_by_id.items():
+        by_id[insight_id].update({
+            "shortlist_lanes": list(shortlist_row.get("shortlist_lanes") or []),
+            "shortlist_lane_rank": shortlist_row.get("shortlist_lane_rank"),
+            "shortlist_rank_fields": dict(shortlist_row.get("shortlist_rank_fields") or {}),
+        })
 
-    normalized = [_attach_candidate_evidence(dict(row), candidates) for row in insights]
-    for row in normalized:
-        if row.get("report_decision") == "main" and not row.get("source_links"):
-            row["report_decision"] = "manual_review"
-            row["needs_human_review"] = True
-            row["artifact_reason"] = "missing_source_link"
-        elif row.get("report_decision") == "main" and row.get("needs_human_review"):
-            row["report_decision"] = "manual_review"
-            row["artifact_reason"] = "model_requested_review"
+    selections = list(global_selection.get("selected_insights") or [])
+    if len(selections) > 5:
+        raise ValueError("global selection cannot exceed five insights")
+    selected_ids = [str(row.get("insight_id") or "") for row in selections]
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError("global selection contains duplicate insight IDs")
+    if any(insight_id not in by_id for insight_id in selected_ids):
+        raise ValueError("global selection references an unknown insight")
+    if any(insight_id not in shortlist_by_id for insight_id in selected_ids):
+        raise ValueError("global selection references a non-shortlisted insight")
+    ordered = sorted(selections, key=lambda row: int(row.get("rank") or 0))
+    if [int(row.get("rank") or 0) for row in ordered] != list(range(1, len(ordered) + 1)):
+        raise ValueError("global selection ranks must be consecutive")
 
-    main = sorted(
-        (row for row in normalized if row.get("report_decision") == "main"),
-        key=_insight_sort_key,
-    )
-    for row in main[max_items:]:
+    main = []
+    for selection in ordered:
+        insight_id = str(selection["insight_id"])
+        source = by_id[insight_id]
+        if source.get("needs_human_review"):
+            raise ValueError("selected insight requires human review")
+        if not source.get("source_links"):
+            raise ValueError("selected insight requires a source link")
+        row = dict(source)
+        row.update({
+            "report_decision": "main",
+            "global_rank": int(selection["rank"]),
+            "global_selection_reason": str(selection.get("selection_reason") or "").strip(),
+            "editorial_note": str(selection.get("editorial_note") or "").strip(),
+        })
+        main.append(row)
+
+    selected_id_set = set(selected_ids)
+    observe = []
+    for source in normalized:
+        insight_id = str(source["insight_id"])
+        if insight_id in selected_id_set or source.get("report_decision") in {"exclude", "manual_review"}:
+            continue
+        row = dict(source)
         row["report_decision"] = "observe"
-        row["artifact_reason"] = "main_limit_overflow"
+        row["artifact_reason"] = (
+            "not_selected_globally" if insight_id in shortlist_by_id else "not_shortlisted"
+        )
+        observe.append(row)
 
     return {
-        "main": main[:max_items],
-        "observe": sorted(
-            (row for row in normalized if row.get("report_decision") == "observe"),
-            key=_insight_sort_key,
-        ),
+        "main": main,
+        "observe": sorted(observe, key=_insight_sort_key),
         "manual_review": sorted(
             (row for row in normalized if row.get("report_decision") == "manual_review"),
             key=_insight_sort_key,
@@ -150,56 +183,6 @@ def write_review_workbook(
     workbook.save(path)
 
 
-def _attach_candidate_evidence(
-    insight: dict[str, Any],
-    candidates: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    source_ids = _dedupe(insight.get("source_candidate_ids") or [])
-    if not source_ids or any(candidate_id not in candidates for candidate_id in source_ids):
-        raise ValueError("insight references an unknown candidate")
-    sources = [candidates[candidate_id] for candidate_id in source_ids]
-    today_conversations = _dedupe(
-        conversation_id
-        for candidate in sources
-        for conversation_id in candidate.get("today_conversation_ids") or []
-    )
-    baseline_dates = sorted({
-        str(day)
-        for candidate in sources
-        for day in candidate.get("baseline_dates") or []
-    })
-    baseline_ids_by_date = {
-        day: _dedupe(
-            conversation_id
-            for candidate in sources
-            for conversation_id in (candidate.get("baseline_conversation_ids_by_date") or {}).get(day, [])
-        )
-        for day in baseline_dates
-    }
-    source_links = _dedupe(
-        link
-        for candidate in sources
-        for link in candidate.get("source_links") or []
-    )
-    insight.update({
-        "source_candidate_ids": source_ids,
-        "source_daily_topic_ids": _dedupe(candidate.get("daily_topic_id") for candidate in sources),
-        "source_stable_topic_ids": _dedupe(candidate.get("stable_topic_id") for candidate in sources),
-        "source_topic_titles": _dedupe(candidate.get("title") for candidate in sources),
-        "source_links": source_links,
-        "today_conversation_ids": today_conversations,
-        "today_conversation_count": len(today_conversations),
-        "baseline_dates": baseline_dates,
-        "baseline_daily_counts": [len(baseline_ids_by_date[day]) for day in baseline_dates],
-        "baseline_conversation_ids_by_date": baseline_ids_by_date,
-        "recall_reasons": _dedupe(reason for candidate in sources for reason in candidate.get("recall_reasons") or []),
-        "platform_counts": _sum_counts(candidate.get("platform_counts") or {} for candidate in sources),
-        "appversion_counts": _sum_counts(candidate.get("appversion_counts") or {} for candidate in sources),
-        "feature_candidate_counts": _sum_counts(candidate.get("feature_candidate_counts") or {} for candidate in sources),
-    })
-    return insight
-
-
 def _insight_sort_key(row: dict[str, Any]) -> tuple[int, float, str]:
     return (
         _TYPE_ORDER.get(str(row.get("signal_type") or "not_reportable"), 99),
@@ -213,7 +196,9 @@ def _render_insight(index: int, insight: dict[str, Any], *, compact: bool = Fals
     lines = [f"### {index}. {insight.get('headline')}", ""]
     lines.append(f"- 类型：{label}")
     lines.append(f"- 判断：{insight.get('summary')}")
-    lines.append(f"- 依据：{insight.get('selection_reason')}")
+    lines.append(
+        f"- 依据：{insight.get('global_selection_reason') or insight.get('selection_reason')}"
+    )
     lines.append(
         f"- 频次：当日 {int(insight.get('today_conversation_count') or 0)} 个去重会话；"
         f"基线逐日 {_json_text(insight.get('baseline_daily_counts') or [])}"
@@ -229,7 +214,9 @@ def _render_insight(index: int, insight: dict[str, Any], *, compact: bool = Fals
 def _write_main_sheet(sheet, selected: dict[str, list[dict[str, Any]]]) -> None:
     headers = [
         "report_layer", "insight_id", "signal_type", "headline", "summary",
-        "selection_reason", "trend_claim", "today_conversation_count",
+        "local_report_decision", "selection_reason", "global_rank",
+        "global_selection_reason", "editorial_note", "shortlist_lanes",
+        "shortlist_lane_rank", "shortlist_rank_fields", "trend_claim", "today_conversation_count",
         "baseline_daily_counts", "source_candidate_ids", "source_topic_titles",
         "platform_counts", "appversion_counts", "feature_candidate_counts",
         "confidence", "needs_human_review", "artifact_reason", "feedback_link",
@@ -240,7 +227,11 @@ def _write_main_sheet(sheet, selected: dict[str, list[dict[str, Any]]]) -> None:
         for row in selected.get(layer) or []:
             values = [
                 layer, row.get("insight_id"), row.get("signal_type"), row.get("headline"), row.get("summary"),
-                row.get("selection_reason"), row.get("trend_claim"), row.get("today_conversation_count"),
+                row.get("local_report_decision"), row.get("selection_reason"), row.get("global_rank"),
+                row.get("global_selection_reason"), row.get("editorial_note"),
+                _json_text(row.get("shortlist_lanes") or []), row.get("shortlist_lane_rank"),
+                _json_text(row.get("shortlist_rank_fields") or {}),
+                row.get("trend_claim"), row.get("today_conversation_count"),
                 _json_text(row.get("baseline_daily_counts") or []),
                 _json_text(row.get("source_candidate_ids") or []),
                 _json_text(row.get("source_topic_titles") or []),
@@ -327,15 +318,7 @@ def _media_links(row: dict[str, Any]) -> list[str]:
     return _dedupe(values)
 
 
-def _sum_counts(values: Iterable[dict[str, Any]]) -> dict[str, int]:
-    counts: Counter[str] = Counter()
-    for value in values:
-        for key, count in value.items():
-            counts[str(key)] += int(count)
-    return dict(sorted(counts.items()))
-
-
-def _dedupe(values: Iterable[Any]) -> list[str]:
+def _dedupe(values) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for value in values:

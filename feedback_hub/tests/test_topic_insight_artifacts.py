@@ -1,12 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from openpyxl import load_workbook
 
-from feedback_hub.topic_discovery.insight_artifacts import (
-    render_daily_report,
-    select_main_insights,
-    write_review_workbook,
-)
+from feedback_hub.topic_discovery import insight_artifacts as artifacts
 
 
 def _candidate(candidate_id: str, *, links: list[str] | None = None) -> dict:
@@ -31,13 +28,18 @@ def _candidate(candidate_id: str, *, links: list[str] | None = None) -> dict:
         "feature_candidate_counts": {"voice_input": 1},
         "platform_counts": {"Android": 1},
         "appversion_counts": {"3.5.0": 1},
-        "representative_issue_units": [{"issue_unit_id": f"issue-{candidate_id}", "summary": f"候选{candidate_id}"}],
+        "representative_issue_units": [{
+            "issue_unit_id": f"issue-{candidate_id}",
+            "summary": f"候选{candidate_id}",
+            "evidence_spans": ["明确证据"],
+        }],
+        "known_context": True,
     }
 
 
 def _insight(
     insight_id: str,
-    decision: str = "main",
+    decision: str = "nominate",
     *,
     confidence: float = 0.9,
     candidate_id: str | None = None,
@@ -49,35 +51,86 @@ def _insight(
         "signal_type": "new_bug",
         "headline": f"洞察{insight_id}",
         "summary": f"洞察{insight_id}摘要",
-        "selection_reason": "证据明确",
+        "selection_reason": "局部证据明确",
         "trend_claim": "none",
         "source_candidate_ids": [candidate],
         "representative_issue_unit_ids": [f"issue-{candidate}"],
         "confidence": confidence,
-        "needs_human_review": False,
+        "needs_human_review": decision == "manual_review",
     }
 
 
-def test_select_main_insights_caps_without_filling_or_duplication() -> None:
-    insights = [_insight(f"i{index}", confidence=0.9 - index / 100) for index in range(7)]
-    candidates = {f"i{index}": _candidate(f"i{index}") for index in range(7)}
+def _selection(*insight_ids: str) -> dict:
+    return {
+        "selected_insights": [{
+            "insight_id": insight_id,
+            "rank": index,
+            "selection_reason": f"全局比较后选择{insight_id}",
+            "editorial_note": "保持谨慎表达",
+        } for index, insight_id in enumerate(insight_ids, 1)],
+        "selection_summary": "完成全局比较",
+    }
 
-    selected = select_main_insights(insights, candidates, max_items=5)
 
-    assert len(selected["main"]) == 5
-    assert len(selected["observe"]) == 2
-    assert len({row["insight_id"] for row in selected["main"]}) == 5
-    assert all(row.get("artifact_reason") == "main_limit_overflow" for row in selected["observe"])
+def _shortlist(*insight_ids: str) -> list[dict]:
+    return [{
+        "insight_id": insight_id,
+        "shortlist_lanes": ["new_bug"],
+        "shortlist_lane_rank": index,
+        "shortlist_rank_fields": {"today_conversation_count": 1},
+    } for index, insight_id in enumerate(insight_ids, 1)]
 
 
-def test_main_insight_without_link_is_demoted_to_manual_review() -> None:
-    selected = select_main_insights(
+def test_partition_uses_only_ranked_global_selection_for_main() -> None:
+    insights = [
+        _insight("i1", candidate_id="c1"),
+        _insight("i2", "observe", candidate_id="c2"),
+        _insight("i3", candidate_id="c3"),
+    ]
+    candidates = {f"c{index}": _candidate(f"c{index}") for index in range(1, 4)}
+
+    selected = artifacts.partition_selected_insights(
+        insights,
+        candidates,
+        _selection("i2", "i1"),
+        shortlist=_shortlist("i1", "i2"),
+    )
+
+    assert [row["insight_id"] for row in selected["main"]] == ["i2", "i1"]
+    assert [row["insight_id"] for row in selected["observe"]] == ["i3"]
+    assert selected["main"][0]["local_report_decision"] == "observe"
+    assert selected["main"][0]["global_selection_reason"] == "全局比较后选择i2"
+    assert selected["main"][0]["shortlist_lanes"] == ["new_bug"]
+
+
+def test_partition_does_not_fill_unused_slots() -> None:
+    selected = artifacts.partition_selected_insights(
         [_insight("i1", candidate_id="c1")],
-        {"c1": _candidate("c1", links=[])},
+        {"c1": _candidate("c1")},
+        _selection(),
+        shortlist=_shortlist("i1"),
     )
 
     assert selected["main"] == []
-    assert selected["manual_review"][0]["artifact_reason"] == "missing_source_link"
+    assert selected["observe"][0]["artifact_reason"] == "not_selected_globally"
+
+
+def test_partition_rejects_unknown_or_linkless_selected_insight() -> None:
+    with pytest.raises(ValueError, match="unknown insight"):
+        artifacts.partition_selected_insights(
+            [_insight("i1", candidate_id="c1")],
+            {"c1": _candidate("c1")},
+            _selection("unknown"),
+            shortlist=_shortlist("i1"),
+        )
+
+    with pytest.raises(ValueError, match="source link"):
+        artifacts.partition_selected_insights(
+            [_insight("i1", candidate_id="c1")],
+            {"c1": _candidate("c1", links=[])},
+            _selection("i1"),
+            shortlist=_shortlist("i1"),
+        )
 
 
 def test_grouped_insight_deduplicates_conversations() -> None:
@@ -87,35 +140,47 @@ def test_grouped_insight_deduplicates_conversations() -> None:
     insight = _insight("i1", candidate_id="c1")
     insight["source_candidate_ids"] = ["c1", "c2"]
 
-    selected = select_main_insights([insight], {"c1": left, "c2": right})
+    selected = artifacts.partition_selected_insights(
+        [insight],
+        {"c1": left, "c2": right},
+        _selection("i1"),
+        shortlist=_shortlist("i1"),
+    )
 
     assert selected["main"][0]["today_conversation_count"] == 2
 
 
-def test_report_contains_clickable_sources_and_separate_media_appendix() -> None:
-    selected = select_main_insights(
+def test_report_contains_global_reason_sources_and_media_appendix() -> None:
+    selected = artifacts.partition_selected_insights(
         [_insight("i1", candidate_id="c1")],
         {"c1": _candidate("c1", links=["https://feedback/main"])},
+        _selection("i1"),
+        shortlist=_shortlist("i1"),
     )
-    text = render_daily_report(
+    text = artifacts.render_daily_report(
         "2026-07-14",
         selected,
         [{"summary": "图片展示异常", "evidence_link": "https://feedback/media"}],
         {"baseline_start": "2026-07-07", "baseline_end": "2026-07-13", "route_counts": {"glm": 2}},
     )
 
+    assert "全局比较后选择i1" in text
     assert "[查看原反馈](https://feedback/main)" in text
     assert "媒体附录" in text
     assert "https://feedback/media" in text
-    assert "最多 5 条" not in text
 
 
-def test_review_workbook_has_four_sheets_links_and_human_columns(tmp_path) -> None:
+def test_review_workbook_has_selection_audit_links_and_human_columns(tmp_path) -> None:
     candidate = _candidate("c1")
-    selected = select_main_insights([_insight("i1", candidate_id="c1")], {"c1": candidate})
+    selected = artifacts.partition_selected_insights(
+        [_insight("i1", candidate_id="c1")],
+        {"c1": candidate},
+        _selection("i1"),
+        shortlist=_shortlist("i1"),
+    )
     path = tmp_path / "review.xlsx"
 
-    write_review_workbook(
+    artifacts.write_review_workbook(
         path,
         selected=selected,
         candidates=[candidate],
@@ -131,10 +196,18 @@ def test_review_workbook_has_four_sheets_links_and_human_columns(tmp_path) -> No
     book = load_workbook(path, data_only=False)
     assert book.sheetnames == ["正文与观察", "全部候选", "原子主题关系", "媒体附录"]
     headers = [cell.value for cell in book["正文与观察"][1]]
-    assert "human_report_decision" in headers
-    assert "human_signal_type" in headers
-    assert "human_grouping_result" in headers
-    assert "human_notes" in headers
+    for name in (
+        "local_report_decision",
+        "global_rank",
+        "global_selection_reason",
+        "editorial_note",
+        "shortlist_lanes",
+        "human_report_decision",
+        "human_signal_type",
+        "human_grouping_result",
+        "human_notes",
+    ):
+        assert name in headers
     assert any(
         cell.hyperlink and cell.hyperlink.target.startswith("https://feedback/")
         for sheet in book.worksheets
