@@ -25,7 +25,7 @@ _RELATION_PRIORITY = {
     "semantic_similarity": 2,
 }
 
-_REPORT_DECISIONS = {"main", "observe", "exclude", "manual_review"}
+_REPORT_DECISIONS = {"nominate", "observe", "exclude", "manual_review"}
 _SIGNAL_TYPES = {
     "new_bug",
     "rising_or_repeated_bug",
@@ -99,12 +99,13 @@ def build_insight_editor_prompt(bucket: dict[str, Any]) -> str:
         "Do not merge merely because candidates share a feature, platform, sentiment, or broad feedback type.",
         "Merge candidates only when one report explanation can preserve their actionable product meaning without hiding different fixes or decisions.",
         "Bug reports and requests remain separate unless they clearly express one capability gap and grouping does not hide their nature.",
-        "Use main only for evidence that genuinely deserves proactive attention. Use observe for useful but not main-report evidence.",
+        "Use nominate only for evidence that deserves comparison in the global selection stage.",
+        "nominate does not mean final report inclusion. Use observe for useful evidence that is weaker in this local context.",
         "Use manual_review when evidence or grouping remains ambiguous. Use exclude for low-value or non-reportable candidates.",
         "A concrete single feedback may be high value, but strong wording alone does not prove importance or severity.",
         "Use only a trend_claim allowed by every grouped candidate. Never claim rising when rising is not allowed.",
         "Do not infer image or video contents, population impact, fix priority, root cause, or facts absent from the evidence.",
-        "Allowed report_decision values: main | observe | exclude | manual_review.",
+        "Allowed report_decision values: nominate | observe | exclude | manual_review.",
         "Allowed signal_type values: new_bug | rising_or_repeated_bug | demand_opportunity | high_value_single | not_reportable.",
         "Keep headline under 28 Chinese characters, summary under 120 Chinese characters, and selection_reason under 100 Chinese characters.",
         "Use only supplied candidate_id and issue_unit_id values.",
@@ -118,7 +119,7 @@ def build_insight_editor_prompt(bucket: dict[str, Any]) -> str:
         "Return shape:",
         json.dumps({
             "insights": [{
-                "report_decision": "main | observe | exclude | manual_review",
+                "report_decision": "nominate | observe | exclude | manual_review",
                 "signal_type": "new_bug | rising_or_repeated_bug | demand_opportunity | high_value_single | not_reportable",
                 "headline": "concise factual title",
                 "summary": "what happened and why it matters",
@@ -264,7 +265,7 @@ def run_insight_editor_multi_channel(
                         allowed_trend_claims=allowed_trends,
                         allowed_issue_unit_ids=allowed_issues,
                     )
-                    _validate_main_links(decisions, items)
+                    _validate_nominate_links(decisions, items)
                     return decisions, None
                 except ValueError as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
@@ -310,7 +311,7 @@ def run_insight_editor_multi_channel(
             "route_source": route.name,
             "endpoint_class": route.endpoint_class,
             "model": route.model or "agent_default",
-            "prompt_version": "daily_insight_editor_v1",
+            "prompt_version": "daily_insight_editor_v2_nominate",
             "attempts": model_attempts,
             "retry_chain": retry_chain,
             "elapsed_ms": elapsed_ms,
@@ -550,7 +551,7 @@ def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_main_links(
+def _validate_nominate_links(
     insights: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
 ) -> None:
@@ -559,7 +560,7 @@ def _validate_main_links(
         for candidate in candidates
     }
     for insight in insights:
-        if insight["report_decision"] != "main":
+        if insight["report_decision"] != "nominate":
             continue
         links = {
             str(link).strip()
@@ -568,7 +569,7 @@ def _validate_main_links(
             if str(link).strip()
         }
         if not links:
-            raise ValueError("main insight requires a source link")
+            raise ValueError("nominate insight requires a source link")
 
 
 def _extract_json(reply: str) -> str | None:

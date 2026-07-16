@@ -48,6 +48,21 @@ def _candidate(
     }
 
 
+def _reply(decision: str, *, candidate_id: str = "c1", trend_claim: str = "none") -> str:
+    return json.dumps({"insights": [{
+        "report_decision": decision,
+        "signal_type": "new_bug",
+        "headline": "语音输入无文字",
+        "summary": "用户说完后没有文字上屏",
+        "selection_reason": "证据明确",
+        "trend_claim": trend_claim,
+        "source_candidate_ids": [candidate_id],
+        "representative_issue_unit_ids": [f"i-{candidate_id}"],
+        "confidence": 0.8,
+        "needs_human_review": False,
+    }]}, ensure_ascii=False)
+
+
 def test_relation_plan_prioritizes_same_stable_topic_and_parent_links() -> None:
     candidates = [
         _candidate("c1", "d1", stable="t1"),
@@ -104,13 +119,15 @@ def test_editor_prompt_separates_atomic_topics_from_report_insights() -> None:
     assert "Report grouping must not modify topic memory" in prompt
     assert "new_topic does not prove a product-level new issue" in prompt
     assert "Do not merge merely because candidates share a feature" in prompt
-    assert "main | observe | exclude | manual_review" in prompt
+    assert "nominate | observe | exclude | manual_review" in prompt
+    assert "nominate does not mean final report inclusion" in prompt
+    assert "main | observe" not in prompt
     assert "c1" in prompt
 
 
 def test_parser_rejects_unsupported_rising_claim_and_requires_exact_coverage() -> None:
     reply = json.dumps({"insights": [{
-        "report_decision": "main",
+        "report_decision": "nominate",
         "signal_type": "rising_or_repeated_bug",
         "headline": "语音不上屏增加",
         "summary": "当天出现多次",
@@ -137,6 +154,47 @@ def test_parser_rejects_unsupported_rising_claim_and_requires_exact_coverage() -
             allowed_trend_claims={"c1": {"none"}},
             allowed_issue_unit_ids={"i-c1"},
         )
+
+
+def test_parser_accepts_nominate_and_rejects_legacy_main() -> None:
+    rows = parse_insight_editor_reply(
+        _reply("nominate"),
+        allowed_candidate_ids={"c1"},
+        allowed_trend_claims={"c1": {"none"}},
+        allowed_issue_unit_ids={"i-c1"},
+    )
+
+    assert rows[0]["report_decision"] == "nominate"
+
+    with pytest.raises(ValueError, match="unsupported report decision"):
+        parse_insight_editor_reply(
+            _reply("main"),
+            allowed_candidate_ids={"c1"},
+            allowed_trend_claims={"c1": {"none"}},
+            allowed_issue_unit_ids={"i-c1"},
+        )
+
+
+def test_nominate_requires_a_source_link(tmp_path) -> None:
+    candidate = _candidate("c1", "d1")
+    candidate["source_links"] = []
+
+    rows, summary = run_insight_editor_multi_channel(
+        [{"bucket_id": "edit:0001", "items": [candidate]}],
+        routes=[{
+            "name": "test",
+            "endpoint_class": "openai_compatible",
+            "api_url": "https://model.test",
+            "token": "secret",
+            "model": "glm-5.2",
+        }],
+        output_path=tmp_path / "editor.jsonl",
+        concurrency_per_route=1,
+        call_fn=lambda *_args, **_kwargs: _reply("nominate"),
+    )
+
+    assert summary["parse_failed"] == 1
+    assert "nominate insight requires a source link" in rows[0]["editor_parse_error"]
 
 
 def test_parser_accepts_report_group_and_preserves_review_fields() -> None:
