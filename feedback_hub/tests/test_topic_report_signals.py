@@ -7,6 +7,8 @@ import pytest
 from feedback_hub.tagger.v2.feature_catalog import Feature, FeatureCatalog
 from feedback_hub.topic_discovery.report_signals import (
     build_topic_signal_features,
+    classify_allowed_trend_claims,
+    recall_report_candidates,
     validate_feature_coverage,
 )
 
@@ -134,3 +136,102 @@ def test_validate_feature_coverage_rejects_missing_and_duplicate_topics() -> Non
             [{"daily_topic_id": "d1"}, {"daily_topic_id": "d1"}],
             {"d1", "d2"},
         )
+
+
+def _feature(**overrides) -> dict:
+    row = {
+        "daily_topic_id": "daily:2026-07-14:0001",
+        "stable_topic_id": "topic:000001",
+        "parent_topic_ids": [],
+        "title": "语音输入不上屏",
+        "description": "语音结束后没有文字",
+        "today_conversation_count": 1,
+        "today_issue_unit_count": 1,
+        "baseline_dates": [f"2026-07-{day:02d}" for day in range(7, 14)],
+        "baseline_daily_counts": [0, 0, 0, 0, 0, 0, 0],
+        "historical_active_dates": [],
+        "lifecycle_verdict": "same_topic",
+        "lifecycle_historical_topic_id": "topic:000001",
+        "lifecycle_confidence": 0.9,
+        "lifecycle_reason": "同一问题",
+        "feedback_type_counts": {"bug_problem": 1},
+        "feature_candidate_counts": {"voice_input": 1},
+        "platform_counts": {"Android": 1},
+        "appversion_counts": {"3.5.0": 1},
+        "source_links": ["https://feedback/c1"],
+        "evidence_span_count": 1,
+        "has_media_evidence": False,
+        "confidence": 0.9,
+        "needs_review": False,
+        "known_context": True,
+        "feature_policy": {"action": "eligible", "known": 1, "unknown": 0},
+        "representative_issue_units": [{"issue_unit_id": "i1"}],
+    }
+    aliases = {
+        "today": "today_conversation_count",
+        "baseline": "baseline_daily_counts",
+        "verdict": "lifecycle_verdict",
+    }
+    for key, value in overrides.items():
+        row[aliases.get(key, key)] = value
+    if "baseline" in overrides:
+        row["historical_active_dates"] = [
+            row["baseline_dates"][index]
+            for index, value in enumerate(row["baseline_daily_counts"])
+            if value
+        ]
+    return row
+
+
+@pytest.mark.parametrize(
+    ("reason", "row"),
+    [
+        ("repeat_today", _feature(today=2)),
+        ("cross_day_persistent", _feature(today=1, baseline=[1, 0, 1, 0, 0, 1, 0])),
+        ("clear_new", _feature(today=1, verdict="new_topic", lifecycle_historical_topic_id=None)),
+        ("demand_opportunity", _feature(feedback_type_counts={"feature_request": 1})),
+        ("high_value_single", _feature(today=1, feedback_type_counts={"bug_problem": 1})),
+    ],
+)
+def test_recall_report_candidates_uses_independent_routes(reason: str, row: dict) -> None:
+    candidate = recall_report_candidates([row])[0]
+
+    assert reason in candidate["recall_reasons"]
+
+
+def test_no_report_policy_excludes_only_unanimous_known_features() -> None:
+    excluded = recall_report_candidates([
+        _feature(feature_policy={"action": "exclude", "known": 2, "unknown": 0})
+    ])[0]
+    mixed = recall_report_candidates([
+        _feature(feature_policy={"action": "review", "known": 1, "unknown": 1})
+    ])[0]
+
+    assert excluded["deterministic_exclusion"] == "feature_policy_excluded"
+    assert mixed["deterministic_exclusion"] is None
+
+
+def test_rising_requires_nonzero_history_and_supported_delta() -> None:
+    no_history = classify_allowed_trend_claims(3, [0, 0, 0, 0, 0, 0, 0], [])
+    rising = classify_allowed_trend_claims(5, [1, 1, 0, 1, 1, 0, 1], ["2026-07-07"])
+
+    assert "rising" not in no_history
+    assert "new_signal" in no_history
+    assert "rising" in rising
+
+
+def test_reappeared_requires_a_recent_gap() -> None:
+    claims = classify_allowed_trend_claims(1, [1, 0, 1, 0, 0, 0, 0], ["2026-07-07"])
+
+    assert "reappeared" in claims
+
+
+def test_unclear_singletons_do_not_make_the_broad_candidate_pool() -> None:
+    low_confidence = _feature(confidence=0.6)
+    review_needed_demand = _feature(
+        feedback_type_counts={"feature_request": 1},
+        needs_review=True,
+    )
+
+    assert recall_report_candidates([low_confidence]) == []
+    assert recall_report_candidates([review_needed_demand]) == []

@@ -157,6 +157,109 @@ def validate_feature_coverage(
         raise ValueError("topic signal features must provide exact coverage")
 
 
+def classify_allowed_trend_claims(
+    today_count: int,
+    baseline_counts: list[int],
+    active_dates: list[str],
+) -> list[str]:
+    """Return trend language that is supported by deterministic counts."""
+    del active_dates  # Dates remain in the artifact; claims depend on the aligned count series.
+    today = max(0, int(today_count))
+    baseline = [max(0, int(value)) for value in baseline_counts]
+    claims = {"none"}
+    nonzero_days = sum(value > 0 for value in baseline)
+    baseline_mean = sum(baseline) / len(baseline) if baseline else 0.0
+    if today >= 2:
+        claims.add("repeated")
+    if nonzero_days >= 2:
+        claims.add("persistent")
+    if any(baseline) and not any(baseline[-2:]) and today:
+        claims.add("reappeared")
+    if not any(baseline) and today:
+        claims.add("new_signal")
+    if (
+        any(baseline)
+        and today >= 3
+        and today >= baseline_mean + 2
+        and today >= baseline_mean * 1.5
+    ):
+        claims.add("rising")
+    return sorted(claims)
+
+
+def recall_report_candidates(
+    features: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Broadly recall report candidates through independent, auditable routes."""
+    candidates: list[dict[str, Any]] = []
+    for feature in features:
+        reasons = _recall_reasons(feature)
+        policy_action = str((feature.get("feature_policy") or {}).get("action") or "review")
+        exclusion = "feature_policy_excluded" if policy_action == "exclude" else None
+        if not reasons and exclusion is None:
+            continue
+        allowed_claims = classify_allowed_trend_claims(
+            int(feature.get("today_conversation_count") or 0),
+            [int(value) for value in feature.get("baseline_daily_counts") or []],
+            _strings(feature.get("historical_active_dates") or []),
+        )
+        if exclusion:
+            candidate_band = "excluded"
+        elif bool(feature.get("needs_review")) or policy_action == "manual_review":
+            candidate_band = "review"
+        elif {"repeat_today", "cross_day_persistent"}.intersection(reasons):
+            candidate_band = "primary"
+        else:
+            candidate_band = "exploratory"
+        candidates.append({
+            **feature,
+            "candidate_id": "candidate:" + str(feature.get("daily_topic_id") or ""),
+            "recall_reasons": sorted(reasons),
+            "candidate_band": candidate_band,
+            "allowed_trend_claims": allowed_claims,
+            "deterministic_exclusion": exclusion,
+        })
+    return sorted(candidates, key=lambda row: row["candidate_id"])
+
+
+def _recall_reasons(feature: dict[str, Any]) -> set[str]:
+    reasons: set[str] = set()
+    today_count = int(feature.get("today_conversation_count") or 0)
+    baseline = [int(value) for value in feature.get("baseline_daily_counts") or []]
+    links = _strings(feature.get("source_links") or [])
+    evidence_span_count = int(feature.get("evidence_span_count") or 0)
+    feedback_types = set((feature.get("feedback_type_counts") or {}).keys())
+    clear_evidence = bool(links) and evidence_span_count > 0
+
+    if today_count >= 2:
+        reasons.add("repeat_today")
+    if sum(value > 0 for value in baseline) >= 2:
+        reasons.add("cross_day_persistent")
+    if (
+        str(feature.get("lifecycle_verdict") or "") == "new_topic"
+        and float(feature.get("lifecycle_confidence") or 0.0) >= 0.75
+        and clear_evidence
+        and not bool(feature.get("needs_review"))
+    ):
+        reasons.add("clear_new")
+    if (
+        feedback_types.intersection({"feature_request", "improvement_request", "mixed"})
+        and clear_evidence
+        and not bool(feature.get("needs_review"))
+    ):
+        reasons.add("demand_opportunity")
+    if (
+        today_count == 1
+        and clear_evidence
+        and bool(feature.get("known_context"))
+        and not bool(feature.get("needs_review"))
+        and float(feature.get("confidence") or 0.0) >= 0.85
+        and feedback_types.intersection({"bug_problem", "feature_request", "improvement_request", "mixed"})
+    ):
+        reasons.add("high_value_single")
+    return reasons
+
+
 def _resolve_feature_policy(
     member_units: list[dict[str, Any]],
     catalog: FeatureCatalog,
