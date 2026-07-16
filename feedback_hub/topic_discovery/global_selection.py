@@ -24,6 +24,11 @@ DEFAULT_LANE_LIMITS = {
     "high_value_single": 4,
 }
 _LANE_ORDER = tuple(DEFAULT_LANE_LIMITS)
+_FIX_PRIORITY_PHRASES = (
+    "最严重", "修复优先", "优先修复", "修复紧迫", "立即修复", "立即介入", "必须修复",
+)
+_RETENTION_CLAIMS = ("获客", "留存", "流失风险", "用户流失")
+_RETENTION_EVIDENCE = ("转用", "换用", "卸载", "不用了", "竞品", "搜狗", "流失")
 _FENCE_JSON_RE = re.compile(r"```json\s*(.+?)\s*```", re.DOTALL | re.IGNORECASE)
 _BRACE_RE = re.compile(r"\{[\s\S]*\}")
 
@@ -169,6 +174,8 @@ def build_global_selection_prompt(shortlist: list[dict[str, Any]]) -> str:
         "Compare product impact, actionability, evidence quality, today's information gain, user task, and duplication with other items.",
         "Frequency is evidence but is not a complete importance score. Local nominate is not final inclusion, and a strong observe may be selected.",
         "Do not cite model confidence in selection_reason or report_summary; it is internal routing evidence, not a product conclusion.",
+        "This stage selects report attention and does not decide fix priority, severity, or implementation urgency. Phrase reasons as why an item deserves attention today.",
+        "Do not claim acquisition, retention, or churn impact unless a supplied evidence span explicitly says the user switched, uninstalled, stopped using, or chose a competitor.",
         "Treat low report_priority as a product-policy warning. Skin, visual-theme, and account-login preferences should not be selected merely for frequency; select them only for clear breakage or unusual new evidence.",
         "You must not change headline, signal_type, or trend_claim, and you must not add facts, root causes, severity, or population impact.",
         "Do not select needs_human_review items, linkless items, or two insights that overlap on source_candidate_ids.",
@@ -231,6 +238,12 @@ def parse_global_selection_reply(
             raise ValueError("global selection reason is required")
         if "置信度" in reason or "confidence" in reason.lower():
             raise ValueError("global selection reason cannot cite model confidence")
+        if any(phrase in reason for phrase in _FIX_PRIORITY_PHRASES):
+            raise ValueError("global selection reason cannot decide fix priority")
+        if any(claim in reason for claim in _RETENTION_CLAIMS):
+            evidence_text = _selection_evidence_text(source)
+            if not any(marker in evidence_text for marker in _RETENTION_EVIDENCE):
+                raise ValueError("global selection reason lacks direct retention evidence")
         report_summary = str(value.get("report_summary") or "").strip()
         if not report_summary:
             raise ValueError("global report summary is required")
@@ -327,7 +340,7 @@ def run_global_selection_multi_channel(
             "route_source": route.name,
             "endpoint_class": route.endpoint_class,
             "model": route.model or "agent_default",
-            "prompt_version": "daily_insight_global_selection_v1",
+            "prompt_version": "daily_insight_global_selection_v2_evidence_boundaries",
             "attempts": attempts,
             "retry_chain": retry_chain,
             "elapsed_ms": elapsed_ms,
@@ -461,6 +474,14 @@ def _report_priority(row: dict[str, Any]) -> dict[str, Any]:
         "report_priority": "low" if reasons else "normal",
         "report_priority_reasons": reasons,
     }
+
+
+def _selection_evidence_text(row: dict[str, Any]) -> str:
+    values = [row.get("headline"), row.get("summary")]
+    for unit in row.get("representative_issue_units") or row.get("representative_evidence") or []:
+        values.append(unit.get("summary"))
+        values.extend(unit.get("evidence_spans") or [])
+    return " ".join(_dedupe_strings(values))
 
 
 def _validate_no_source_overlap(

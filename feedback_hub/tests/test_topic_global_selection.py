@@ -201,6 +201,7 @@ def test_global_prompt_requests_relative_selection_without_new_facts() -> None:
     assert "fixed type quota" in prompt
     assert "Do not cite model confidence" in prompt
     assert "low report_priority" in prompt
+    assert "does not decide fix priority" in prompt
     assert "report_summary" in prompt
 
 
@@ -256,6 +257,38 @@ def test_global_parser_rejects_model_confidence_as_report_reason() -> None:
             json.dumps(reply, ensure_ascii=False),
             [_shortlist_row("i1")],
         )
+
+
+@pytest.mark.parametrize("reason", [
+    "这是最严重的问题，需要立即介入",
+    "该问题修复紧迫性更强",
+    "应该优先修复",
+])
+def test_global_parser_rejects_fix_priority_claims(reason: str) -> None:
+    reply = json.loads(_selection_reply(["i1"]))
+    reply["selected_insights"][0]["selection_reason"] = reason
+
+    with pytest.raises(ValueError, match="fix priority"):
+        _api().parse_global_selection_reply(
+            json.dumps(reply, ensure_ascii=False),
+            [_shortlist_row("i1")],
+        )
+
+
+def test_global_parser_requires_direct_evidence_for_retention_claims() -> None:
+    reply = json.loads(_selection_reply(["i1"]))
+    reply["selected_insights"][0]["selection_reason"] = "该问题影响获客与留存"
+
+    with pytest.raises(ValueError, match="retention evidence"):
+        _api().parse_global_selection_reply(
+            json.dumps(reply, ensure_ascii=False),
+            [_shortlist_row("i1")],
+        )
+
+    supported = _shortlist_row("i1")
+    supported["summary"] = "用户因缺少该能力已转用竞品"
+    parsed = _api().parse_global_selection_reply(json.dumps(reply, ensure_ascii=False), [supported])
+    assert parsed["selected_insights"][0]["insight_id"] == "i1"
 
 
 def test_global_selection_runner_records_route_and_parsed_result(tmp_path) -> None:
