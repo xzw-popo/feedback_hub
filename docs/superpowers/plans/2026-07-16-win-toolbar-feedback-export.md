@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce a verified one-off Excel list of Win feedback from 2026-01-16 through the 2026-07-16 execution snapshot for toolbar position drift and toolbar visibility during full-screen games.
+**Goal:** Produce a verified one-off Excel list of Win feedback from 2026-01-16 through the 2026-07-16 execution snapshot for toolbar position drift and toolbar visibility during full-screen video or games, including borderless-window and exclusive full-screen modes.
 
 **Architecture:** Take a consistent snapshot of the current remote SQLite database, backfill only the missing historical window into that local copy, and leave both production databases untouched. Run deterministic broad recall followed by batched OpenAI-compatible semantic classification, then export only matched feedback IDs to a formatted workbook.
 
@@ -15,7 +15,7 @@
 - Do not upload a database, restart DevCloud, or modify the remote production database.
 - Target platform is exactly `Win`.
 - Target time begins at `2026-01-16 00:00:00` local time and ends at the recorded remote snapshot time.
-- Issue 2 includes full-screen games only; video, live-stream, browser, and other non-game full-screen feedback are excluded.
+- Issue 2 includes video or games in full-screen, borderless-window full-screen, or exclusive full-screen modes; ordinary always-on-top behavior without a video or game full-screen context is excluded.
 - General L1/L2/severity labels do not affect inclusion.
 - Final rows are unique by `feedback_id` and must contain a usable conversation URL.
 
@@ -137,12 +137,16 @@ def test_recall_toolbar_position_drift():
 
 
 def test_recall_fullscreen_game_without_literal_toolbar():
-    assert "游戏全屏不隐藏" in recall_issue_types("打 LOL 的时候这个输入法框一直置顶挡画面")
+    assert "视频或游戏全屏不隐藏" in recall_issue_types("打 LOL 的时候这个输入法框一直置顶挡画面")
 
 
-def test_video_fullscreen_is_not_a_final_match():
-    result = parse_classification('{"matched":false,"issue_type":null,"confidence":0.98,"reason":"仅视频全屏"}')
-    assert result["matched"] is False
+def test_recall_video_exclusive_fullscreen():
+    assert "视频或游戏全屏不隐藏" in recall_issue_types("播放器独占全屏看视频时工具栏还在")
+
+
+def test_parse_fullscreen_video_match():
+    result = parse_classification('{"matched":true,"issue_type":"视频或游戏全屏不隐藏","confidence":0.98,"reason":"视频独占全屏仍显示"}')
+    assert result["matched"] is True
 ```
 
 - [ ] **Step 2: Run tests and verify they fail**
@@ -158,11 +162,11 @@ Implement `recall_issue_types(text: str) -> set[str]` using two intentionally br
 ```python
 TOOLBAR_OBJECTS = ("工具栏", "悬浮栏", "悬浮窗", "浮窗", "状态栏", "输入法框", "输入栏")
 POSITION_SIGNALS = ("位置", "左下", "右上", "乱跑", "跑到", "错位", "漂", "重置", "固定", "多屏", "双屏", "跨屏")
-GAME_SIGNALS = ("游戏", "打游戏", "LOL", "英雄联盟", "原神", "CS2", "Steam")
-VISIBILITY_SIGNALS = ("全屏", "隐藏", "置顶", "挡", "遮", "误触", "关不掉", "一直显示")
+FULLSCREEN_CONTEXTS = ("游戏", "打游戏", "LOL", "英雄联盟", "原神", "CS2", "Steam", "视频", "看视频", "播放", "播放器", "观影", "直播")
+VISIBILITY_SIGNALS = ("全屏", "无边框", "独占", "隐藏", "置顶", "挡", "遮", "误触", "关不掉", "一直显示")
 ```
 
-Recall issue 1 when a toolbar object and position signal co-occur. Recall issue 2 when a game signal and visibility signal co-occur. Retain the union so semantic classification can remove false positives.
+Recall issue 1 when a toolbar object and position signal co-occur. Recall issue 2 when a video/game context and visibility or full-screen-mode signal co-occur. Retain the union so semantic classification can remove false positives.
 
 - [ ] **Step 4: Add 30-minute user context and batched semantic classification**
 
@@ -172,17 +176,17 @@ Query candidates with exact platform and time bounds. For each candidate, attach
 {"results":[{"feedback_id":"id","matched":true,"issue_type":"工具栏位置错乱","confidence":0.97,"reason":"工具栏在双屏切换后跑到左下角"}]}
 ```
 
-The prompt must explicitly reject position-setting questions without abnormal movement and all non-game full-screen scenarios. Append each parsed result to `classified.jsonl` immediately so reruns skip completed IDs.
+The prompt must explicitly reject position-setting questions without abnormal movement and ordinary always-on-top behavior without a video or game full-screen context. It must accept video, live-stream, and game contexts in normal, borderless-window, or exclusive full-screen modes. Append each parsed result to `classified.jsonl` immediately so reruns skip completed IDs.
 
 - [ ] **Step 5: Run classification and verify invariants**
 
 Run: `python3 feedback_hub/data/win_toolbar_feedback_20260716/run_export.py classify`
 
-Expected: every candidate ID has exactly one valid classification record; matched records use only `工具栏位置错乱` or `游戏全屏不隐藏`.
+Expected: every candidate ID has exactly one valid classification record; matched records use only `工具栏位置错乱` or `视频或游戏全屏不隐藏`.
 
 - [ ] **Step 6: Review boundary samples**
 
-Export deterministic samples of high-confidence matches, low-confidence matches, and rejects containing `视频`, `直播`, or position-setting questions. Correct only demonstrable classification errors through a recorded `review_overrides.jsonl` keyed by `feedback_id`; never edit source text.
+Export deterministic samples of high-confidence matches, low-confidence matches, and rejects containing ordinary window behavior or position-setting questions. Include accepted samples for video, games, borderless-window full-screen, and exclusive full-screen. Correct only demonstrable classification errors through a recorded `review_overrides.jsonl` keyed by `feedback_id`; never edit source text.
 
 ### Task 3: Generate and verify the Excel deliverable
 
