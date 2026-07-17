@@ -15,6 +15,7 @@ feedback_hub/data/
 
 # Local tooling / generated artifacts
 .superpowers/
+.worktrees/
 .vite/
 .workbuddy/
 dashboard/dist/
