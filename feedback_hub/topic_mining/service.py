@@ -159,11 +159,11 @@ def _run_pipeline(
         manifest["unresolved_parser_items"] = int(stats.get("failed", 0))
         # Classification can safely pause; it must never publish review_ready.
         if stats.get("run_status") == "paused_quota_exhausted":
-            _checkpoint(run_id, store, artifact_dir, manifest, "classify", [audit_path])
+            _checkpoint_attempt(run_id, store, artifact_dir, manifest, "classify", [audit_path])
             _set_status(run_id, store, "paused_quota_exhausted", stage="classify")
             return
         if manifest["unresolved_classifier_items"] or manifest["unresolved_parser_items"]:
-            _checkpoint(run_id, store, artifact_dir, manifest, "classify", [audit_path])
+            _checkpoint_attempt(run_id, store, artifact_dir, manifest, "classify", [audit_path])
             raise ValueError("unresolved_classifier_items")
         _checkpoint(run_id, store, artifact_dir, manifest, "classify", [classified_path, audit_path])
         classifications_rebuilt = True
@@ -183,6 +183,9 @@ def _run_pipeline(
     # separately requested verify step is required before data leaves the run.
     manifest.setdefault("unresolved_classifier_items", 0)
     manifest.setdefault("unresolved_parser_items", 0)
+    for key in _UNRESOLVED_KEYS:
+        manifest.setdefault(key, 0)
+    _atomic_json(artifact_dir / "review_ready.json", {"classification_count": len(classifications), "queue_count": len(_read_jsonl(queue_path))})
     _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [queue_path, overrides_path])
     _set_status(run_id, store, "review_ready", stage="review_ready")
 
@@ -195,14 +198,20 @@ def submit_review_overrides(
 ) -> list[dict[str, Any]]:
     store = store or default_store()
     run = _require_run(run_id, store)
+    if run["status"] != "review_ready":
+        raise RunVerificationError("run_not_review_ready")
     artifact_dir = Path(run["artifact_dir"])
-    classifications = [_classification_from_dict(row) for row in _read_jsonl(artifact_dir / "classified.jsonl")]
+    manifest = _load_manifest(run, artifact_dir)
+    _verify_manifest(manifest, artifact_dir)
+    _require_artifact(manifest, artifact_dir / "classified.jsonl")
+    _require_artifact(manifest, artifact_dir / "review_queue.jsonl")
+    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl")]
     spec = validate_topic_spec(json.loads(run["spec_json"]))
     # Validate before touching the persistent file. It is intentionally only a
     # decision layer; source text/evidence never comes from client input.
     apply_review_overrides(classifications, overrides, allowed_labels={entry["id"] for entry in spec.classification_labels})
     _write_jsonl(artifact_dir / "review_overrides.jsonl", [dict(row) for row in overrides])
-    manifest = _load_manifest(run, artifact_dir)
+    _invalidate_export_artifacts(manifest, artifact_dir)
     _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [artifact_dir / "review_overrides.jsonl"])
     return [dict(row) for row in overrides]
 
@@ -314,8 +323,15 @@ def _item_in_scope(item: Mapping[str, Any], spec: TopicSpec) -> bool:
 def _valid_source_url(value: Any) -> bool:
     if not isinstance(value, str) or not value or any(character.isspace() for character in value):
         return False
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc and parsed.hostname)
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname or parsed.username is not None:
+        return False
+    # Accessing ``port`` above validates malformed values such as ``:bad``.
+    return port is None or 0 < port <= 65535
 
 
 def _context_texts(contexts: Mapping[str, Any], item_id: str) -> list[str]:
@@ -326,6 +342,13 @@ def _context_texts(contexts: Mapping[str, Any], item_id: str) -> list[str]:
 
 
 def _verify_manifest(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
+    mirror = artifact_dir / "manifest.json"
+    try:
+        mirror_value = json.loads(mirror.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunVerificationError("manifest_hash_reconciliation") from exc
+    if mirror_value != manifest:
+        raise RunVerificationError("manifest_hash_reconciliation")
     artifacts = manifest.get("artifacts", {})
     if not isinstance(artifacts, Mapping):
         raise RunVerificationError("manifest_hash_reconciliation")
@@ -350,6 +373,9 @@ def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> Non
         record = stages.get(stage)
         if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
             raise RunVerificationError("manifest_stage_chain")
+        expected_inputs, expected_outputs = _stage_contract_names(stage, artifact_dir)
+        if set(record["inputs"]) != expected_inputs or set(record["outputs"]) != expected_outputs:
+            raise RunVerificationError("manifest_stage_chain")
         for name, expected in {**record["inputs"], **record["outputs"]}.items():
             path = artifact_dir / str(name)
             if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
@@ -362,20 +388,34 @@ def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest:
         if not path.is_file():
             continue
         artifacts[path.name] = _sha256(path)
-    previous_outputs: dict[str, str] = {}
-    if stage != "snapshot":
-        previous_stage = _STAGES[_STAGES.index(stage) - 1] if stage in _STAGES else "review_ready"
-        previous = manifest.setdefault("stages", {}).get(previous_stage, {})
-        if isinstance(previous, Mapping):
-            previous_outputs = dict(previous.get("outputs", {}))
-    outputs = {path.name: _sha256(path) for path in files if path.is_file()}
+    if stage not in _STAGES:
+        manifest["stage"] = stage
+        _atomic_json(artifact_dir / "manifest.json", manifest)
+        store.update_manifest(run_id, manifest, stage=stage)
+        return
+    input_names, output_names = _stage_contract_names(stage, artifact_dir)
+    inputs = {name: _sha256(artifact_dir / name) for name in input_names}
+    outputs = {name: _sha256(artifact_dir / name) for name in output_names}
+    funnel = manifest.setdefault("funnel", {})
+    output_count = _stage_output_count(stage, artifact_dir, manifest)
     manifest.setdefault("stages", {})[stage] = {
-        "inputs": previous_outputs,
+        "inputs": inputs,
         "outputs": outputs,
-        "input_count": int(manifest.get("funnel", {}).get("input_count", 0)),
-        "output_count": int(manifest.get("funnel", {}).get(stage + "_count", len(outputs))),
+        "input_count": int(funnel.get(_STAGES[_STAGES.index(stage) - 1] + "_count", 0)) if stage in _STAGES and stage != "snapshot" else 0,
+        "output_count": output_count,
     }
+    funnel[stage + "_count"] = output_count
     manifest["manifest_version"] = _MANIFEST_VERSION
+    manifest["stage"] = stage
+    _atomic_json(artifact_dir / "manifest.json", manifest)
+    store.update_manifest(run_id, manifest, stage=stage)
+
+
+def _checkpoint_attempt(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
+    artifacts = manifest.setdefault("artifacts", {})
+    for path in files:
+        if path.is_file():
+            artifacts[path.name] = _sha256(path)
     manifest["stage"] = stage
     _atomic_json(artifact_dir / "manifest.json", manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -389,14 +429,9 @@ def _load_manifest(run: Mapping[str, Any], artifact_dir: Path) -> dict[str, Any]
         manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
-    disk = artifact_dir / "manifest.json"
-    if disk.exists():
-        try:
-            disk_value = _read_json(disk, {})
-            if isinstance(disk_value, dict):
-                manifest = disk_value
-        except ValueError:
-            pass
+    # The database record is the durable trust anchor.  The on-disk manifest is
+    # only a mirror checked by verification/export/download; it must never be
+    # allowed to replace a persisted record after a partial write or tampering.
     return manifest
 
 
@@ -409,6 +444,9 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
     record = manifest.get("stages", {}).get(stage) if isinstance(manifest.get("stages"), Mapping) else None
     if not isinstance(record, Mapping):
         return False
+    expected_inputs, expected_outputs = _stage_contract_names(stage, artifact_dir)
+    if set(record.get("inputs", {})) != expected_inputs or set(record.get("outputs", {})) != expected_outputs:
+        return False
     for section in ("inputs", "outputs"):
         values = record.get(section)
         if not isinstance(values, Mapping):
@@ -420,22 +458,83 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
     return True
 
 
+def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set[str]]:
+    contracts = {
+        "snapshot": (set(), {"source_snapshot.sqlite"}),
+        "hard_scope": ({"source_snapshot.sqlite"}, {"scoped_items.jsonl", "item_contexts.json"}),
+        "hybrid_recall": ({"scoped_items.jsonl", "item_contexts.json"}, {"recall_candidates.jsonl", "recall_manifest.json"}),
+        "classify": ({"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}, {"classified.jsonl", "classification_audit.jsonl"}),
+        "review_queue": ({"classified.jsonl", "recall_candidates.jsonl", "classification_audit.jsonl"}, {"review_queue.jsonl", "review_overrides.jsonl"}),
+        "review_ready": ({"review_queue.jsonl", "review_overrides.jsonl"}, {"review_ready.json"}),
+    }
+    inputs, outputs = contracts[stage]
+    if stage == "classify":
+        for name in ("classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl", "classification_batches.jsonl.failures.jsonl", "classification_batches.jsonl.run_state.json"):
+            if (artifact_dir / name).is_file():
+                outputs.add(name)
+    return set(inputs), set(outputs)
+
+
+def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, Any]) -> int:
+    if stage == "snapshot":
+        return int((manifest.get("source_snapshot") or {}).get("row_count", 0))
+    if stage == "hard_scope":
+        return len(_read_jsonl(artifact_dir / "scoped_items.jsonl"))
+    if stage == "hybrid_recall":
+        return len(_read_jsonl(artifact_dir / "recall_candidates.jsonl"))
+    if stage == "classify":
+        return len(_read_jsonl(artifact_dir / "classified.jsonl"))
+    if stage == "review_queue":
+        return len(_read_jsonl(artifact_dir / "review_queue.jsonl"))
+    if stage == "review_ready":
+        return len(_read_jsonl(artifact_dir / "classified.jsonl"))
+    return len(_read_jsonl(artifact_dir / "final_reviewed.jsonl"))
+
+
 def _read_required_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        raise RunVerificationError("missing_artifact")
+    raw = _read_verified_bytes_from_path(path)
     try:
-        return _read_jsonl(path)
+        values = []
+        for line in raw.decode("utf-8").splitlines():
+            if line.strip():
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError("not object")
+                values.append(value)
+        return values
     except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
 
 
 def _read_required_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise RunVerificationError("missing_artifact")
-    value = _read_json(path, None)
+    try:
+        value = json.loads(_read_verified_bytes_from_path(path).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
     if not isinstance(value, dict):
         raise RunVerificationError("invalid_artifact")
     return value
+
+
+def read_verified_artifact_bytes(manifest: Mapping[str, Any], path: Path) -> bytes:
+    """Read once and validate those exact bytes against the DB manifest."""
+    expected = manifest.get("artifacts", {}).get(path.name) if isinstance(manifest.get("artifacts"), Mapping) else None
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RunVerificationError("manifest_hash_reconciliation") from exc
+    if not isinstance(expected, str) or hashlib.sha256(raw).hexdigest() != expected:
+        raise RunVerificationError("manifest_hash_reconciliation")
+    return raw
+
+
+def _read_verified_bytes_from_path(path: Path) -> bytes:
+    # Callers already used _require_artifact / manifest validation. The helper
+    # still reads once; it is retained for internal parse error normalization.
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise RunVerificationError("missing_artifact") from exc
 
 
 def _invalidate_export_artifacts(manifest: dict[str, Any], artifact_dir: Path) -> None:

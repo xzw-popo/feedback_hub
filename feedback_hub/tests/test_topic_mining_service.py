@@ -44,6 +44,16 @@ def test_verify_gate_rejects_pending_even_with_empty_artifacts(tmp_path):
         verify_topic_run(run["run_id"], store=store)
 
 
+def test_db_manifest_remains_trust_anchor_when_disk_mirror_is_tampered(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    artifact_dir = tmp_path / "runs" / run["run_id"]
+    (artifact_dir / "manifest.json").write_text('{"artifacts": {"final_reviewed.jsonl": "forged"}}', encoding="utf-8")
+    store.update_status(run["run_id"], "review_ready", stage="review_ready")
+    with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
+        verify_topic_run(run["run_id"], store=store)
+
+
 def test_verify_rejects_duplicate_and_missing_link(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)

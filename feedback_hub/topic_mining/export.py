@@ -10,7 +10,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _checkpoint, _load_manifest, _read_required_jsonl, _require_artifact, _require_run, _validate_final_rows, _write_jsonl
+from .service import RunVerificationError, _checkpoint, _load_manifest, _require_run, _validate_final_rows, _write_jsonl, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
 
 
@@ -30,8 +30,10 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     spec = validate_topic_spec(json.loads(run["spec_json"]))
     final_path = artifact_dir / "final_reviewed.jsonl"
     manifest = _load_manifest(run, artifact_dir)
-    _require_artifact(manifest, final_path)
-    rows = _read_required_jsonl(final_path)
+    try:
+        rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
     rows = [{**row, "run_id": row.get("run_id", run_id)} for row in rows]
     _validate_final_rows(rows, spec)
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))

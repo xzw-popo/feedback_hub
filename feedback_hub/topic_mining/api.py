@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import sqlite3
 import threading
@@ -11,14 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from .config import TopicMiningConfig
 from .contracts import validate_topic_spec
 from .export import export_topic_run
 from .run_store import TopicRunStore
 from .service import (
-    RunVerificationError, _artifact_valid, default_store, get_topic_run, run_topic_job,
+    RunVerificationError, _artifact_valid, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
@@ -85,8 +86,9 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         run = _get_or_404(run_id, store)
         path = Path(run["artifact_dir"]) / "review_queue.jsonl"
         try:
-            return {"run_id": run_id, "items": _read_jsonl(path)}
-        except ValueError as exc:
+            raw = read_verified_artifact_bytes(_manifest(run), path)
+            return {"run_id": run_id, "items": _parse_jsonl_bytes(raw)}
+        except (ValueError, RunVerificationError) as exc:
             raise HTTPException(status_code=409, detail=_redact(str(exc), config)) from None
 
     @router.post("/runs/{run_id}/overrides", dependencies=[Depends(require_token)])
@@ -131,9 +133,11 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         path = Path(run["artifact_dir"]) / artifact_name
         if not path.is_file():
             raise HTTPException(status_code=404, detail="topic artifact not found")
-        if not _artifact_valid(manifest, path):
-            raise HTTPException(status_code=409, detail="topic artifact hash mismatch")
-        return FileResponse(path, filename=artifact_name)
+        try:
+            raw = read_verified_artifact_bytes(manifest, path)
+        except RunVerificationError:
+            raise HTTPException(status_code=409, detail="topic artifact hash mismatch") from None
+        return Response(content=raw, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{artifact_name}"'})
 
     return router
 
@@ -207,6 +211,25 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         raise ValueError("invalid review queue artifact") from exc
     if any(not isinstance(value, dict) for value in values):
         raise ValueError("invalid review queue artifact")
+    return values
+
+
+def _parse_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
+    try:
+        return _read_jsonl_bytes(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid review queue artifact") from exc
+
+
+def _read_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
+    values = []
+    for line in raw.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError("invalid review queue artifact")
+        values.append(value)
     return values
 
 

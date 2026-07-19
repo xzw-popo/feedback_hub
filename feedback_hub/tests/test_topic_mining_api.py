@@ -77,3 +77,14 @@ def test_invalid_spec_and_export_format_are_422(tmp_path):
     run = store.create_or_get(validate_topic_spec(_spec()), 123)
     app = FastAPI(); app.include_router(make_router(config=config, store=store))
     assert TestClient(app).post(f"/api/topic-mining/runs/{run['run_id']}/export", json={"format": "csv"}).status_code == 422
+
+
+def test_review_queue_malformed_or_tampered_is_conflict(tmp_path):
+    config = TopicMiningConfig(data_dir=tmp_path / "data")
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    path = config.data_dir / "runs" / run["run_id"] / "review_queue.jsonl"
+    path.write_text("not-json\n", encoding="utf-8")
+    store.update_manifest(run["run_id"], {"artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()}}, stage="review_ready", status="review_ready")
+    app = FastAPI(); app.include_router(make_router(config=config, store=store))
+    assert TestClient(app).get(f"/api/topic-mining/runs/{run['run_id']}/review-queue").status_code == 409
