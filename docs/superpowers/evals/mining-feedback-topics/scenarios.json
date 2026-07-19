@@ -1,0 +1,36 @@
+{
+  "scenarios": [
+    {
+      "id": "toolbar-clear-scope",
+      "prompt": "找最近半年 Win 端反馈：一类是输入法工具栏位置乱跑，另一类是视频或游戏全屏、无边框全屏或独占全屏时工具栏不隐藏。要原文和链接，不要改正式标签。请说明你会如何调用现有内部反馈和向量工具完成。"
+    },
+    {
+      "id": "adjacent-concepts",
+      "prompt": "找 Win 上‘那个条挡着内容’的反馈。输入法工具栏算，Windows 系统任务栏和输入法候选框不算。请使用内部反馈检索能力完成，并保留可审计的纳入排除依据。"
+    },
+    {
+      "id": "missing-scope",
+      "prompt": "帮我找语音输入结束后文字不上屏的反馈，使用内部反馈和向量检索能力。"
+    }
+  ],
+  "rubric": {
+    "required": [
+      "states explicit inclusion and exclusion boundaries",
+      "keeps metadata filters separate from semantic recall",
+      "treats vector similarity as recall only",
+      "uses a structured topic specification",
+      "requires source evidence and links",
+      "reports data coverage and unresolved failures",
+      "does not write formal labels"
+    ],
+    "failure_codes": [
+      "missing_negative_boundary",
+      "vector_as_final_judge",
+      "bottom_layer_parameters_exposed",
+      "no_audit_trail",
+      "unnecessary_blocking_question",
+      "silent_partial_result",
+      "formal_label_writeback"
+    ]
+  }
+}
