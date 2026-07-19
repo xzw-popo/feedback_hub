@@ -405,9 +405,11 @@ def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest:
     manifest.setdefault("stages", {})[stage] = {
         "inputs": inputs,
         "outputs": outputs,
-        "input_count": int(funnel.get(_STAGES[_STAGES.index(stage) - 1] + "_count", 0)) if stage in _STAGES and stage != "snapshot" else 0,
+        "input_count": _stage_input_count(stage, artifact_dir),
         "output_count": output_count,
     }
+    if stage == "classify":
+        manifest.get("stage_attempts", {}).pop("classify", None)
     funnel[stage + "_count"] = output_count
     manifest["manifest_version"] = _MANIFEST_VERSION
     manifest["stage"] = stage
@@ -420,6 +422,8 @@ def _checkpoint_attempt(run_id: str, store: TopicRunStore, artifact_dir: Path, m
     for path in files:
         if path.is_file():
             artifacts[path.name] = _sha256(path)
+    inputs, _ = _stage_contract_names(stage, artifact_dir)
+    manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": {path.name: _sha256(path) for path in files if path.is_file()}, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
     manifest["stage"] = stage
     _atomic_json(artifact_dir / "manifest.json", manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -461,12 +465,15 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
                 return False
     if int(record.get("output_count", -1)) != _stage_output_count(stage, artifact_dir, manifest):
         return False
+    if int(record.get("input_count", -1)) != _stage_input_count(stage, artifact_dir):
+        return False
     return True
 
 
 def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path) -> bool:
     """Only reuse scheduler checkpoints when the exact classifier inputs match."""
-    record = manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None
+    attempts = manifest.get("stage_attempts", {}) if isinstance(manifest.get("stage_attempts"), Mapping) else {}
+    record = attempts.get("classify") or (manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None)
     if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
         return False
     required_inputs = {"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}
@@ -531,6 +538,15 @@ def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, A
     if stage == "review_ready":
         return len(_read_jsonl(artifact_dir / "classified.jsonl"))
     return len(_read_jsonl(artifact_dir / "final_reviewed.jsonl"))
+
+
+def _stage_input_count(stage: str, artifact_dir: Path) -> int:
+    if stage == "snapshot":
+        import sqlite3
+        with sqlite3.connect(f"file:{(artifact_dir / 'source_snapshot.sqlite').resolve()}?mode=ro", uri=True) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+    previous = _STAGES[_STAGES.index(stage) - 1]
+    return _stage_output_count(previous, artifact_dir, {})
 
 
 def _read_required_jsonl(path: Path, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
