@@ -57,6 +57,10 @@ class TopicRunStore:
         spec_hash = topic_spec_hash(spec)
         run_id = hashlib.sha256(f"{spec_hash}:{source_watermark_ms}".encode("utf-8")).hexdigest()[:16]
         artifact_dir = self.artifacts_dir / run_id
+        # An artifact directory is part of a usable run.  Create (or repair) it
+        # before publishing the database row, so workers never see a run that
+        # cannot write its isolated outputs.
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         now_ms = int(time.time() * 1000)
         record = {
             "run_id": run_id,
@@ -91,8 +95,6 @@ class TopicRunStore:
             ).fetchone()
         if row is None:  # pragma: no cover - defensive safeguard for damaged stores
             raise RuntimeError("topic run disappeared during creation")
-        if created:
-            artifact_dir.mkdir(parents=True, exist_ok=True)
         result = dict(row)
         result["created"] = created
         return result

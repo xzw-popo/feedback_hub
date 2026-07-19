@@ -8,6 +8,7 @@ from feedback_hub import db
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.source import (
     DataCoverageError,
+    UnsupportedSourceFilterError,
     build_item_contexts,
     create_source_snapshot,
     fetch_scoped_items,
@@ -131,3 +132,13 @@ def test_missing_source_date_range_raises_before_retrieval(source_db, valid_topi
         fetch_scoped_items(source_db, uncovered)
 
     assert error.value.start_ms < error.value.source_min_ms
+
+
+def test_non_wetype_product_scope_is_rejected_before_source_retrieval(tmp_path, valid_topic_spec):
+    unsupported = validate_topic_spec({
+        **valid_topic_spec.to_dict(),
+        "scope": {**valid_topic_spec.to_dict()["scope"], "products": ["另一款产品"]},
+    })
+
+    with pytest.raises(UnsupportedSourceFilterError, match="微信输入法"):
+        fetch_scoped_items(tmp_path / "not-opened.db", unsupported)

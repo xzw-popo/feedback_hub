@@ -36,6 +36,22 @@ class DataCoverageError(ValueError):
         )
 
 
+class UnsupportedSourceFilterError(ValueError):
+    """Raised when a requested scope cannot be represented by this source."""
+
+
+_FIXED_SOURCE_PRODUCT = "微信输入法"
+
+
+def _validate_source_filters(spec: TopicSpec) -> None:
+    unsupported_products = set(spec.scope.products) - {_FIXED_SOURCE_PRODUCT}
+    if unsupported_products:
+        requested = ", ".join(sorted(unsupported_products))
+        raise UnsupportedSourceFilterError(
+            f"source database is fixed to {_FIXED_SOURCE_PRODUCT}; unsupported products: {requested}"
+        )
+
+
 def _readonly_connection(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True)
 
@@ -125,6 +141,7 @@ def _item(row: sqlite3.Row) -> dict[str, Any]:
 
 def fetch_scoped_items(source_path: Path, spec: TopicSpec) -> list[dict[str, Any]]:
     """Read source items only through SQLite URI read-only mode."""
+    _validate_source_filters(spec)
     with _readonly_connection(Path(source_path)) as connection:
         rows = _filtered_rows(connection, spec)
     if spec.unit == "feedback":
