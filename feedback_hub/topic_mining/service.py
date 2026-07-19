@@ -423,7 +423,9 @@ def _checkpoint_attempt(run_id: str, store: TopicRunStore, artifact_dir: Path, m
         if path.is_file():
             artifacts[path.name] = _sha256(path)
     inputs, _ = _stage_contract_names(stage, artifact_dir)
-    manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": {path.name: _sha256(path) for path in files if path.is_file()}, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
+    names = ("classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl", "classification_batches.jsonl.run_state.json", "classification_batches.jsonl.failures.jsonl", "classification_audit.jsonl", "classified.jsonl")
+    outputs = {name: _sha256(artifact_dir / name) for name in names if (artifact_dir / name).is_file()}
+    manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": outputs, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
     manifest["stage"] = stage
     _atomic_json(artifact_dir / "manifest.json", manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -682,12 +684,16 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     values: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise RunVerificationError("invalid_artifact")
-            values.append(value)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            if line.strip():
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise RunVerificationError("invalid_artifact")
+                values.append(value)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
     return values
 
 
