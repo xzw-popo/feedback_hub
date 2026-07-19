@@ -60,7 +60,8 @@ def test_manifest_allowlists_artifacts_and_export_blocks_unverified(tmp_path):
     run = store.create_or_get(validate_topic_spec(_spec()), 123)
     artifact = tmp_path / "data" / "runs" / run["run_id"] / "safe.jsonl"
     artifact.write_text("{}\n", encoding="utf-8")
-    store.update_manifest(run["run_id"], {"artifacts": {"safe.jsonl": hashlib.sha256(artifact.read_bytes()).hexdigest()}}, stage="review_ready")
+    manifest = {"artifacts": {"safe.jsonl": hashlib.sha256(artifact.read_bytes()).hexdigest()}}
+    store.update_manifest(run["run_id"], manifest, stage="review_ready"); (artifact.parent / "manifest.json").write_text(__import__("json").dumps(manifest), encoding="utf-8")
     app = FastAPI()
     app.include_router(make_router(config=config, store=store))
     client = TestClient(app)

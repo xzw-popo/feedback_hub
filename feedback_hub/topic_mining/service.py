@@ -147,13 +147,15 @@ def _run_pipeline(
     audit_path = artifact_dir / "classification_audit.jsonl"
     classifications_rebuilt = False
     if not _stage_valid(manifest, "classify", artifact_dir):
+        resume_classification = _classification_resume_safe(manifest, artifact_dir)
+        if not resume_classification:
+            _purge_classification_checkpoints(artifact_dir)
         results, stats = classify_candidates(
             spec, recalls, artifact_dir=artifact_dir, contexts=contexts, routes=classifier_routes,
-            config=config, resume=True, call_fn=classifier_call_fn,
+            config=config, resume=resume_classification, call_fn=classifier_call_fn,
         )
         manifest["classifier"] = _safe_json(stats)
-        manifest["classifier"]["models"] = sorted({str(route.model) for route in (classifier_routes or []) if getattr(route, "model", "")})
-        manifest["classifier"]["retry_total"] = int(stats.get("attempts", 0))
+        manifest["classifier"].update(_classification_quality(audit_path))
         manifest["funnel"] = {"hard_scope_count": len(items), "candidate_count": len(recalls), "classified_count": len(results)}
         manifest["unresolved_classifier_items"] = max(0, len(recalls) - len(results))
         manifest["unresolved_parser_items"] = int(stats.get("failed", 0))
@@ -205,7 +207,7 @@ def submit_review_overrides(
     _verify_manifest(manifest, artifact_dir)
     _require_artifact(manifest, artifact_dir / "classified.jsonl")
     _require_artifact(manifest, artifact_dir / "review_queue.jsonl")
-    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl")]
+    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl", manifest)]
     spec = validate_topic_spec(json.loads(run["spec_json"]))
     # Validate before touching the persistent file. It is intentionally only a
     # decision layer; source text/evidence never comes from client input.
@@ -235,9 +237,9 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     recall_path, classified_path, contexts_path, overrides_path = (artifact_dir / "recall_candidates.jsonl", artifact_dir / "classified.jsonl", artifact_dir / "item_contexts.json", artifact_dir / "review_overrides.jsonl")
     for path in (recall_path, classified_path, contexts_path, overrides_path):
         _require_artifact(manifest, path)
-    recalls = [_recall_from_dict(row) for row in _read_required_jsonl(recall_path)]
-    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(classified_path)]
-    contexts = _read_required_json(contexts_path)
+    recalls = [_recall_from_dict(row) for row in _read_required_jsonl(recall_path, manifest)]
+    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(classified_path, manifest)]
+    contexts = _read_required_json(contexts_path, manifest)
     expected = {hit.item_id for hit in recalls}
     actual = [row.item_id for row in classifications]
     if len(actual) != len(set(actual)):
@@ -260,7 +262,7 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
             raise RunVerificationError("invalid_evidence")
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
-    overrides = _read_required_jsonl(overrides_path)
+    overrides = _read_required_jsonl(overrides_path, manifest)
     merged = apply_review_overrides(classifications, overrides, allowed_labels=allowed)
     final_rows = [_final_row(result, by_id[result.item_id], run_id, _context_texts(contexts, result.item_id)) for result in merged if result.label == "matched"]
     _validate_final_rows(final_rows, spec, contexts=contexts)
@@ -380,6 +382,8 @@ def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> Non
             path = artifact_dir / str(name)
             if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
                 raise RunVerificationError("manifest_stage_chain")
+        if int(record.get("output_count", -1)) != _stage_output_count(stage, artifact_dir, manifest):
+            raise RunVerificationError("manifest_stage_chain")
 
 
 def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
@@ -455,7 +459,45 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
             path = artifact_dir / str(name)
             if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
                 return False
+    if int(record.get("output_count", -1)) != _stage_output_count(stage, artifact_dir, manifest):
+        return False
     return True
+
+
+def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path) -> bool:
+    """Only reuse scheduler checkpoints when the exact classifier inputs match."""
+    record = manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None
+    if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
+        return False
+    required_inputs = {"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}
+    if set(record["inputs"]) != required_inputs:
+        return False
+    for name, expected in record["inputs"].items():
+        path = artifact_dir / name
+        if not path.is_file() or _sha256(path) != expected:
+            return False
+    # classified can be absent: scheduler checkpoint may safely reconstruct it.
+    for name, expected in record["outputs"].items():
+        if name == "classified.jsonl":
+            continue
+        path = artifact_dir / name
+        if not path.is_file() or _sha256(path) != expected:
+            return False
+    return True
+
+
+def _purge_classification_checkpoints(artifact_dir: Path) -> None:
+    for name in (
+        "classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl",
+        "classification_batches.jsonl.failures.jsonl", "classification_batches.jsonl.run_state.json",
+        "classification_audit.jsonl", "classified.jsonl",
+    ):
+        (artifact_dir / name).unlink(missing_ok=True)
+    partial = artifact_dir / "classification_partial_audit"
+    if partial.is_dir():
+        for child in partial.iterdir():
+            child.unlink(missing_ok=True)
+        partial.rmdir()
 
 
 def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set[str]]:
@@ -491,8 +533,8 @@ def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, A
     return len(_read_jsonl(artifact_dir / "final_reviewed.jsonl"))
 
 
-def _read_required_jsonl(path: Path) -> list[dict[str, Any]]:
-    raw = _read_verified_bytes_from_path(path)
+def _read_required_jsonl(path: Path, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    raw = read_verified_artifact_bytes(manifest, path) if manifest is not None else _read_verified_bytes_from_path(path)
     try:
         values = []
         for line in raw.decode("utf-8").splitlines():
@@ -506,9 +548,10 @@ def _read_required_jsonl(path: Path) -> list[dict[str, Any]]:
         raise RunVerificationError("invalid_artifact") from exc
 
 
-def _read_required_json(path: Path) -> dict[str, Any]:
+def _read_required_json(path: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
     try:
-        value = json.loads(_read_verified_bytes_from_path(path).decode("utf-8"))
+        raw = read_verified_artifact_bytes(manifest, path) if manifest is not None else _read_verified_bytes_from_path(path)
+        value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
     if not isinstance(value, dict):
@@ -558,6 +601,14 @@ def _record_failure(run_id: str, store: TopicRunStore, exc: Exception, config: T
         code = "classifier_unresolved"
     else:
         code = "topic_run_error"
+    run = _require_run(run_id, store)
+    manifest = _load_manifest(run, Path(run["artifact_dir"]))
+    if code == "data_coverage_error":
+        manifest["unresolved_coverage_items"] = 1
+    if code == "vector_index_stale":
+        manifest["unresolved_vector_items"] = 1
+    _atomic_json(Path(run["artifact_dir"]) / "manifest.json", manifest)
+    store.update_manifest(run_id, manifest, stage=run["stage"])
     _set_status(run_id, store, "failed", error_code=code, error_message=_redact_message(str(exc), config))
 
 
@@ -578,20 +629,30 @@ def _require_run(run_id: str, store: TopicRunStore) -> dict[str, Any]:
 
 
 def _recall_from_dict(value: Mapping[str, Any]) -> RecallHit:
-    return RecallHit(
-        item_id=str(value["item_id"]), item=dict(value["item"]), channels=tuple(value.get("channels", [])),
-        fused_score=float(value.get("fused_score", 0)), fused_rank=int(value.get("fused_rank", 0)),
-        channel_ranks=dict(value.get("channel_ranks", {})), raw_scores=dict(value.get("raw_scores", {})),
-        query_ids=tuple(value.get("query_ids", [])), negative_query_hits=tuple(value.get("negative_query_hits", [])),
-    )
+    try:
+        if not isinstance(value, Mapping) or not isinstance(value["item"], Mapping):
+            raise TypeError("invalid recall")
+        return RecallHit(
+            item_id=str(value["item_id"]), item=dict(value["item"]), channels=tuple(value.get("channels", [])),
+            fused_score=float(value.get("fused_score", 0)), fused_rank=int(value.get("fused_rank", 0)),
+            channel_ranks=dict(value.get("channel_ranks", {})), raw_scores=dict(value.get("raw_scores", {})),
+            query_ids=tuple(value.get("query_ids", [])), negative_query_hits=tuple(value.get("negative_query_hits", [])),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
 
 
 def _classification_from_dict(value: Mapping[str, Any]) -> ClassificationResult:
-    return ClassificationResult(
-        item_id=str(value["item_id"]), label=str(value["label"]), confidence=float(value["confidence"]),
-        evidence=tuple(value.get("evidence", [])), reason=str(value["reason"]), needs_review=bool(value.get("needs_review", False)),
-        source=str(value.get("source", "classifier")),
-    )
+    try:
+        if not isinstance(value, Mapping) or not isinstance(value.get("reason"), str):
+            raise TypeError("invalid classification")
+        return ClassificationResult(
+            item_id=str(value["item_id"]), label=str(value["label"]), confidence=float(value["confidence"]),
+            evidence=tuple(value.get("evidence", [])), reason=value["reason"], needs_review=bool(value.get("needs_review", False)),
+            source=str(value.get("source", "classifier")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
 
 
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -649,6 +710,20 @@ def _safe_config(config: TopicMiningConfig) -> dict[str, Any]:
 
 def _safe_json(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _classification_quality(audit_path: Path) -> dict[str, Any]:
+    routes: set[str] = set()
+    models: set[str] = set()
+    attempts = retries = 0
+    for row in _read_jsonl(audit_path):
+        if isinstance(row.get("route_source"), str):
+            routes.add(row["route_source"])
+        if isinstance(row.get("model"), str):
+            models.add(row["model"])
+        attempts += int(row.get("attempts", 0) or 0)
+        retries += len(row.get("retry_chain", []) if isinstance(row.get("retry_chain"), list) else [])
+    return {"routes": sorted(routes), "models": sorted(models), "attempts_total": attempts, "retry_total": retries}
 
 
 def _redact_message(message: str, config: TopicMiningConfig) -> str:

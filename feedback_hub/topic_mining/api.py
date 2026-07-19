@@ -19,7 +19,7 @@ from .contracts import validate_topic_spec
 from .export import export_topic_run
 from .run_store import TopicRunStore
 from .service import (
-    RunVerificationError, _artifact_valid, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
+    RunVerificationError, _artifact_valid, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
@@ -86,7 +86,8 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         run = _get_or_404(run_id, store)
         path = Path(run["artifact_dir"]) / "review_queue.jsonl"
         try:
-            raw = read_verified_artifact_bytes(_manifest(run), path)
+            manifest = _manifest(run); _verify_manifest(manifest, Path(run["artifact_dir"]))
+            raw = read_verified_artifact_bytes(manifest, path)
             return {"run_id": run_id, "items": _parse_jsonl_bytes(raw)}
         except (ValueError, RunVerificationError) as exc:
             raise HTTPException(status_code=409, detail=_redact(str(exc), config)) from None
@@ -127,6 +128,10 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         # Resolve exclusively through the persisted manifest. Never normalize
         # or join a caller-controlled path before this allowlist lookup.
         manifest = _manifest(run)
+        try:
+            _verify_manifest(manifest, Path(run["artifact_dir"]))
+        except RunVerificationError:
+            raise HTTPException(status_code=409, detail="topic artifact hash mismatch") from None
         allowed = manifest.get("artifacts", {}) if isinstance(manifest, dict) else {}
         if artifact_name not in allowed or "/" in artifact_name or "\\" in artifact_name:
             raise HTTPException(status_code=404, detail="topic artifact not found")
@@ -172,7 +177,7 @@ def _public_run(run: dict[str, Any]) -> dict[str, Any]:
         "quality": {
             "funnel": manifest.get("funnel", {}), "source_watermark_ms": manifest.get("source_watermark_ms"),
             "vector_watermark_ms": manifest.get("vector_watermark_ms"),
-            "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items")},
+            "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items")},
             "models": classifier.get("models", []), "retry_total": classifier.get("retry_total", 0),
         },
     }

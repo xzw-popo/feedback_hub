@@ -35,7 +35,8 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     artifact_dir = tmp_path / "runs" / run["run_id"]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(_row()) + "\n", encoding="utf-8")
     store.update_status(run["run_id"], "verified", stage="verified")
-    store.update_manifest(run["run_id"], {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}, stage="verified", status="verified")
+    manifest = {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}
+    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified"); (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, read_only=False, data_only=False)
     ws = wb["反馈清单"]
@@ -55,7 +56,8 @@ def test_export_escapes_formula_like_user_text(tmp_path, text):
     row["evidence"] = [text]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     store.update_status(run["run_id"], "verified", stage="verified")
-    store.update_manifest(run["run_id"], {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}, stage="verified", status="verified")
+    manifest = {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}
+    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified"); (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, data_only=False)
     assert wb["反馈清单"]["C2"].value.startswith("'")

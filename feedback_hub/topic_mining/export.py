@@ -10,7 +10,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _checkpoint, _load_manifest, _require_run, _validate_final_rows, _write_jsonl, read_verified_artifact_bytes
+from .service import RunVerificationError, _checkpoint, _load_manifest, _require_run, _validate_final_rows, _verify_manifest, _write_jsonl, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
 
 
@@ -30,6 +30,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     spec = validate_topic_spec(json.loads(run["spec_json"]))
     final_path = artifact_dir / "final_reviewed.jsonl"
     manifest = _load_manifest(run, artifact_dir)
+    _verify_manifest(manifest, artifact_dir)
     try:
         rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
