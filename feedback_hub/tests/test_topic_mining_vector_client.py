@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import traceback
 
 import pytest
 
@@ -108,6 +109,63 @@ def test_vector_client_rejects_invalid_capabilities(config, payload):
         HttpVectorSearchClient(config, request_fn=FakeHttp([payload])).capabilities()
 
 
+@pytest.mark.parametrize("units", [
+    ["unknown"],
+    ["feedback", "feedback"],
+])
+def test_vector_client_rejects_unsupported_or_duplicate_capability_units(config, units):
+    payload = {
+        "index": "feedback-items-v1", "schema_version": 1,
+        "supported_units": units, "watermark_ts_ms": 1,
+    }
+
+    with pytest.raises(VectorResponseError):
+        HttpVectorSearchClient(config, request_fn=FakeHttp([payload])).capabilities()
+
+
+@pytest.mark.parametrize("queries", [
+    [{"id": "", "text": "valid", "kind": "positive"}],
+    [{"id": "q", "text": "", "kind": "positive"}],
+    [{"id": "q", "text": "valid", "kind": "typo"}],
+    [{"id": "q", "text": "valid", "kind": "positive"}, {"id": "q", "text": "other", "kind": "negative"}],
+])
+def test_vector_client_rejects_invalid_queries_before_transport(config, queries):
+    called = False
+
+    def request_fn(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid queries must not reach the vector service")
+
+    with pytest.raises(ValueError):
+        HttpVectorSearchClient(config, request_fn=request_fn).search(queries, {}, 1)
+
+    assert not called
+
+
+def test_vector_client_rejects_unsubmitted_or_misspelled_return_query_id(config):
+    fake_http = FakeHttp([{
+        "index": "feedback-items-v1", "watermark_ts_ms": 1,
+        "hits": [{"item_id": "a", "query_id": "positve:0", "score": 0.9, "rank": 1}],
+    }])
+
+    with pytest.raises(VectorResponseError, match="unsubmitted"):
+        HttpVectorSearchClient(config, request_fn=fake_http).search(
+            [{"id": "positive:0", "text": "valid", "kind": "positive"}], {}, 1,
+        )
+
+
+def test_vector_client_redacts_tokens_from_the_complete_exception_traceback(config):
+    def request_fn(*args, **kwargs):
+        raise RuntimeError("upstream error with top-secret-token")
+
+    with pytest.raises(VectorResponseError) as error:
+        HttpVectorSearchClient(config, request_fn=request_fn).search([], {}, 1)
+
+    formatted = "".join(traceback.format_exception(type(error.value), error.value, error.value.__traceback__))
+    assert "top-secret-token" not in formatted
+
+
 @pytest.mark.parametrize("hits", [
     [{"item_id": "a", "query_id": "positive:0", "score": 1.0, "rank": 1},
      {"item_id": "a", "query_id": "positive:0", "score": 0.5, "rank": 2}],
@@ -121,6 +179,8 @@ def test_vector_client_rejects_unsafe_search_hits_and_redacts_token(config, hits
     }])
 
     with pytest.raises(VectorResponseError) as error:
-        HttpVectorSearchClient(config, request_fn=fake_http).search([], {}, 1)
+        HttpVectorSearchClient(config, request_fn=fake_http).search(
+            [{"id": "positive:0", "text": "valid", "kind": "positive"}], {}, 1,
+        )
 
     assert "top-secret-token" not in str(error.value)

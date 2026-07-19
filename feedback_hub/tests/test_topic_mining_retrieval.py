@@ -107,6 +107,29 @@ def test_rrf_ties_break_by_item_id_and_negative_hits_do_not_score(valid_topic_sp
     assert [row.item_id for row in plan.candidates] == ["a", "z"]
     assert plan.candidates[0].negative_query_hits == ("negative:0",)
     assert plan.candidates[0].fused_score == plan.candidates[1].fused_score
+    assert [row.fused_rank for row in plan.candidates] == [1, 2]
+
+
+def test_hybrid_recall_uses_exact_spec_query_kind_for_negative_hits(valid_topic_spec):
+    plan = hybrid_recall(
+        [{"item_id": "negative-only", "text": "完全无关"}],
+        valid_topic_spec,
+        vector_hits=[VectorHit("negative-only", "negative:0", 0.99, 1)],
+        config=recall_config(),
+    )
+
+    assert plan.candidates == ()
+
+
+@pytest.mark.parametrize("query_id", ["positve:0", "negative:99"])
+def test_hybrid_recall_rejects_unknown_or_misspelled_vector_query_id(valid_topic_spec, query_id):
+    with pytest.raises(ValueError, match="unknown vector query_id"):
+        hybrid_recall(
+            [{"item_id": "v1", "text": "完全无关"}],
+            valid_topic_spec,
+            vector_hits=[VectorHit("v1", query_id, 0.82, 1)],
+            config=recall_config(),
+        )
 
 
 def test_configured_candidate_limit_and_auditable_artifacts(valid_topic_spec, tmp_path):
@@ -124,6 +147,7 @@ def test_configured_candidate_limit_and_auditable_artifacts(valid_topic_spec, tm
     rows = (tmp_path / "artifacts" / "recall_candidates.jsonl").read_text(encoding="utf-8").splitlines()
     manifest = json.loads((tmp_path / "artifacts" / "recall_manifest.json").read_text(encoding="utf-8"))
     assert json.loads(rows[0])["channel_ranks"]["positive:0"] == 1
+    assert json.loads(rows[0])["fused_rank"] == 1
     assert manifest["source_watermark_ms"] == 100
     assert manifest["vector_watermark_ms"] == 100
     assert manifest["configuration_version"] == 1

@@ -63,11 +63,11 @@ class HttpVectorSearchClient:
             return {"Authorization": f"Bearer {self.config.vector_api_token}"}
         return {}
 
-    def _raise(self, message: str, error: Exception | None = None) -> None:
+    def _raise(self, message: str) -> None:
         redacted = message.replace(self.config.vector_api_token, "[REDACTED]") if self.config.vector_api_token else message
-        if error is None:
-            raise VectorResponseError(redacted)
-        raise VectorResponseError(redacted) from error
+        # Do not preserve an upstream exception as __cause__/__context__: it may
+        # contain credentials even after the human-readable message is redacted.
+        raise VectorResponseError(redacted) from None
 
     def _request_json(self, method: str, path: str, **kwargs: Any) -> Mapping[str, Any]:
         try:
@@ -81,7 +81,7 @@ class HttpVectorSearchClient:
             response.raise_for_status()
             payload = response.json()
         except Exception as error:  # requests errors and malformed provider responses
-            self._raise(f"vector service {method} {path} failed: {error}", error)
+            self._raise(f"vector service {method} {path} failed: {error}")
         if not isinstance(payload, Mapping):
             self._raise(f"vector service {method} {path} returned a non-object response")
         return payload
@@ -102,12 +102,18 @@ class HttpVectorSearchClient:
         if payload.get("schema_version") != 1:
             self._raise("vector service returned an unknown schema version")
         units = payload.get("supported_units")
-        if not isinstance(units, list) or not units or any(not isinstance(unit, str) or not unit for unit in units):
+        if (
+            not isinstance(units, list)
+            or not units
+            or any(not isinstance(unit, str) or not unit for unit in units)
+            or set(units) - {"feedback", "conversation"}
+            or len(set(units)) != len(units)
+        ):
             self._raise("vector service response has invalid supported_units")
         try:
             watermark = self._watermark(payload.get("watermark_ts_ms"))
         except VectorResponseError as error:
-            self._raise(str(error), error)
+            self._raise(str(error))
         return VectorCapabilities(
             index=self.config.vector_index,
             schema_version=1,
@@ -123,12 +129,14 @@ class HttpVectorSearchClient:
     ) -> VectorSearchResult:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("vector search limit must be a positive integer")
+        submitted_queries = self._validate_queries(queries)
+        submitted_query_ids = {query["id"] for query in submitted_queries}
         payload = self._request_json(
             "POST",
             "/search",
             json={
                 "index": self.config.vector_index,
-                "queries": [dict(query) for query in queries],
+                "queries": submitted_queries,
                 "filters": dict(filters),
                 "limit": limit,
             },
@@ -137,7 +145,7 @@ class HttpVectorSearchClient:
         try:
             watermark = self._watermark(payload.get("watermark_ts_ms"))
         except VectorResponseError as error:
-            self._raise(str(error), error)
+            self._raise(str(error))
         raw_hits = payload.get("hits")
         if not isinstance(raw_hits, list):
             self._raise("vector service response has invalid hits")
@@ -150,6 +158,8 @@ class HttpVectorSearchClient:
             score, rank = raw_hit.get("score"), raw_hit.get("rank")
             if not isinstance(item_id, str) or not item_id.strip() or not isinstance(query_id, str) or not query_id.strip():
                 self._raise(f"vector service hit {position} has missing IDs")
+            if query_id not in submitted_query_ids:
+                self._raise(f"vector service hit {position} references an unsubmitted query_id")
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
                 self._raise(f"vector service hit {position} has a non-finite score")
             if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
@@ -160,3 +170,23 @@ class HttpVectorSearchClient:
             seen.add(key)
             hits.append(VectorHit(item_id=item_id, query_id=query_id, score=float(score), rank=rank))
         return VectorSearchResult(self.config.vector_index, watermark, tuple(hits))
+
+    @staticmethod
+    def _validate_queries(queries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        validated: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for position, query in enumerate(queries):
+            if not isinstance(query, Mapping):
+                raise ValueError(f"vector query {position} must be an object")
+            query_id, text, kind = query.get("id"), query.get("text"), query.get("kind")
+            if not isinstance(query_id, str) or not query_id.strip():
+                raise ValueError(f"vector query {position} must have a non-empty id")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"vector query {position} must have non-empty text")
+            if kind not in {"positive", "negative"}:
+                raise ValueError(f"vector query {position} kind must be positive or negative")
+            if query_id in seen_ids:
+                raise ValueError(f"vector queries have duplicate id: {query_id}")
+            seen_ids.add(query_id)
+            validated.append(dict(query))
+        return validated

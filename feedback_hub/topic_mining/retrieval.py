@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -44,6 +44,7 @@ class RecallHit:
     item: dict[str, Any]
     channels: tuple[str, ...]
     fused_score: float
+    fused_rank: int
     channel_ranks: dict[str, int]
     raw_scores: dict[str, float]
     query_ids: tuple[str, ...]
@@ -55,6 +56,7 @@ class RecallHit:
             "item": self.item,
             "channels": list(self.channels),
             "fused_score": self.fused_score,
+            "fused_rank": self.fused_rank,
             "channel_ranks": self.channel_ranks,
             "raw_scores": self.raw_scores,
             "query_ids": list(self.query_ids),
@@ -233,13 +235,17 @@ def hybrid_recall(
         query_ids[item_id].add("bm25")
         channels[item_id].add("bm25")
     rejected_out_of_scope: set[str] = set()
+    vector_query_kinds = {query["id"]: query["kind"] for query in build_semantic_queries(spec)}
     for hit in vector_hits:
+        query_kind = vector_query_kinds.get(hit.query_id)
+        if query_kind is None:
+            raise ValueError(f"unknown vector query_id: {hit.query_id}")
         if hit.item_id not in item_by_id:
             rejected_out_of_scope.add(hit.item_id)
             continue
         if hit.rank > config.vector_top_k:
             continue
-        if hit.query_id.startswith("negative:"):
+        if query_kind == "negative":
             negative_hits[hit.item_id].add(hit.query_id)
             continue
         ranks[hit.item_id][hit.query_id] = hit.rank
@@ -255,14 +261,19 @@ def hybrid_recall(
             item=item_by_id[item_id],
             channels=tuple(sorted(channels[item_id])),
             fused_score=fused_score,
+            fused_rank=0,
             channel_ranks=dict(sorted(positive_ranks.items())),
             raw_scores=dict(sorted(scores[item_id].items())),
             query_ids=tuple(sorted(query_ids[item_id])),
             negative_query_hits=tuple(sorted(negative_hits[item_id])),
         ))
     candidates.sort(key=lambda hit: (-hit.fused_score, hit.item_id))
+    ranked_candidates = tuple(
+        replace(hit, fused_rank=rank)
+        for rank, hit in enumerate(candidates, start=1)
+    )
     plan = RecallPlan(
-        candidates=tuple(candidates[:config.candidate_limit]),
+        candidates=ranked_candidates[:config.candidate_limit],
         rejected_out_of_scope_ids=tuple(sorted(rejected_out_of_scope)),
         semantic_queries=tuple(build_semantic_queries(spec)),
         bm25_query=bm25_query,
