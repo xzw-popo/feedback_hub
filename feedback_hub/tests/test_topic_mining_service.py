@@ -118,6 +118,22 @@ def test_run_maps_classifier_quota_pause(tmp_path):
     def exhausted(_prompt, *, route, **_kwargs): raise QuotaExhaustedError(route.name, 429, "quota")
     outcome = run_topic_job(run["run_id"], store=store, config=config, vector_client=Vector(), classifier_routes=[route], classifier_call_fn=exhausted)
     assert outcome["status"] == "paused_quota_exhausted"
+    attempt = json.loads(store.get(run["run_id"])["manifest_json"])["stage_attempts"]["classify"]
+    assert {
+        "classification_batches.jsonl.checkpoint.jsonl",
+        "classification_batches.jsonl.run_state.json",
+        "classification_batches.jsonl.failures.jsonl",
+        "classification_audit.jsonl",
+    } <= set(attempt["outputs"])
+
+
+def test_read_jsonl_normalizes_malformed_json(tmp_path):
+    from feedback_hub.topic_mining.service import _read_jsonl
+
+    path = tmp_path / "broken.jsonl"
+    path.write_text("{broken\n", encoding="utf-8")
+    with pytest.raises(RunVerificationError, match="invalid_artifact"):
+        _read_jsonl(path)
 
 
 def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
@@ -156,5 +172,17 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
     # than rewriting the read-only source snapshot or restarting the run.
     (config.data_dir / "runs" / run["run_id"] / "classified.jsonl").unlink()
     assert run_topic_job(run["run_id"], store=store, config=config, vector_client=FakeVector(), classifier_routes=[route], classifier_call_fn=call_fn)["status"] == "review_ready"
+    current = store.get(run["run_id"])
+    original_manifest = json.loads(current["manifest_json"])
+    tampered_manifest = json.loads(json.dumps(original_manifest))
+    for stage in tampered_manifest["stages"].values():
+        stage["input_count"] = 999
+    store.update_manifest(run["run_id"], tampered_manifest, stage="review_ready")
+    manifest_path = config.data_dir / "runs" / run["run_id"] / "manifest.json"
+    manifest_path.write_text(json.dumps(tampered_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(RunVerificationError, match="manifest_stage_chain"):
+        verify_topic_run(run["run_id"], store=store)
+    store.update_manifest(run["run_id"], original_manifest, stage="review_ready")
+    manifest_path.write_text(json.dumps(original_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     assert verify_topic_run(run["run_id"], store=store)["status"] == "verified"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before

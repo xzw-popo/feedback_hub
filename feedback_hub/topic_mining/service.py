@@ -384,6 +384,8 @@ def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> Non
                 raise RunVerificationError("manifest_stage_chain")
         if int(record.get("output_count", -1)) != _stage_output_count(stage, artifact_dir, manifest):
             raise RunVerificationError("manifest_stage_chain")
+        if int(record.get("input_count", -1)) != _stage_input_count(stage, artifact_dir):
+            raise RunVerificationError("manifest_stage_chain")
 
 
 def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
@@ -475,7 +477,8 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
 def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path) -> bool:
     """Only reuse scheduler checkpoints when the exact classifier inputs match."""
     attempts = manifest.get("stage_attempts", {}) if isinstance(manifest.get("stage_attempts"), Mapping) else {}
-    record = attempts.get("classify") or (manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None)
+    attempt_record = attempts.get("classify")
+    record = attempt_record or (manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None)
     if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
         return False
     required_inputs = {"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}
@@ -491,6 +494,15 @@ def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path)
             continue
         path = artifact_dir / name
         if not path.is_file() or _sha256(path) != expected:
+            return False
+    if attempt_record is not None:
+        required_attempt_outputs = {
+            "classification_batches.jsonl.checkpoint.jsonl",
+            "classification_batches.jsonl.run_state.json",
+            "classification_batches.jsonl.failures.jsonl",
+            "classification_audit.jsonl",
+        }
+        if attempt_record.get("complete") is not False or not required_attempt_outputs <= set(record["outputs"]):
             return False
     return True
 
@@ -528,7 +540,7 @@ def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set
 
 def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, Any]) -> int:
     if stage == "snapshot":
-        return int((manifest.get("source_snapshot") or {}).get("row_count", 0))
+        return _snapshot_row_count(artifact_dir)
     if stage == "hard_scope":
         return len(_read_jsonl(artifact_dir / "scoped_items.jsonl"))
     if stage == "hybrid_recall":
@@ -544,11 +556,23 @@ def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, A
 
 def _stage_input_count(stage: str, artifact_dir: Path) -> int:
     if stage == "snapshot":
-        import sqlite3
-        with sqlite3.connect(f"file:{(artifact_dir / 'source_snapshot.sqlite').resolve()}?mode=ro", uri=True) as connection:
-            return int(connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+        return 0
+    if stage == "hard_scope":
+        return _snapshot_row_count(artifact_dir)
     previous = _STAGES[_STAGES.index(stage) - 1]
     return _stage_output_count(previous, artifact_dir, {})
+
+
+def _snapshot_row_count(artifact_dir: Path) -> int:
+    import sqlite3
+    try:
+        with sqlite3.connect(f"file:{(artifact_dir / 'source_snapshot.sqlite').resolve()}?mode=ro", uri=True) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM feedback").fetchone()
+    except sqlite3.Error as exc:
+        raise RunVerificationError("invalid_artifact") from exc
+    if row is None or isinstance(row[0], bool) or not isinstance(row[0], int):
+        raise RunVerificationError("invalid_artifact")
+    return int(row[0])
 
 
 def _read_required_jsonl(path: Path, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
