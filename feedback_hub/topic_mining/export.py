@@ -10,7 +10,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _checkpoint, _load_manifest, _read_jsonl, _require_run, _validate_final_rows, _write_jsonl
+from .service import RunVerificationError, _checkpoint, _load_manifest, _read_required_jsonl, _require_artifact, _require_run, _validate_final_rows, _write_jsonl
 from .contracts import validate_topic_spec
 
 
@@ -28,7 +28,10 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         raise RunVerificationError("run_not_verified")
     artifact_dir = Path(run["artifact_dir"])
     spec = validate_topic_spec(json.loads(run["spec_json"]))
-    rows = _read_jsonl(artifact_dir / "final_reviewed.jsonl")
+    final_path = artifact_dir / "final_reviewed.jsonl"
+    manifest = _load_manifest(run, artifact_dir)
+    _require_artifact(manifest, final_path)
+    rows = _read_required_jsonl(final_path)
     rows = [{**row, "run_id": row.get("run_id", run_id)} for row in rows]
     _validate_final_rows(rows, spec)
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))

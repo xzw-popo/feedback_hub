@@ -67,3 +67,13 @@ def test_manifest_allowlists_artifacts_and_export_blocks_unverified(tmp_path):
     assert client.get(f"/api/topic-mining/runs/{run['run_id']}/artifacts/safe.jsonl").status_code == 200
     assert client.get(f"/api/topic-mining/runs/{run['run_id']}/artifacts/other.jsonl").status_code == 404
     assert client.post(f"/api/topic-mining/runs/{run['run_id']}/export", json={"format": "xlsx"}).status_code == 409
+
+
+def test_invalid_spec_and_export_format_are_422(tmp_path):
+    client = _client(tmp_path)
+    assert client.post("/api/topic-mining/runs", json={}).status_code == 422
+    config = TopicMiningConfig(data_dir=tmp_path / "data")
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    app = FastAPI(); app.include_router(make_router(config=config, store=store))
+    assert TestClient(app).post(f"/api/topic-mining/runs/{run['run_id']}/export", json={"format": "csv"}).status_code == 422

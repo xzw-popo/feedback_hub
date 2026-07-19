@@ -18,7 +18,7 @@ from .contracts import validate_topic_spec
 from .export import export_topic_run
 from .run_store import TopicRunStore
 from .service import (
-    RunVerificationError, default_store, get_topic_run, run_topic_job,
+    RunVerificationError, _artifact_valid, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
@@ -71,7 +71,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
                 start_run_async(run["run_id"])
             return result
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=_redact(str(exc), config)) from None
+            raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
 
     @router.get("/runs/{run_id}", dependencies=[Depends(require_token)])
     def get_run(run_id: str) -> dict[str, Any]:
@@ -84,7 +84,10 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
     def review_queue(run_id: str) -> dict[str, Any]:
         run = _get_or_404(run_id, store)
         path = Path(run["artifact_dir"]) / "review_queue.jsonl"
-        return {"run_id": run_id, "items": _read_jsonl(path)}
+        try:
+            return {"run_id": run_id, "items": _read_jsonl(path)}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=_redact(str(exc), config)) from None
 
     @router.post("/runs/{run_id}/overrides", dependencies=[Depends(require_token)])
     def overrides(run_id: str, payload: list[dict[str, Any]]) -> dict[str, Any]:
@@ -92,7 +95,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         try:
             return {"run_id": run_id, "overrides": submit_review_overrides(run_id, payload, store=store)}
         except (ValueError, RunVerificationError) as exc:
-            raise HTTPException(status_code=400, detail=_redact(str(exc), config)) from None
+            raise HTTPException(status_code=409 if isinstance(exc, RunVerificationError) else 422, detail=_redact(str(exc), config)) from None
 
     @router.post("/runs/{run_id}/verify", dependencies=[Depends(require_token)])
     def verify(run_id: str) -> dict[str, Any]:
@@ -102,7 +105,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         except RunVerificationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=_redact(str(exc), config)) from None
+            raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
 
     @router.post("/runs/{run_id}/export", dependencies=[Depends(require_token)])
     def export(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -113,7 +116,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         except RunVerificationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=_redact(str(exc), config)) from None
+            raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
         return {"run_id": run_id, "artifact_name": path.name, "format": export_format}
 
     @router.get("/runs/{run_id}/artifacts/{artifact_name}", dependencies=[Depends(require_token)])
@@ -128,6 +131,8 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         path = Path(run["artifact_dir"]) / artifact_name
         if not path.is_file():
             raise HTTPException(status_code=404, detail="topic artifact not found")
+        if not _artifact_valid(manifest, path):
+            raise HTTPException(status_code=409, detail="topic artifact hash mismatch")
         return FileResponse(path, filename=artifact_name)
 
     return router
@@ -154,10 +159,18 @@ def _source_watermark(source_path: Path, spec: Any) -> int:
 
 
 def _public_run(run: dict[str, Any]) -> dict[str, Any]:
+    manifest = _manifest(run)
+    classifier = manifest.get("classifier", {}) if isinstance(manifest.get("classifier"), dict) else {}
     return {
         "run_id": run["run_id"], "status": run["status"], "stage": run["stage"],
         "error_code": run.get("error_code"), "error_message": run.get("error_message"),
         "created": bool(run.get("created", False)), "source_watermark_ms": run["source_watermark_ms"],
+        "quality": {
+            "funnel": manifest.get("funnel", {}), "source_watermark_ms": manifest.get("source_watermark_ms"),
+            "vector_watermark_ms": manifest.get("vector_watermark_ms"),
+            "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items")},
+            "models": classifier.get("models", []), "retry_total": classifier.get("retry_total", 0),
+        },
     }
 
 
@@ -181,7 +194,20 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     import json
     if not path.is_file():
         return []
-    return [value for line in path.read_text(encoding="utf-8").splitlines() if line.strip() for value in [json.loads(line)] if isinstance(value, dict)]
+    try:
+        values = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("invalid review queue artifact")
+            values.append(value)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid review queue artifact") from exc
+    if any(not isinstance(value, dict) for value in values):
+        raise ValueError("invalid review queue artifact")
+    return values
 
 
 def _redact(message: str, config: TopicMiningConfig) -> str:

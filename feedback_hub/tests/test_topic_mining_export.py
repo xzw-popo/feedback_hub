@@ -4,6 +4,7 @@ import json
 
 import openpyxl
 import pytest
+import hashlib
 
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.export import export_topic_run
@@ -34,6 +35,7 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     artifact_dir = tmp_path / "runs" / run["run_id"]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(_row()) + "\n", encoding="utf-8")
     store.update_status(run["run_id"], "verified", stage="verified")
+    store.update_manifest(run["run_id"], {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}, stage="verified", status="verified")
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, read_only=False, data_only=False)
     ws = wb["反馈清单"]
@@ -53,6 +55,7 @@ def test_export_escapes_formula_like_user_text(tmp_path, text):
     row["evidence"] = [text]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     store.update_status(run["run_id"], "verified", stage="verified")
+    store.update_manifest(run["run_id"], {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}, stage="verified", status="verified")
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, data_only=False)
     assert wb["反馈清单"]["C2"].value.startswith("'")
@@ -63,3 +66,15 @@ def test_export_blocks_unverified_run(tmp_path):
     run = store.create_or_get(_spec(), 123)
     with pytest.raises(RunVerificationError, match="run_not_verified"):
         export_topic_run(run["run_id"], "jsonl", store=store)
+
+
+def test_export_rejects_tampered_final_artifact(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    artifact_dir = tmp_path / "runs" / run["run_id"]
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(_row()) + "\n", encoding="utf-8")
+    store.update_manifest(run["run_id"], {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}, stage="verified", status="verified")
+    final.write_text(json.dumps({**_row(), "reason": "tampered"}) + "\n", encoding="utf-8")
+    with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
+        export_topic_run(run["run_id"], "xlsx", store=store)

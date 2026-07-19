@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from urllib.parse import urlparse
 from dataclasses import asdict
 from datetime import timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ class RunVerificationError(ValueError):
 
 
 _STAGES = ("snapshot", "hard_scope", "hybrid_recall", "classify", "review_queue", "review_ready")
+_MANIFEST_VERSION = 2
 _UNRESOLVED_KEYS = (
     "unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids",
     "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items",
@@ -64,7 +66,8 @@ def run_topic_job(
     store = store or default_store(config)
     run = _require_run(run_id, store)
     if run["status"] == "verified":
-        return run
+        verify_topic_run(run_id, store=store)
+        return _require_run(run_id, store)
     try:
         _run_pipeline(
             run_id=run_id, store=store, config=config, vector_client=vector_client,
@@ -89,10 +92,12 @@ def _run_pipeline(
     artifact_dir = Path(run["artifact_dir"])
     artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(run, artifact_dir)
+    manifest.setdefault("manifest_version", _MANIFEST_VERSION)
+    manifest.setdefault("stages", {})
     _set_status(run_id, store, "running", stage=run.get("stage") or "created")
 
     snapshot_path = artifact_dir / "source_snapshot.sqlite"
-    if not _artifact_valid(manifest, snapshot_path):
+    if not _stage_valid(manifest, "snapshot", artifact_dir):
         snapshot = create_source_snapshot(config.source_db_path, snapshot_path)
         snapshot_data = asdict(snapshot)
         snapshot_data["path"] = str(snapshot.path)
@@ -107,7 +112,7 @@ def _run_pipeline(
 
     scoped_path = artifact_dir / "scoped_items.jsonl"
     contexts_path = artifact_dir / "item_contexts.json"
-    if not _artifact_valid(manifest, scoped_path) or not _artifact_valid(manifest, contexts_path):
+    if not _stage_valid(manifest, "hard_scope", artifact_dir):
         items = fetch_scoped_items(snapshot_path, spec)
         contexts = build_item_contexts(items, spec.unit, window_ms=1_800_000)
         _write_jsonl(scoped_path, items)
@@ -119,7 +124,7 @@ def _run_pipeline(
 
     recall_path = artifact_dir / "recall_candidates.jsonl"
     recall_manifest_path = artifact_dir / "recall_manifest.json"
-    if not _artifact_valid(manifest, recall_path) or not _artifact_valid(manifest, recall_manifest_path):
+    if not _stage_valid(manifest, "hybrid_recall", artifact_dir):
         client = vector_client or HttpVectorSearchClient(config)
         capabilities = client.capabilities()
         if spec.unit not in capabilities.supported_units:
@@ -141,12 +146,15 @@ def _run_pipeline(
     classified_path = artifact_dir / "classified.jsonl"
     audit_path = artifact_dir / "classification_audit.jsonl"
     classifications_rebuilt = False
-    if not _artifact_valid(manifest, classified_path):
+    if not _stage_valid(manifest, "classify", artifact_dir):
         results, stats = classify_candidates(
             spec, recalls, artifact_dir=artifact_dir, contexts=contexts, routes=classifier_routes,
             config=config, resume=True, call_fn=classifier_call_fn,
         )
         manifest["classifier"] = _safe_json(stats)
+        manifest["classifier"]["models"] = sorted({str(route.model) for route in (classifier_routes or []) if getattr(route, "model", "")})
+        manifest["classifier"]["retry_total"] = int(stats.get("attempts", 0))
+        manifest["funnel"] = {"hard_scope_count": len(items), "candidate_count": len(recalls), "classified_count": len(results)}
         manifest["unresolved_classifier_items"] = max(0, len(recalls) - len(results))
         manifest["unresolved_parser_items"] = int(stats.get("failed", 0))
         # Classification can safely pause; it must never publish review_ready.
@@ -165,7 +173,7 @@ def _run_pipeline(
     overrides_path = artifact_dir / "review_overrides.jsonl"
     if not overrides_path.exists():
         _write_jsonl(overrides_path, [])
-    if classifications_rebuilt or not _artifact_valid(manifest, queue_path):
+    if classifications_rebuilt or not _stage_valid(manifest, "review_queue", artifact_dir):
         queue = build_review_queue(run_id, classifications, {row.item_id: row for row in recalls})
         persist_review_artifacts(artifact_dir, queue, _read_jsonl(overrides_path))
         manifest["review_queue"] = {"item_count": len(queue)}
@@ -203,15 +211,24 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     """Validate every membership claim and make an immutable verified result."""
     store = store or default_store()
     run = _require_run(run_id, store)
+    if run["status"] not in {"review_ready", "verified"}:
+        raise RunVerificationError("run_not_review_ready")
     artifact_dir = Path(run["artifact_dir"])
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
     for key in _UNRESOLVED_KEYS:
         if int(manifest.get(key, 0) or 0) > 0:
             raise RunVerificationError(key)
+    _require_stage_chain(manifest, artifact_dir)
+    if run["status"] == "verified":
+        _require_artifact(manifest, artifact_dir / "final_reviewed.jsonl")
     spec = validate_topic_spec(json.loads(run["spec_json"]))
-    recalls = [_recall_from_dict(row) for row in _read_jsonl(artifact_dir / "recall_candidates.jsonl")]
-    classifications = [_classification_from_dict(row) for row in _read_jsonl(artifact_dir / "classified.jsonl")]
+    recall_path, classified_path, contexts_path, overrides_path = (artifact_dir / "recall_candidates.jsonl", artifact_dir / "classified.jsonl", artifact_dir / "item_contexts.json", artifact_dir / "review_overrides.jsonl")
+    for path in (recall_path, classified_path, contexts_path, overrides_path):
+        _require_artifact(manifest, path)
+    recalls = [_recall_from_dict(row) for row in _read_required_jsonl(recall_path)]
+    classifications = [_classification_from_dict(row) for row in _read_required_jsonl(classified_path)]
+    contexts = _read_required_json(contexts_path)
     expected = {hit.item_id for hit in recalls}
     actual = [row.item_id for row in classifications]
     if len(actual) != len(set(actual)):
@@ -227,16 +244,17 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
             raise RunVerificationError("missing_text")
-        if not isinstance(item.get("source_url"), str) or not item["source_url"].startswith(("https://", "http://")):
+        if not _valid_source_url(item.get("source_url")):
             raise RunVerificationError("missing_link")
-        if result.label == "matched" and (not result.evidence or not all(evidence in text for evidence in result.evidence)):
+        context_texts = _context_texts(contexts, result.item_id)
+        if result.label == "matched" and (not result.evidence or not all(any(evidence in source for source in [text, *context_texts]) for evidence in result.evidence)):
             raise RunVerificationError("invalid_evidence")
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
-    overrides = _read_jsonl(artifact_dir / "review_overrides.jsonl")
+    overrides = _read_required_jsonl(overrides_path)
     merged = apply_review_overrides(classifications, overrides, allowed_labels=allowed)
-    final_rows = [_final_row(result, by_id[result.item_id], run_id) for result in merged if result.label == "matched"]
-    _validate_final_rows(final_rows, spec)
+    final_rows = [_final_row(result, by_id[result.item_id], run_id, _context_texts(contexts, result.item_id)) for result in merged if result.label == "matched"]
+    _validate_final_rows(final_rows, spec, contexts=contexts)
     final_path = artifact_dir / "final_reviewed.jsonl"
     _write_jsonl(final_path, final_rows)
     manifest["verified"] = {"matched_count": len(final_rows), "verified_at_ms": int(time.time() * 1000)}
@@ -245,15 +263,16 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
 
 
-def _final_row(result: ClassificationResult, item: Mapping[str, Any], run_id: str) -> dict[str, Any]:
+def _final_row(result: ClassificationResult, item: Mapping[str, Any], run_id: str, context_texts: Sequence[str]) -> dict[str, Any]:
+    evidence_source = {value: ("source_text" if value in str(item.get("text", "")) else "context") for value in result.evidence}
     return {
         "item_id": result.item_id, "label": result.label, "confidence": result.confidence,
         "evidence": list(result.evidence), "reason": result.reason, "source": result.source,
-        "source_item": dict(item), "run_id": run_id,
+        "source_item": dict(item), "context_texts": list(context_texts), "evidence_source": evidence_source, "run_id": run_id,
     }
 
 
-def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec) -> None:
+def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec, *, contexts: Mapping[str, Any] | None = None) -> None:
     seen: set[str] = set()
     allowed = {entry["id"] for entry in spec.classification_labels}
     for row in rows:
@@ -267,10 +286,11 @@ def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec) -> 
         if not isinstance(item, Mapping) or not isinstance(item.get("text"), str) or not item["text"].strip():
             raise RunVerificationError("missing_text")
         url = item.get("source_url")
-        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        if not _valid_source_url(url):
             raise RunVerificationError("missing_link")
         evidence = row.get("evidence")
-        if not isinstance(evidence, list) or not evidence or not all(isinstance(value, str) and value in item["text"] for value in evidence):
+        context_texts = list(row.get("context_texts", [])) or _context_texts(contexts or {}, str(item_id))
+        if not isinstance(evidence, list) or not evidence or not all(isinstance(value, str) and any(value in source for source in [item["text"], *context_texts]) for value in evidence):
             raise RunVerificationError("invalid_evidence")
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
@@ -291,6 +311,20 @@ def _item_in_scope(item: Mapping[str, Any], spec: TopicSpec) -> bool:
     return True
 
 
+def _valid_source_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value or any(character.isspace() for character in value):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc and parsed.hostname)
+
+
+def _context_texts(contexts: Mapping[str, Any], item_id: str) -> list[str]:
+    values = contexts.get(item_id, []) if isinstance(contexts, Mapping) else []
+    if not isinstance(values, list):
+        return []
+    return [str(row.get("text") or row.get("feedback_text")) for row in values if isinstance(row, Mapping) and isinstance(row.get("text") or row.get("feedback_text"), str)]
+
+
 def _verify_manifest(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
     artifacts = manifest.get("artifacts", {})
     if not isinstance(artifacts, Mapping):
@@ -303,12 +337,45 @@ def _verify_manifest(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
             raise RunVerificationError("manifest_hash_reconciliation")
 
 
+def _require_artifact(manifest: Mapping[str, Any], path: Path) -> None:
+    if not _artifact_valid(manifest, path):
+        raise RunVerificationError("manifest_hash_reconciliation")
+
+
+def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
+    stages = manifest.get("stages")
+    if manifest.get("manifest_version") != _MANIFEST_VERSION or not isinstance(stages, Mapping):
+        raise RunVerificationError("manifest_stage_chain")
+    for stage in _STAGES:
+        record = stages.get(stage)
+        if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
+            raise RunVerificationError("manifest_stage_chain")
+        for name, expected in {**record["inputs"], **record["outputs"]}.items():
+            path = artifact_dir / str(name)
+            if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
+                raise RunVerificationError("manifest_stage_chain")
+
+
 def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
     artifacts = manifest.setdefault("artifacts", {})
     for path in files:
         if not path.is_file():
             continue
         artifacts[path.name] = _sha256(path)
+    previous_outputs: dict[str, str] = {}
+    if stage != "snapshot":
+        previous_stage = _STAGES[_STAGES.index(stage) - 1] if stage in _STAGES else "review_ready"
+        previous = manifest.setdefault("stages", {}).get(previous_stage, {})
+        if isinstance(previous, Mapping):
+            previous_outputs = dict(previous.get("outputs", {}))
+    outputs = {path.name: _sha256(path) for path in files if path.is_file()}
+    manifest.setdefault("stages", {})[stage] = {
+        "inputs": previous_outputs,
+        "outputs": outputs,
+        "input_count": int(manifest.get("funnel", {}).get("input_count", 0)),
+        "output_count": int(manifest.get("funnel", {}).get(stage + "_count", len(outputs))),
+    }
+    manifest["manifest_version"] = _MANIFEST_VERSION
     manifest["stage"] = stage
     _atomic_json(artifact_dir / "manifest.json", manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -336,6 +403,47 @@ def _load_manifest(run: Mapping[str, Any], artifact_dir: Path) -> dict[str, Any]
 def _artifact_valid(manifest: Mapping[str, Any], path: Path) -> bool:
     expected = manifest.get("artifacts", {}).get(path.name) if isinstance(manifest.get("artifacts"), Mapping) else None
     return isinstance(expected, str) and path.is_file() and _sha256(path) == expected
+
+
+def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) -> bool:
+    record = manifest.get("stages", {}).get(stage) if isinstance(manifest.get("stages"), Mapping) else None
+    if not isinstance(record, Mapping):
+        return False
+    for section in ("inputs", "outputs"):
+        values = record.get(section)
+        if not isinstance(values, Mapping):
+            return False
+        for name, expected in values.items():
+            path = artifact_dir / str(name)
+            if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
+                return False
+    return True
+
+
+def _read_required_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise RunVerificationError("missing_artifact")
+    try:
+        return _read_jsonl(path)
+    except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
+
+
+def _read_required_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise RunVerificationError("missing_artifact")
+    value = _read_json(path, None)
+    if not isinstance(value, dict):
+        raise RunVerificationError("invalid_artifact")
+    return value
+
+
+def _invalidate_export_artifacts(manifest: dict[str, Any], artifact_dir: Path) -> None:
+    artifacts = manifest.setdefault("artifacts", {})
+    for name in ("final_reviewed.jsonl", "final_results.jsonl", "quality_report.json", "feedback_list.xlsx"):
+        (artifact_dir / name).unlink(missing_ok=True)
+        artifacts.pop(name, None)
+    manifest.pop("verified", None)
 
 
 def _record_failure(run_id: str, store: TopicRunStore, exc: Exception, config: TopicMiningConfig) -> None:

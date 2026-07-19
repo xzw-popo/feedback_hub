@@ -33,7 +33,14 @@ def test_verify_blocks_unresolved_classifier_failure(tmp_path):
     run = store.create_or_get(_spec(), 123)
     manifest = {"unresolved_classifier_items": 1, "artifacts": {}}
     store.update_manifest(run["run_id"], manifest, stage="classify")
-    with pytest.raises(RunVerificationError, match="unresolved_classifier_items"):
+    with pytest.raises(RunVerificationError, match="run_not_review_ready"):
+        verify_topic_run(run["run_id"], store=store)
+
+
+def test_verify_gate_rejects_pending_even_with_empty_artifacts(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    with pytest.raises(RunVerificationError, match="run_not_review_ready"):
         verify_topic_run(run["run_id"], store=store)
 
 
@@ -47,7 +54,7 @@ def test_verify_rejects_duplicate_and_missing_link(tmp_path):
     (artifact_dir / "recall_candidates.jsonl").write_text(json.dumps(recall) + "\n", encoding="utf-8")
     (artifact_dir / "classified.jsonl").write_text("\n".join(json.dumps(result) for _ in range(2)) + "\n", encoding="utf-8")
     (artifact_dir / "review_overrides.jsonl").write_text("", encoding="utf-8")
-    with pytest.raises(RunVerificationError, match="duplicate_item_id"):
+    with pytest.raises(RunVerificationError, match="run_not_review_ready"):
         verify_topic_run(run["run_id"], store=store)
 
 
@@ -55,7 +62,7 @@ def test_verify_reconciles_manifest_hashes(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
     store.update_manifest(run["run_id"], {"artifacts": {"classified.jsonl": "not-a-real-hash"}}, stage="classify")
-    with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
+    with pytest.raises(RunVerificationError, match="run_not_review_ready"):
         verify_topic_run(run["run_id"], store=store)
 
 
