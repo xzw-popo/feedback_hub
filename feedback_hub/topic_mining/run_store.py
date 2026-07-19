@@ -7,7 +7,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .contracts import TopicSpec, topic_spec_hash
 
@@ -107,6 +107,40 @@ class TopicRunStore:
             cursor = connection.execute(
                 "UPDATE topic_run SET status = ?, stage = COALESCE(?, stage), updated_at_ms = ? WHERE run_id = ?",
                 (status, stage, now_ms, run_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(run_id)
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        """Return the isolated run row without exposing source databases."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM topic_run WHERE run_id = ?", (run_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_manifest(
+        self,
+        run_id: str,
+        manifest: Mapping[str, Any],
+        *,
+        stage: str,
+        status: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Atomically publish a stage manifest and optional stable status."""
+        if status is not None and status not in RUN_STATES:
+            raise ValueError(f"unsupported topic run status: {status}")
+        now_ms = int(time.time() * 1000)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE topic_run SET stage = ?, status = COALESCE(?, status),
+                   error_code = ?, error_message = ?, manifest_json = ?, updated_at_ms = ?
+                   WHERE run_id = ?""",
+                (
+                    stage, status, error_code, error_message,
+                    json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    now_ms, run_id,
+                ),
             )
         if cursor.rowcount != 1:
             raise KeyError(run_id)
