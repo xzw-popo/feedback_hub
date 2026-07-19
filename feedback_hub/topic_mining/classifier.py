@@ -203,12 +203,15 @@ def classify_candidates(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     batches_path = artifact_dir / "classification_batches.jsonl"
     partial_audit_dir = artifact_dir / "classification_partial_audit"
+    audit_path = artifact_dir / "classification_audit.jsonl"
+    audit_generation = _next_audit_generation(audit_path, partial_audit_dir)
     if resume:
         _retain_successful_checkpoints(batches_path)
     batch_payloads = [normalized[index:index + config.classifier_batch_size] for index in range(0, len(normalized), config.classifier_batch_size)]
     jobs = [(index, f"classification:{index:05d}", {"candidates": batch}) for index, batch in enumerate(batch_payloads)]
     allowed_labels = {entry["id"] for entry in spec.classification_labels}
     openai_call = call_fn or partial(_call_openai_classifier, system_prompt=classification_system_prompt())
+    route_secrets = tuple(route.credential for route in selected_routes if route.credential)
 
     def worker(_index: int, key: str, payload: dict[str, Any], route: ModelRoute) -> tuple[dict[str, Any], str | None]:
         batch = payload["candidates"]
@@ -244,9 +247,11 @@ def classify_candidates(
                         attempts=attempts,
                         retry_chain=retry_chain,
                         elapsed_ms=elapsed_ms,
-                        audit_id=f"{key}:quota:{len(raw_replies)}",
+                        audit_id=f"g{audit_generation}:{key}:quota:{len(raw_replies)}",
+                        audit_generation=audit_generation,
                     ),
-                    route.credential,
+                    route_secrets,
+                    audit_generation,
                 )
                 raise
             except Exception as exc:
@@ -256,7 +261,7 @@ def classify_candidates(
                     raise
                 call_error = f"{type(exc).__name__}: {exc}"
                 break
-            raw_replies.append(_redact(reply.content, route.credential))
+            raw_replies.append(_redact(reply.content, route_secrets))
             attempts += reply.attempts
             elapsed_ms += reply.elapsed_ms
             retry_chain.extend(reply.retry_chain)
@@ -278,7 +283,8 @@ def classify_candidates(
             attempts=attempts,
             retry_chain=retry_chain,
             elapsed_ms=elapsed_ms,
-            audit_id=f"{key}:final:{len(raw_replies)}",
+            audit_id=f"g{audit_generation}:{key}:final:{len(raw_replies)}",
+            audit_generation=audit_generation,
         )
         return row, error
 
@@ -287,7 +293,10 @@ def classify_candidates(
         concurrency_per_route=config.classifier_concurrency, resume=resume,
     )
     partial_rows = _read_partial_audit(partial_audit_dir)
-    _write_audit(artifact_dir / "classification_audit.jsonl", [*partial_rows, *rows], append=resume)
+    # Audit history is append-only across both new and resumed attempts. A new
+    # scheduling attempt may reset checkpoints, but must not erase evidence of
+    # an earlier unresolved batch in the same isolated run directory.
+    _write_audit(audit_path, [*partial_rows, *rows], append=True, secrets=route_secrets)
     _clear_partial_audit(partial_audit_dir)
     ready = scheduler_stats["run_status"] == "completed" and scheduler_stats["failed"] == 0
     results = _flatten_complete_results(rows, normalized) if ready else []
@@ -331,9 +340,11 @@ def _classification_audit_row(
     retry_chain: Sequence[str],
     elapsed_ms: int,
     audit_id: str,
+    audit_generation: int,
 ) -> dict[str, Any]:
     return {
         "audit_id": audit_id,
+        "audit_generation": audit_generation,
         "batch_key": key,
         "item_ids": sorted(expected_ids),
         "results": [result.to_dict() for result in results],
@@ -424,11 +435,17 @@ def _retain_successful_checkpoints(output_path: Path) -> None:
     checkpoint.write_text("".join(line + "\n" for line in good), encoding="utf-8")
 
 
-def _write_partial_audit(directory: Path, batch_key: str, row: Mapping[str, Any], secret: str) -> None:
+def _write_partial_audit(
+    directory: Path,
+    batch_key: str,
+    row: Mapping[str, Any],
+    secrets: Sequence[str],
+    audit_generation: int,
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{batch_key.replace(':', '_')}.json"
+    path = directory / f"g{audit_generation}_{batch_key.replace(':', '_')}.json"
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(_redact_nested(dict(row), secret), ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    temporary.write_text(json.dumps(_redact_nested(dict(row), secrets), ensure_ascii=False, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
 
 
@@ -454,7 +471,28 @@ def _clear_partial_audit(directory: Path) -> None:
     directory.rmdir()
 
 
-def _write_audit(path: Path, rows: Sequence[Mapping[str, Any]], *, append: bool) -> None:
+def _next_audit_generation(audit_path: Path, partial_directory: Path) -> int:
+    generations: list[int] = []
+    if audit_path.exists():
+        for line in audit_path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, Mapping) and isinstance(row.get("audit_generation"), int):
+                generations.append(row["audit_generation"])
+    if partial_directory.exists():
+        for partial_path in partial_directory.glob("*.json"):
+            try:
+                row = json.loads(partial_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(row, Mapping) and isinstance(row.get("audit_generation"), int):
+                generations.append(row["audit_generation"])
+    return max(generations, default=0) + 1
+
+
+def _write_audit(path: Path, rows: Sequence[Mapping[str, Any]], *, append: bool, secrets: Sequence[str]) -> None:
     existing: list[dict[str, Any]] = []
     if append and path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -463,12 +501,14 @@ def _write_audit(path: Path, rows: Sequence[Mapping[str, Any]], *, append: bool)
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                existing.append(value)
+                existing.append(_redact_nested(value, secrets))
     merged = {str(row.get("audit_id") or f"legacy:{index}"): dict(row) for index, row in enumerate(existing)}
     for index, row in enumerate(rows):
-        merged[str(row.get("audit_id") or f"new:{index}")] = dict(row)
+        merged[str(row.get("audit_id") or f"new:{index}")] = _redact_nested(dict(row), secrets)
     ordered = [merged[key] for key in sorted(merged)]
-    path.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in ordered), encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in ordered), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _extract_json_text(raw: str) -> str:
@@ -490,17 +530,21 @@ def _exact_required_text(value: Any, field: str) -> str:
     return value
 
 
-def _redact(text: str, secret: str) -> str:
-    return text.replace(secret, "[REDACTED]") if secret else text
+def _redact(text: str, secrets: Sequence[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
-def _redact_nested(value: Any, secret: str) -> Any:
+def _redact_nested(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, str):
-        return _redact(value, secret)
+        return _redact(value, secrets)
     if isinstance(value, list):
-        return [_redact_nested(item, secret) for item in value]
+        return [_redact_nested(item, secrets) for item in value]
     if isinstance(value, tuple):
-        return [_redact_nested(item, secret) for item in value]
+        return [_redact_nested(item, secrets) for item in value]
     if isinstance(value, Mapping):
-        return {str(key): _redact_nested(item, secret) for key, item in value.items()}
+        return {str(key): _redact_nested(item, secrets) for key, item in value.items()}
     return value

@@ -111,6 +111,10 @@ def _route() -> ModelRoute:
     return ModelRoute("classifier", "openai_compatible", "https://model.test", "not-a-secret", "test-model")
 
 
+def _named_route(name: str, credential: str) -> ModelRoute:
+    return ModelRoute(name, "openai_compatible", f"https://{name}.test", credential, "test-model")
+
+
 def test_classification_retries_once_after_parse_failure_and_writes_complete_outputs(tmp_path, valid_topic_spec):
     calls = []
 
@@ -190,6 +194,36 @@ def test_parse_failure_then_quota_keeps_partial_audit_and_resume_publishes(tmp_p
     assert [row.item_id for row in second] == ["a"]
     assert second_stats["classification_status"] == "review_ready"
     assert len((tmp_path / "classification_audit.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_audit_generations_preserve_repeated_quota_history_and_redact_every_route_secret(tmp_path, valid_topic_spec):
+    route_a = _named_route("route-a", "secret-a")
+    route_b = _named_route("route-b", "secret-b")
+    calls = []
+
+    def call_fn(_prompt, *, route, **_kwargs):
+        calls.append(route.name)
+        if len(calls) in {1, 3}:
+            return f"{route_b.credential} invalid json"
+        if len(calls) in {2, 4}:
+            raise QuotaExhaustedError(route.name, 429, "quota")
+        return json.dumps({"results": [{"item_id": "a", "label": "matched", "confidence": 0.9, "evidence": ["工具栏一直显示"], "reason": "符合", "needs_review": False}]})
+
+    config = TopicMiningConfig(classifier_batch_size=1, classifier_concurrency=1)
+    for resume in (False, True):
+        rows, stats = classify_candidates(valid_topic_spec, [recall("a")], artifact_dir=tmp_path, routes=[route_a, route_b], config=config, call_fn=call_fn, resume=resume)
+        assert rows == []
+        assert stats["run_status"] == "paused_quota_exhausted"
+    rows, stats = classify_candidates(valid_topic_spec, [recall("a")], artifact_dir=tmp_path, routes=[route_a, route_b], config=config, call_fn=call_fn, resume=True)
+    assert [row.item_id for row in rows] == ["a"]
+    assert stats["classification_status"] == "review_ready"
+
+    audit_rows = [json.loads(line) for line in (tmp_path / "classification_audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["audit_generation"] for row in audit_rows] == [1, 2, 3]
+    assert len({row["audit_id"] for row in audit_rows}) == 3
+    persisted = "\n".join(path.read_text(encoding="utf-8") for path in tmp_path.rglob("*") if path.is_file())
+    assert route_a.credential not in persisted
+    assert route_b.credential not in persisted
 
 
 def test_missing_route_credentials_fails_before_scheduling(tmp_path, valid_topic_spec):
