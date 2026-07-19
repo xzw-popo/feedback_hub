@@ -86,6 +86,22 @@ def test_parser_rejects_duplicate_ids():
         parse_classification_reply(json.dumps(raw), expected_ids={"a"}, allowed_labels={"matched", "not_matched"})
 
 
+@pytest.mark.parametrize("field, value", [("item_id", " a "), ("label", " matched ")])
+def test_parser_rejects_whitespace_normalized_identity_values(field, value):
+    body = {"item_id": "a", "label": "matched", "confidence": 0.9, "evidence": ["工具栏一直显示"], "reason": "符合", "needs_review": False}
+    body[field] = value
+    with pytest.raises(ValueError):
+        parse_classification_reply(json.dumps({"results": [body]}), expected_ids={"a"}, allowed_labels={"matched", "not_matched"})
+
+
+def test_evidence_keeps_original_whitespace_and_rejects_nonliteral_substring():
+    raw = json.dumps({"results": [{"item_id": "a", "label": "matched", "confidence": 0.9, "evidence": [" 工具栏一直显示 "], "reason": "符合", "needs_review": False}]})
+    parsed = parse_classification_reply(raw, expected_ids={"a"}, allowed_labels={"matched", "not_matched"})
+    assert parsed[0].evidence == (" 工具栏一直显示 ",)
+    with pytest.raises(ValueError, match="evidence"):
+        validate_evidence(parsed, {"a": candidate_payload()})
+
+
 def test_parser_rejects_evidence_not_present_in_text():
     with pytest.raises(ValueError, match="evidence"):
         validate_evidence([result(evidence=("不存在的事实",))], {"a": candidate_payload(text="原文")})
@@ -144,6 +160,36 @@ def test_quota_pause_keeps_classification_unpublished(tmp_path, valid_topic_spec
     assert rows == []
     assert stats["run_status"] == "paused_quota_exhausted"
     assert not (tmp_path / "classified.jsonl").exists()
+
+
+def test_parse_failure_then_quota_keeps_partial_audit_and_resume_publishes(tmp_path, valid_topic_spec):
+    calls = []
+
+    def call_fn(_prompt, *, route, **_kwargs):
+        calls.append(route.name)
+        if len(calls) == 1:
+            return "not json"
+        if len(calls) == 2:
+            raise QuotaExhaustedError(route.name, 429, "quota")
+        return json.dumps({"results": [{"item_id": "a", "label": "matched", "confidence": 0.9, "evidence": ["工具栏一直显示"], "reason": "符合", "needs_review": False}]})
+
+    config = TopicMiningConfig(classifier_batch_size=1, classifier_concurrency=1)
+    first, first_stats = classify_candidates(valid_topic_spec, [recall("a")], artifact_dir=tmp_path, routes=[_route()], config=config, call_fn=call_fn)
+    assert first == []
+    assert first_stats["run_status"] == "paused_quota_exhausted"
+    audit_lines = [json.loads(line) for line in (tmp_path / "classification_audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(audit_lines) == 1
+    assert audit_lines[0]["raw_replies"] == ["not json"]
+    assert audit_lines[0]["parse_errors"]
+    assert audit_lines[0]["route_source"] == "classifier"
+    assert audit_lines[0]["model"] == "test-model"
+    assert audit_lines[0]["item_ids"] == ["a"]
+    assert not (tmp_path / "classified.jsonl").exists()
+
+    second, second_stats = classify_candidates(valid_topic_spec, [recall("a")], artifact_dir=tmp_path, routes=[_route()], config=config, call_fn=call_fn, resume=True)
+    assert [row.item_id for row in second] == ["a"]
+    assert second_stats["classification_status"] == "review_ready"
+    assert len((tmp_path / "classification_audit.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_missing_route_credentials_fails_before_scheduling(tmp_path, valid_topic_spec):

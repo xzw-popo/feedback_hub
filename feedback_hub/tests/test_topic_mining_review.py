@@ -56,6 +56,11 @@ def test_review_queue_includes_all_mandatory_reasons_and_stable_samples():
     assert first == second
 
 
+def test_review_queue_honors_classifier_requested_review_for_rejects():
+    queue = build_review_queue("run", [ClassificationResult("reject", "not_matched", 0.4, (), "证据不足", True)], {"reject": recall()}, per_label_sample=0)
+    assert queue[0]["review_reasons"] == ["classifier_requested_review"]
+
+
 def test_overrides_are_separate_and_cannot_change_source_text():
     merged = apply_review_overrides(
         [matched("a", 0.6)],
@@ -84,6 +89,13 @@ def test_persisted_queue_and_overrides_use_separate_auditable_paths(tmp_path):
 def test_overrides_validate_identity_and_decision(overrides, message):
     with pytest.raises(ValueError, match=message):
         apply_review_overrides([matched("a", 0.9)], overrides)
+
+
+def test_overrides_cannot_turn_empty_evidence_reject_into_match_or_bypass_explicit_empty_labels():
+    with pytest.raises(ValueError, match="evidence"):
+        apply_review_overrides([rejected("a", 0.9)], [{"item_id": "a", "label": "matched", "reason": "改判", "reviewer": "skill-ai"}])
+    with pytest.raises(ValueError, match="label"):
+        apply_review_overrides([matched("a", 0.9)], [{"item_id": "a", "label": "matched", "reason": "改判", "reviewer": "skill-ai"}], allowed_labels=set())
 
 
 def test_review_queue_rejects_duplicate_classification_ids():

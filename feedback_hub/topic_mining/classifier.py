@@ -116,11 +116,11 @@ def parse_classification_reply(
     for row in payload["results"]:
         if not isinstance(row, dict) or set(row) != _REQUIRED_RESULT_FIELDS:
             raise ValueError("classification result has unsupported fields")
-        item_id = _required_text(row.get("item_id"), "item_id")
+        item_id = _exact_required_text(row.get("item_id"), "item_id")
         if item_id in seen:
             raise ValueError(f"duplicate item_id: {item_id}")
         seen.add(item_id)
-        label = _required_text(row.get("label"), "label")
+        label = _exact_required_text(row.get("label"), "label")
         if label not in allowed_labels:
             raise ValueError(f"unsupported label: {label}")
         confidence = row.get("confidence")
@@ -129,7 +129,10 @@ def parse_classification_reply(
         evidence_value = row.get("evidence")
         if not isinstance(evidence_value, list) or any(not isinstance(value, str) or not value.strip() for value in evidence_value):
             raise ValueError("evidence must be an array of non-empty strings")
-        evidence = tuple(value.strip() for value in evidence_value)
+        # Evidence must remain byte-for-byte identical to the model response.
+        # Whitespace can change substring semantics, so only use strip to test
+        # whether it is blank and validate the original text below.
+        evidence = tuple(evidence_value)
         if label == "matched" and not evidence:
             raise ValueError("matched results require evidence")
         reason = _required_text(row.get("reason"), "reason")
@@ -199,6 +202,7 @@ def classify_candidates(
     artifact_dir = Path(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     batches_path = artifact_dir / "classification_batches.jsonl"
+    partial_audit_dir = artifact_dir / "classification_partial_audit"
     if resume:
         _retain_successful_checkpoints(batches_path)
     batch_payloads = [normalized[index:index + config.classifier_batch_size] for index in range(0, len(normalized), config.classifier_batch_size)]
@@ -221,6 +225,30 @@ def classify_candidates(
             prompt = build_classification_prompt(spec, batch, contexts=contexts, repair_error=parser_errors[-1] if parser_errors else None)
             try:
                 reply = invoke_model_route(prompt, route=route, call_fn=openai_call, max_retries=max_retries, timeout=request_timeout)
+            except QuotaExhaustedError:
+                # The shared scheduler intentionally does not retain a future
+                # that raises quota. Persist this already-safe partial record
+                # by batch key before re-raising so the main thread can merge
+                # it after all workers settle.
+                _write_partial_audit(
+                    partial_audit_dir,
+                    key,
+                    _classification_audit_row(
+                        key=key,
+                        expected_ids=expected_ids,
+                        results=(),
+                        raw_replies=raw_replies,
+                        parser_errors=parser_errors,
+                        call_error=None,
+                        route=route,
+                        attempts=attempts,
+                        retry_chain=retry_chain,
+                        elapsed_ms=elapsed_ms,
+                        audit_id=f"{key}:quota:{len(raw_replies)}",
+                    ),
+                    route.credential,
+                )
+                raise
             except Exception as exc:
                 # QuotaExhaustedError is intentionally not flattened: the scheduler
                 # must stop submission and preserve its pause checkpoint.
@@ -239,28 +267,28 @@ def classify_candidates(
             except ValueError as exc:
                 parser_errors.append(f"{type(exc).__name__}: {exc}")
         error = call_error or (parser_errors[-1] if not results else None)
-        row = {
-            "batch_key": key,
-            "item_ids": sorted(expected_ids),
-            "results": [result.to_dict() for result in results] if error is None else [],
-            "raw_replies": raw_replies,
-            "parse_errors": parser_errors,
-            "parse_attempts": len(raw_replies),
-            "call_error": call_error,
-            "route_source": route.name,
-            "endpoint_class": route.endpoint_class,
-            "model": route.model,
-            "attempts": attempts,
-            "retry_chain": retry_chain,
-            "elapsed_ms": elapsed_ms,
-        }
+        row = _classification_audit_row(
+            key=key,
+            expected_ids=expected_ids,
+            results=results if error is None else (),
+            raw_replies=raw_replies,
+            parser_errors=parser_errors,
+            call_error=call_error,
+            route=route,
+            attempts=attempts,
+            retry_chain=retry_chain,
+            elapsed_ms=elapsed_ms,
+            audit_id=f"{key}:final:{len(raw_replies)}",
+        )
         return row, error
 
     rows, scheduler_stats = run_pauseable_model_jobs(
         jobs, worker, routes=selected_routes, output_path=batches_path,
         concurrency_per_route=config.classifier_concurrency, resume=resume,
     )
-    _write_audit(artifact_dir / "classification_audit.jsonl", rows, append=resume)
+    partial_rows = _read_partial_audit(partial_audit_dir)
+    _write_audit(artifact_dir / "classification_audit.jsonl", [*partial_rows, *rows], append=resume)
+    _clear_partial_audit(partial_audit_dir)
     ready = scheduler_stats["run_status"] == "completed" and scheduler_stats["failed"] == 0
     results = _flatten_complete_results(rows, normalized) if ready else []
     classified_path = artifact_dir / "classified.jsonl"
@@ -288,6 +316,38 @@ def _normalize_candidates(candidates: Sequence[RecallHit]) -> list[dict[str, Any
         seen.add(item_id)
         normalized.append({"item_id": item_id, "text": _required_text(item.get("text"), f"candidate {item_id} text")})
     return sorted(normalized, key=lambda row: row["item_id"])
+
+
+def _classification_audit_row(
+    *,
+    key: str,
+    expected_ids: set[str],
+    results: Sequence[ClassificationResult],
+    raw_replies: Sequence[str],
+    parser_errors: Sequence[str],
+    call_error: str | None,
+    route: ModelRoute,
+    attempts: int,
+    retry_chain: Sequence[str],
+    elapsed_ms: int,
+    audit_id: str,
+) -> dict[str, Any]:
+    return {
+        "audit_id": audit_id,
+        "batch_key": key,
+        "item_ids": sorted(expected_ids),
+        "results": [result.to_dict() for result in results],
+        "raw_replies": list(raw_replies),
+        "parse_errors": list(parser_errors),
+        "parse_attempts": len(raw_replies),
+        "call_error": call_error,
+        "route_source": route.name,
+        "endpoint_class": route.endpoint_class,
+        "model": route.model,
+        "attempts": attempts,
+        "retry_chain": list(retry_chain),
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def _call_openai_classifier(
@@ -364,11 +424,51 @@ def _retain_successful_checkpoints(output_path: Path) -> None:
     checkpoint.write_text("".join(line + "\n" for line in good), encoding="utf-8")
 
 
+def _write_partial_audit(directory: Path, batch_key: str, row: Mapping[str, Any], secret: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{batch_key.replace(':', '_')}.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(_redact_nested(dict(row), secret), ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _read_partial_audit(directory: Path) -> list[dict[str, Any]]:
+    if not directory.exists():
+        return []
+    rows = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
+
+
+def _clear_partial_audit(directory: Path) -> None:
+    if not directory.exists():
+        return
+    for path in directory.glob("*.json"):
+        path.unlink(missing_ok=True)
+    directory.rmdir()
+
+
 def _write_audit(path: Path, rows: Sequence[Mapping[str, Any]], *, append: bool) -> None:
-    mode = "a" if append and path.exists() else "w"
-    with path.open(mode, encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
+    existing: list[dict[str, Any]] = []
+    if append and path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                existing.append(value)
+    merged = {str(row.get("audit_id") or f"legacy:{index}"): dict(row) for index, row in enumerate(existing)}
+    for index, row in enumerate(rows):
+        merged[str(row.get("audit_id") or f"new:{index}")] = dict(row)
+    ordered = [merged[key] for key in sorted(merged)]
+    path.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in ordered), encoding="utf-8")
 
 
 def _extract_json_text(raw: str) -> str:
@@ -384,5 +484,23 @@ def _required_text(value: Any, field: str) -> str:
     return value.strip()
 
 
+def _exact_required_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{field} must be an exact non-empty string")
+    return value
+
+
 def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def _redact_nested(value: Any, secret: str) -> Any:
+    if isinstance(value, str):
+        return _redact(value, secret)
+    if isinstance(value, list):
+        return [_redact_nested(item, secret) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_nested(item, secret) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _redact_nested(item, secret) for key, item in value.items()}
+    return value

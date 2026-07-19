@@ -29,6 +29,8 @@ def build_review_queue(
         hit = recall_by_id.get(result.item_id)
         if hit is None:
             raise ValueError(f"missing recall source for classification item_id: {result.item_id}")
+        if result.needs_review:
+            reasons.add("classifier_requested_review")
         if result.label == "matched":
             if result.confidence < 0.75:
                 reasons.add("low_confidence_match")
@@ -36,8 +38,6 @@ def build_review_queue(
                 reasons.add("vector_only_match")
             if hit.negative_query_hits:
                 reasons.add("negative_query_conflict")
-            if result.needs_review:
-                reasons.add("classifier_requested_review")
         rows[result.item_id] = _queue_row(result, hit, reasons)
     for label in sorted({result.label for result in classifications}):
         selected = _hash_select(run_id, [result for result in classifications if result.label == label], "deterministic_label_sample", per_label_sample)
@@ -61,7 +61,7 @@ def apply_review_overrides(
     *,
     allowed_labels: set[str] | None = None,
 ) -> list[ClassificationResult]:
-    allowed_labels = allowed_labels or {"matched", "not_matched"}
+    allowed_labels = {"matched", "not_matched"} if allowed_labels is None else allowed_labels
     original = {result.item_id: result for result in classifications}
     seen: set[str] = set()
     validated: dict[str, Mapping[str, Any]] = {}
@@ -77,6 +77,8 @@ def apply_review_overrides(
             raise ValueError(f"unsupported override label: {label}")
         _required_override_text(override.get("reason"), "reason")
         _required_override_text(override.get("reviewer"), "reviewer")
+        if label == "matched" and not original[item_id].evidence:
+            raise ValueError("override cannot mark an empty-evidence result as matched")
         validated[item_id] = override
     merged = []
     for result in classifications:
