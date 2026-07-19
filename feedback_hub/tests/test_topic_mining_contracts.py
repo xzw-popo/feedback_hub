@@ -45,6 +45,26 @@ def test_validate_topic_spec_normalizes_timezone_and_deduplicates_terms():
     assert spec.lexical_hints["contexts"] == ("全屏", "游戏")
 
 
+def test_schema_allows_duplicate_list_values_that_normalizer_deduplicates():
+    raw = valid_spec()
+    raw["scope"]["platforms"].append("Win")
+    raw["lexical_hints"]["contexts"].append("全屏")
+
+    spec = validate_topic_spec(raw)
+
+    assert spec.scope.platforms == ("Win",)
+    assert spec.lexical_hints["contexts"] == ("全屏", "游戏")
+    assert "uniqueItems" not in str(topic_spec_json_schema())
+
+
+def test_validate_topic_spec_rejects_unknown_lexical_hint_keys():
+    raw = valid_spec()
+    raw["lexical_hints"]["symptoms"] = ["遮挡"]
+
+    with pytest.raises(ValueError, match="lexical_hints"):
+        validate_topic_spec(raw)
+
+
 @pytest.mark.parametrize("field", ["topic_name", "objective", "inclusion_criteria", "exclusion_criteria"])
 def test_validate_topic_spec_rejects_missing_semantic_boundary(field):
     raw = valid_spec()

@@ -32,6 +32,7 @@ _SCOPE_FIELDS = frozenset(
 )
 _OUTPUT_FIELDS = frozenset({"preferred_format", "required_fields"})
 _LABEL_FIELDS = frozenset({"id", "meaning"})
+_LEXICAL_HINT_FIELDS = frozenset({"objects", "contexts"})
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
         raise ValueError("unit must be 'feedback' or 'conversation'")
 
     lexical_raw = _require_mapping(raw["lexical_hints"], "lexical_hints")
+    _reject_unknown(lexical_raw, _LEXICAL_HINT_FIELDS, "lexical_hints")
     lexical_hints = {
         _required_string(key, "lexical_hints key"): _string_list(value, f"lexical_hints.{key}")
         for key, value in lexical_raw.items()
@@ -221,7 +223,7 @@ def topic_spec_hash(spec: TopicSpec) -> str:
 
 def topic_spec_json_schema() -> dict[str, Any]:
     """Return the strict JSON Schema accepted by :func:`validate_topic_spec`."""
-    string_array = {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True}
+    string_array = {"type": "array", "items": {"type": "string", "minLength": 1}}
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
