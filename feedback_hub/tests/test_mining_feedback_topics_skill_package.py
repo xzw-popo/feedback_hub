@@ -204,6 +204,62 @@ def test_skill_guidance_shapes_blocked_pre_run_responses():
     assert "never default to all history" in body
 
 
+def test_skill_guidance_assigns_capability_and_run_quality_fields_to_the_right_commands():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    capabilities = next(line for line in body.splitlines() if line.startswith("1. **capabilities."))
+    inspect = next(line for line in body.splitlines() if line.startswith("4. **inspect."))
+    for value in ("schema versions", "formats", "statuses", "read-only flags"):
+        assert value in capabilities
+    assert "vector watermark" not in capabilities
+    assert "`get-run run_id`" in inspect
+    assert "vector watermark" in inspect
+
+
+def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    commands = (
+        "`capabilities`",
+        "validate_topic_spec.py",
+        "`create-run --spec file`",
+        "`get-run run_id`",
+        "`review-queue run_id --output file`",
+        "`apply-overrides run_id --file file`",
+        "`verify run_id`",
+        "`export run_id --format xlsx|jsonl`",
+        "`download run_id artifact --output file`",
+    )
+    positions = [body.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
+def test_skill_guidance_asks_for_missing_time_as_a_direct_question():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "what start time, end time, and timezone should this run use?" in body
+
+
+def test_skill_guidance_resolves_explicit_relative_time_without_questioning():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "treat an explicit relative time range as supplied scope" in body
+    assert "resolve it from the current date and timezone without asking again" in body
+
+
+def test_backend_contract_has_one_copyable_complete_command_sequence():
+    text = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    commands = (
+        "python3 scripts/topic_backend_client.py capabilities",
+        "python3 scripts/validate_topic_spec.py TOPIC_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py get-run RUN_ID",
+        "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PATH",
+        "python3 scripts/topic_backend_client.py apply-overrides RUN_ID --file OVERRIDES_PATH",
+        "python3 scripts/topic_backend_client.py verify RUN_ID",
+        "python3 scripts/topic_backend_client.py export RUN_ID --format xlsx",
+        "python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH",
+    )
+    positions = [text.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
 def test_client_download_uses_atomic_replace(tmp_path, monkeypatch):
     module = _load_client_module()
     target = tmp_path / "result.xlsx"

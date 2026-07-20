@@ -286,3 +286,66 @@ python3 .../topic_backend_client.py export RUN_ID --format jsonl
 | missing-scope | unnecessary_blocking_question | Exactly one material time-range question is requested. | false |
 | missing-scope | silent_partial_result | Service and scope blockers are explicit. | false |
 | missing-scope | formal_label_writeback | No writeback is claimed. | false |
+
+## Review-driven reruns
+
+The reviewer found two remaining evaluation gaps. First, the toolbar answer attributed vector-watermark discovery to `capabilities` and showed an incomplete/non-verbatim executable sequence. Second, the adjacent-concepts answer stated that time was missing but did not phrase the required scope slot as a direct question. Structural tests were added first and observed failing. The Skill and backend reference were then tightened so `capabilities` covers only schema/formats/status/read-only flags, `get-run` owns watermark inspection, the reference provides one complete copyable command path, explicit relative time is resolved from the current date/timezone, and missing absolute time is requested as a direct start/end/timezone question.
+
+### toolbar-clear-scope — review rerun raw output
+
+当前无法实际检索：内部主题挖掘服务未配置 `FEEDBACK_TOPIC_API_URL`（`capabilities` 已返回该配置缺失），因此不能承诺原文、链接或向量召回覆盖。
+
+- 拟定范围：2026-01-20 至 2026-07-20（Asia/Shanghai），Win 端；分别匹配
+  1. 输入法工具栏位置异常移动/乱跑；
+  2. 视频或游戏处于全屏、无边框全屏、独占全屏时，工具栏未隐藏。
+- 排除：非 Win 端；与位置无关的普通工具栏显示问题；与全屏无关的工具栏不隐藏；视频/游戏本身的性能、播放或兼容性问题。
+- 不改正式标签：主题挖掘运行仅产生独立的 `matched/not_matched` 审核决策与审计记录，不写回任何来源记录或正式标签。
+- 唯一阻塞：请提供已配置的内部服务地址（环境变量 `FEEDBACK_TOPIC_API_URL`；如需鉴权再配置 `FEEDBACK_TOPIC_API_TOKEN`）。
+
+配置后会按技能规定调用既有内部反馈/向量能力（不直接查询数据库或向量库）：
+
+```bash
+cd /Users/charvel/Desktop/用户反馈_2026_0612/.worktrees/mining-feedback-topics-skill/codex-skills/mining-feedback-topics
+python3 scripts/topic_backend_client.py capabilities
+python3 scripts/validate_topic_spec.py TOPIC_SPEC_PATH
+python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH
+python3 scripts/topic_backend_client.py get-run RUN_ID
+python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PATH
+# 仅当队列需人工判定时：
+python3 scripts/topic_backend_client.py apply-overrides RUN_ID --file OVERRIDES_PATH
+python3 scripts/topic_backend_client.py verify RUN_ID
+python3 scripts/topic_backend_client.py export RUN_ID --format xlsx
+python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH
+```
+
+其中后端负责按时间/Win 元数据硬筛、对“位置乱跑”和三类全屏不隐藏进行语义及向量召回；向量相似度只用于召回，最终只依据原文和上下文审核。通过 `verify` 后导出的结果会保留所需原文与来源链接。
+
+### adjacent-concepts — review rerun raw output
+
+预运行受阻，尚未检索。
+
+- 纳入：Windows 上，用户反馈“某个条/输入法工具栏”遮挡内容、挡住输入区域或影响可见性；输入法工具栏是必需对象。
+- 排除：Windows 系统任务栏遮挡；输入法候选框/候选栏遮挡。
+- 需要的唯一范围确认：请提供开始时间、结束时间和时区。
+- 服务阻塞：内部检索客户端未配置 `FEEDBACK_TOPIC_API_URL`（能力探测无法连接服务）。
+
+待范围和服务配置就绪后，可生成带逐条纳入/排除理由的可审计结果.
+
+### Review-rerun visible-behavior scoring
+
+| scenario | failure_code | evidence_excerpt | present |
+| --- | --- | --- | --- |
+| toolbar-clear-scope | missing_negative_boundary | Both target branches and explicit adjacent exclusions are visible. | false |
+| toolbar-clear-scope | vector_as_final_judge | “向量相似度只用于召回，最终只依据原文和上下文审核。” | false |
+| toolbar-clear-scope | bottom_layer_parameters_exposed | The complete high-level client sequence contains no retrieval tuning. | false |
+| toolbar-clear-scope | no_audit_trail | No result is claimed while blocked; planned source text, links, decisions, and audit record are explicit. | false |
+| toolbar-clear-scope | unnecessary_blocking_question | The relative six-month range is resolved; only the missing service configuration is requested. | false |
+| toolbar-clear-scope | silent_partial_result | The pre-run service blocker and absence of results are explicit. | false |
+| toolbar-clear-scope | formal_label_writeback | “不写回任何来源记录或正式标签。” | false |
+| adjacent-concepts | missing_negative_boundary | Input-method toolbar inclusion and both requested exclusions are explicit. | false |
+| adjacent-concepts | vector_as_final_judge | No vector-based judgment is claimed. | false |
+| adjacent-concepts | bottom_layer_parameters_exposed | No retrieval tuning is exposed. | false |
+| adjacent-concepts | no_audit_trail | No result is claimed while blocked; promised output is auditable per item. | false |
+| adjacent-concepts | unnecessary_blocking_question | The only question requests the required start, end, and timezone. | false |
+| adjacent-concepts | silent_partial_result | Scope and service blockers are explicit. | false |
+| adjacent-concepts | formal_label_writeback | No formal-label writeback is claimed. | false |
