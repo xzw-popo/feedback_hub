@@ -154,11 +154,11 @@ class TopicRunStore:
         """
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
             raise ValueError("worker lease seconds must be positive")
-        claimed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-        lease_expires_at_ms = claimed_at_ms + lease_seconds * 1000
         claim_token = secrets.token_urlsafe(32)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            claimed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+            lease_expires_at_ms = claimed_at_ms + lease_seconds * 1000
             row = connection.execute(
                 "SELECT status, worker_lease_expires_at_ms FROM topic_run WHERE run_id = ?",
                 (run_id,),
@@ -204,8 +204,9 @@ class TopicRunStore:
     ) -> bool:
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
             raise ValueError("worker lease seconds must be positive")
-        renewed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            renewed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
             cursor = connection.execute(
                 """UPDATE topic_run
                    SET worker_lease_expires_at_ms = ?, updated_at_ms = ?
@@ -253,8 +254,9 @@ class TopicRunStore:
         error_message: str,
     ) -> bool:
         """Atomically fail and release only the worker that still owns a run."""
-        now_ms = int(time.time() * 1000)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = int(time.time() * 1000)
             cursor = connection.execute(
                 """UPDATE topic_run
                    SET status = 'failed', error_code = ?, error_message = ?,
@@ -281,8 +283,9 @@ class TopicRunStore:
     ) -> None:
         if status not in RUN_STATES:
             raise ValueError(f"unsupported topic run status: {status}")
-        now_ms = int(time.time() * 1000)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = int(time.time() * 1000)
             cursor = connection.execute(
                 """UPDATE topic_run
                    SET status = ?, stage = COALESCE(?, stage), updated_at_ms = ?,
@@ -321,8 +324,9 @@ class TopicRunStore:
         """Atomically publish a stage manifest and optional stable status."""
         if status is not None and status not in RUN_STATES:
             raise ValueError(f"unsupported topic run status: {status}")
-        now_ms = int(time.time() * 1000)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = int(time.time() * 1000)
             worker_reset = status is not None and status != "running"
             cursor = connection.execute(
                 """UPDATE topic_run SET stage = ?, status = COALESCE(?, status),
@@ -351,8 +355,9 @@ class TopicRunStore:
         *,
         now_ms: int | None = None,
     ) -> None:
-        checked_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            checked_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
             row = connection.execute(
                 """SELECT 1 FROM topic_run
                    WHERE run_id = ? AND status = 'running'

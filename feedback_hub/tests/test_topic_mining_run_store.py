@@ -3,6 +3,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -362,6 +363,39 @@ def test_worker_rechecks_lease_after_waiting_for_publication_lock(
         blocker.close()
 
     assert not target.exists()
+
+
+def test_manifest_update_rechecks_lease_after_waiting_for_database_lock(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(run["run_id"], lease_seconds=1)
+    started = Event()
+
+    def update_manifest() -> None:
+        started.set()
+        store.update_manifest(
+            run["run_id"], {"writer": "expired"}, stage="classify",
+            worker_claim_token=claim.claim_token,
+        )
+
+    blocker = sqlite3.connect(store.db_path, timeout=30)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(update_manifest)
+            assert started.wait(timeout=1)
+            remaining = claim.lease_expires_at_ms / 1000 - time.time()
+            if remaining > 0:
+                time.sleep(remaining + 0.05)
+            blocker.commit()
+            with pytest.raises(RuntimeError, match="worker_claim_lost"):
+                future.result(timeout=5)
+    finally:
+        blocker.close()
+
+    assert store.get(run["run_id"])["manifest_json"] == "{}"
 
 
 def test_unfenced_stale_worker_cannot_publish_over_new_claim(

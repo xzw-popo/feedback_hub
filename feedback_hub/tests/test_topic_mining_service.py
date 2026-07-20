@@ -86,6 +86,8 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(
     from feedback_hub.topic_mining.service import (
         _classification_output_safe,
         _classification_resume_safe,
+        _checkpoint_attempt,
+        _promote_stage_files,
         _publish_classification_progress,
     )
 
@@ -150,6 +152,25 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(
     forged_audit.write_text('{"forged":true}\n', encoding="utf-8")
     _publish_classification_progress(
         run["run_id"], claimed, artifact_dir, workspace, manifest,
+    )
+    persisted = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert _classification_output_safe(
+        persisted, artifact_dir, forged_audit.name,
+    ) is False
+
+    final_workspace = claimed.stage_artifact_dir(
+        artifact_dir, "classify_final_test",
+    )
+    staged_audit = final_workspace / forged_audit.name
+    staged_audit.write_text('{"trusted":true}\n', encoding="utf-8")
+    final_hashes = _promote_stage_files(
+        run["run_id"], claimed, artifact_dir, final_workspace,
+        [staged_audit.name],
+    )
+    forged_audit.write_text('{"tampered_after_final":true}\n', encoding="utf-8")
+    _checkpoint_attempt(
+        run["run_id"], claimed, artifact_dir, manifest, "classify",
+        [forged_audit], output_hashes=final_hashes,
     )
     persisted = json.loads(store.get(run["run_id"])["manifest_json"])
     assert _classification_output_safe(

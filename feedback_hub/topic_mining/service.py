@@ -122,7 +122,7 @@ def _run_pipeline(
         staged_snapshot_path = snapshot_workspace / snapshot_path.name
         snapshot = create_source_snapshot(config.source_db_path, staged_snapshot_path)
         _ensure_worker_active(run_id, store)
-        _promote_stage_files(
+        snapshot_hashes = _promote_stage_files(
             run_id, store, artifact_dir, snapshot_workspace,
             [snapshot_path.name],
         )
@@ -133,7 +133,10 @@ def _run_pipeline(
             "source_watermark_ms": snapshot.max_ts_ms,
             "source_sha256": snapshot.sha256,
         })
-        _checkpoint(run_id, store, artifact_dir, manifest, "snapshot", [snapshot_path])
+        _checkpoint(
+            run_id, store, artifact_dir, manifest, "snapshot", [snapshot_path],
+            output_hashes=snapshot_hashes,
+        )
     snapshot_meta = manifest.get("source_snapshot") or {}
     source_watermark_ms = int(snapshot_meta.get("max_ts_ms") or run["source_watermark_ms"])
 
@@ -147,7 +150,7 @@ def _run_pipeline(
         scope_workspace = _stage_workspace(store, artifact_dir, "hard_scope")
         _write_jsonl(scope_workspace / scoped_path.name, items)
         _atomic_json(scope_workspace / contexts_path.name, contexts)
-        _promote_stage_files(
+        scope_hashes = _promote_stage_files(
             run_id, store, artifact_dir, scope_workspace,
             [scoped_path.name, contexts_path.name],
         )
@@ -155,7 +158,10 @@ def _run_pipeline(
         # Clear only the failure owned by this stage after the repaired stage
         # has produced valid outputs. Other unresolved failures remain intact.
         manifest["unresolved_coverage_items"] = 0
-        _checkpoint(run_id, store, artifact_dir, manifest, "hard_scope", [scoped_path, contexts_path])
+        _checkpoint(
+            run_id, store, artifact_dir, manifest, "hard_scope",
+            [scoped_path, contexts_path], output_hashes=scope_hashes,
+        )
     items = _read_jsonl(scoped_path)
     contexts = _read_json(contexts_path, {})
 
@@ -175,7 +181,7 @@ def _run_pipeline(
             source_watermark_ms=source_watermark_ms, vector_watermark_ms=result.watermark_ts_ms,
         )
         _ensure_worker_active(run_id, store)
-        _promote_stage_files(
+        recall_hashes = _promote_stage_files(
             run_id, store, artifact_dir, recall_workspace,
             [recall_path.name, recall_manifest_path.name],
         )
@@ -186,7 +192,10 @@ def _run_pipeline(
             "retrieval_config": _safe_config(config),
             "unresolved_vector_items": 0,
         })
-        _checkpoint(run_id, store, artifact_dir, manifest, "hybrid_recall", [recall_path, recall_manifest_path])
+        _checkpoint(
+            run_id, store, artifact_dir, manifest, "hybrid_recall",
+            [recall_path, recall_manifest_path], output_hashes=recall_hashes,
+        )
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
 
     classified_path = artifact_dir / "classified.jsonl"
@@ -218,7 +227,7 @@ def _run_pipeline(
             ),
         )
         _ensure_worker_active(run_id, store)
-        _promote_stage_files(
+        classification_hashes = _promote_stage_files(
             run_id, store, artifact_dir, classify_workspace,
             [
                 name for name in _CLASSIFICATION_WORK_FILES
@@ -232,13 +241,22 @@ def _run_pipeline(
         manifest["unresolved_parser_items"] = int(stats.get("failed", 0))
         # Classification can safely pause; it must never publish review_ready.
         if stats.get("run_status") == "paused_quota_exhausted":
-            _checkpoint_attempt(run_id, store, artifact_dir, manifest, "classify", [audit_path])
+            _checkpoint_attempt(
+                run_id, store, artifact_dir, manifest, "classify", [audit_path],
+                output_hashes=classification_hashes,
+            )
             _set_status(run_id, store, "paused_quota_exhausted", stage="classify")
             return
         if manifest["unresolved_classifier_items"] or manifest["unresolved_parser_items"]:
-            _checkpoint_attempt(run_id, store, artifact_dir, manifest, "classify", [audit_path])
+            _checkpoint_attempt(
+                run_id, store, artifact_dir, manifest, "classify", [audit_path],
+                output_hashes=classification_hashes,
+            )
             raise ValueError("unresolved_classifier_items")
-        _checkpoint(run_id, store, artifact_dir, manifest, "classify", [classified_path, audit_path])
+        _checkpoint(
+            run_id, store, artifact_dir, manifest, "classify",
+            [classified_path, audit_path], output_hashes=classification_hashes,
+        )
         classifications_rebuilt = True
     classifications = [_classification_from_dict(row) for row in _read_jsonl(classified_path)]
 
@@ -252,12 +270,15 @@ def _run_pipeline(
             review_workspace, queue,
             _read_jsonl(overrides_path) if overrides_path.exists() else [],
         )
-        _promote_stage_files(
+        review_hashes = _promote_stage_files(
             run_id, store, artifact_dir, review_workspace,
             [queue_path.name, overrides_path.name],
         )
         manifest["review_queue"] = {"item_count": len(queue)}
-        _checkpoint(run_id, store, artifact_dir, manifest, "review_queue", [queue_path, overrides_path])
+        _checkpoint(
+            run_id, store, artifact_dir, manifest, "review_queue",
+            [queue_path, overrides_path], output_hashes=review_hashes,
+        )
 
     # The final persisted stage says only that review material is ready. A
     # separately requested verify step is required before data leaves the run.
@@ -269,11 +290,14 @@ def _run_pipeline(
     review_ready_path = artifact_dir / "review_ready.json"
     ready_workspace = _stage_workspace(store, artifact_dir, "review_ready")
     _atomic_json(ready_workspace / review_ready_path.name, {"classification_count": len(classifications), "queue_count": len(_read_jsonl(queue_path))})
-    _promote_stage_files(
+    ready_hashes = _promote_stage_files(
         run_id, store, artifact_dir, ready_workspace,
         [review_ready_path.name],
     )
-    _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [queue_path, overrides_path])
+    _checkpoint(
+        run_id, store, artifact_dir, manifest, "review_ready",
+        [queue_path, overrides_path], output_hashes=ready_hashes,
+    )
     _set_status(run_id, store, "review_ready", stage="review_ready")
 
 
@@ -552,20 +576,48 @@ def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> Non
             raise RunVerificationError("manifest_stage_chain")
 
 
-def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
+def _checkpoint(
+    run_id: str,
+    store: TopicRunStore,
+    artifact_dir: Path,
+    manifest: dict[str, Any],
+    stage: str,
+    files: Sequence[Path],
+    *,
+    output_hashes: Mapping[str, str] | None = None,
+) -> None:
     artifacts = manifest.setdefault("artifacts", {})
     for path in files:
         if not path.is_file():
             continue
-        artifacts[path.name] = _sha256(path)
+        artifacts[path.name] = (
+            output_hashes[path.name]
+            if output_hashes is not None and path.name in output_hashes
+            else _sha256(path)
+        )
     if stage not in _STAGES:
         manifest["stage"] = stage
         _write_manifest_mirror(run_id, store, artifact_dir, manifest)
         store.update_manifest(run_id, manifest, stage=stage)
         return
     input_names, output_names = _stage_contract_names(stage, artifact_dir)
-    inputs = {name: _sha256(artifact_dir / name) for name in input_names}
-    outputs = {name: _sha256(artifact_dir / name) for name in output_names}
+    inputs = _trusted_stage_input_hashes(
+        manifest, artifact_dir, input_names,
+    ) if input_names else {}
+    if output_hashes is None:
+        outputs = {name: _sha256(artifact_dir / name) for name in output_names}
+    else:
+        if set(output_hashes) != output_names:
+            raise RunVerificationError("manifest_stage_chain")
+        outputs = {
+            name: digest
+            for name, digest in output_hashes.items()
+            if isinstance(digest, str)
+            and len(digest) == 64
+            and (artifact_dir / name).is_file()
+        }
+        if set(outputs) != output_names:
+            raise RunVerificationError("manifest_stage_chain")
     funnel = manifest.setdefault("funnel", {})
     output_count = _stage_output_count(stage, artifact_dir, manifest)
     manifest.setdefault("stages", {})[stage] = {
@@ -597,7 +649,11 @@ def _checkpoint_attempt(
     artifacts = manifest.setdefault("artifacts", {})
     for path in files:
         if path.is_file():
-            artifacts[path.name] = _sha256(path)
+            artifacts[path.name] = (
+                output_hashes[path.name]
+                if output_hashes is not None and path.name in output_hashes
+                else _sha256(path)
+            )
     inputs, _ = _stage_contract_names(stage, artifact_dir)
     if output_hashes is not None:
         outputs = {
@@ -816,19 +872,32 @@ def _promote_stage_files(
     artifact_dir: Path,
     workspace: Path,
     names: Sequence[str],
-) -> None:
+) -> dict[str, str] | None:
     """Publish one worker generation only while its claim remains current."""
     if workspace == artifact_dir:
-        return
+        return None
     _ensure_worker_active(run_id, store)
     publisher = getattr(store, "publish_worker_files", None)
     if publisher is None:  # pragma: no cover - paired with _stage_workspace
         raise RuntimeError("worker artifact publisher unavailable")
-    publisher(
+    pairs = [
+        (workspace / name, artifact_dir / name)
+        for name in names
+    ]
+    published = publisher(
         run_id,
-        [(workspace / name, artifact_dir / name) for name in names],
+        pairs,
     )
+    if not isinstance(published, Mapping):  # pragma: no cover - store contract
+        raise RuntimeError("worker artifact publisher omitted digests")
+    hashes = {
+        str(target.relative_to(artifact_dir)): str(
+            published[Path(target).resolve()]
+        )
+        for _source, target in pairs
+    }
     shutil.rmtree(workspace, ignore_errors=True)
+    return hashes
 
 
 def _publish_classification_progress(
