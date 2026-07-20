@@ -149,3 +149,93 @@ def test_pull_end_to_end_with_mock(tmp_path, monkeypatch):
     assert (tmp_path / "raw").exists()
     raw_files = list((tmp_path / "raw").glob("raw_wetype_*.json"))
     assert len(raw_files) == 1
+
+
+def test_pull_publishes_feedback_and_coverage_in_one_transaction(
+    tmp_path, monkeypatch,
+):
+    ts_ms = 1747526400000
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window",
+        lambda *_args, **_kwargs: _sample_resp(ts_ms),
+    )
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(
+        puller, "ensure_dirs",
+        lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True),
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    original = db.record_feedback_source_coverage
+    visible_before_generation = []
+
+    def observe_before_generation(connection, **kwargs):
+        with db.connect(db_path) as observer:
+            visible_before_generation.append(
+                observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            )
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(db, "record_feedback_source_coverage", observe_before_generation)
+    start = datetime.fromtimestamp(ts_ms / 1000) - timedelta(seconds=1)
+    end = datetime.fromtimestamp(ts_ms / 1000) + timedelta(seconds=1)
+
+    try:
+        puller.pull(start, end, conn=conn)
+    finally:
+        conn.close()
+
+    assert visible_before_generation == [0]
+    with db.connect(db_path) as observer:
+        assert observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+        assert observer.execute(
+            "SELECT COUNT(*) FROM feedback_source_coverage"
+        ).fetchone()[0] == 1
+
+
+def test_pull_replays_the_whole_write_after_a_generation_collision(
+    tmp_path, monkeypatch,
+):
+    ts_ms = 1747526400000
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window",
+        lambda *_args, **_kwargs: _sample_resp(ts_ms),
+    )
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(
+        puller, "ensure_dirs",
+        lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True),
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    original = db.record_feedback_source_coverage
+    attempts = 0
+
+    def collide_once(connection, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            connection.rollback()
+            raise db.SourceGenerationCollisionError(
+                "simulated source generation collision"
+            )
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(db, "record_feedback_source_coverage", collide_once)
+    start = datetime.fromtimestamp(ts_ms / 1000) - timedelta(seconds=1)
+    end = datetime.fromtimestamp(ts_ms / 1000) + timedelta(seconds=1)
+
+    try:
+        result = puller.pull(start, end, conn=conn)
+    finally:
+        conn.close()
+
+    assert attempts == 2
+    assert result["inserted_count"] == 1
+    with db.connect(db_path) as observer:
+        assert observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+        assert observer.execute(
+            "SELECT COUNT(*) FROM feedback_source_coverage"
+        ).fetchone()[0] == 1

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -120,7 +121,14 @@ def _run_pipeline(
     if not _stage_valid(manifest, "snapshot", artifact_dir):
         _ensure_worker_active(run_id, store)
         snapshot_workspace = _stage_workspace(store, artifact_dir, "snapshot")
-        staged_snapshot_path = snapshot_workspace / snapshot_path.name
+        direct_snapshot_stage = snapshot_workspace == artifact_dir
+        staged_snapshot_path = snapshot_workspace / (
+            snapshot_path.name + ".staged"
+            if direct_snapshot_stage
+            else snapshot_path.name
+        )
+        if direct_snapshot_stage:
+            staged_snapshot_path.unlink(missing_ok=True)
         persisted_watermark_ms = int(run["source_watermark_ms"])
         snapshot = create_source_snapshot(
             config.source_db_path,
@@ -128,11 +136,30 @@ def _run_pipeline(
         )
         if snapshot.coverage_watermark_ms != persisted_watermark_ms:
             raise RunVerificationError("source_watermark_mismatch")
+        persisted_snapshot_meta = manifest.get("source_snapshot")
+        trusted_snapshot_digest = manifest.get("source_sha256")
+        if (
+            trusted_snapshot_digest is None
+            and isinstance(persisted_snapshot_meta, Mapping)
+        ):
+            trusted_snapshot_digest = persisted_snapshot_meta.get("sha256")
+        if trusted_snapshot_digest is not None and (
+            not isinstance(trusted_snapshot_digest, str)
+            or len(trusted_snapshot_digest) != 64
+            or snapshot.sha256 != trusted_snapshot_digest
+        ):
+            if direct_snapshot_stage:
+                staged_snapshot_path.unlink(missing_ok=True)
+            raise RunVerificationError("source_snapshot_recovery_mismatch")
         _ensure_worker_active(run_id, store)
-        snapshot_hashes = _promote_stage_files(
-            run_id, store, artifact_dir, snapshot_workspace,
-            [snapshot_path.name],
-        )
+        if direct_snapshot_stage:
+            os.replace(staged_snapshot_path, snapshot_path)
+            snapshot_hashes = {snapshot_path.name: snapshot.sha256}
+        else:
+            snapshot_hashes = _promote_stage_files(
+                run_id, store, artifact_dir, snapshot_workspace,
+                [snapshot_path.name],
+            )
         snapshot_data = asdict(snapshot)
         snapshot_data["path"] = str(snapshot_path)
         manifest.update({

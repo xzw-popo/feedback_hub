@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from feedback_hub import db
 

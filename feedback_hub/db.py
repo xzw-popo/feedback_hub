@@ -29,6 +29,10 @@ from feedback_hub import config
 Connection = Any
 
 
+class SourceGenerationCollisionError(RuntimeError):
+    """Raised when another pull allocated the same source generation."""
+
+
 # ---------- 方言抽象 ----------
 
 def _db_mode() -> str:
@@ -372,32 +376,32 @@ def record_feedback_source_coverage(
         else int(completed_at_ms)
     )
     ph = "%s" if _db_mode() == "mysql" else "?"
-    for _attempt in range(8):
-        row = conn.execute(
-            "SELECT MAX(completed_at_ms) AS value FROM feedback_source_coverage"
-        ).fetchone()
-        previous = _row_get(row, "value") if row is not None else None
-        generation = max(proposed, int(previous or 0) + 1)
-        try:
-            conn.execute(
-                f"""INSERT INTO feedback_source_coverage (
-                    channel, start_ts_ms, end_ts_ms, completed_at_ms
-                ) VALUES ({ph}, {ph}, {ph}, {ph})""",
-                (channel.strip(), start_ts_ms, end_ts_ms, generation),
-            )
-        except Exception as exc:
-            mysql_code = exc.args[0] if getattr(exc, "args", ()) else None
-            is_generation_collision = (
-                isinstance(exc, sqlite3.IntegrityError)
-                and "unique" in str(exc).lower()
-            ) or mysql_code == 1062
-            if not is_generation_collision:
-                raise
+    row = conn.execute(
+        "SELECT MAX(completed_at_ms) AS value FROM feedback_source_coverage"
+    ).fetchone()
+    previous = _row_get(row, "value") if row is not None else None
+    generation = max(proposed, int(previous or 0) + 1)
+    try:
+        conn.execute(
+            f"""INSERT INTO feedback_source_coverage (
+                channel, start_ts_ms, end_ts_ms, completed_at_ms
+            ) VALUES ({ph}, {ph}, {ph}, {ph})""",
+            (channel.strip(), start_ts_ms, end_ts_ms, generation),
+        )
+    except Exception as exc:
+        mysql_code = exc.args[0] if getattr(exc, "args", ()) else None
+        is_generation_collision = (
+            isinstance(exc, sqlite3.IntegrityError)
+            and "unique" in str(exc).lower()
+        ) or mysql_code == 1062
+        if is_generation_collision:
             conn.rollback()
-            continue
-        conn.commit()
-        return generation
-    raise RuntimeError("could not allocate a unique source generation")
+            raise SourceGenerationCollisionError(
+                "source generation allocation collided"
+            ) from exc
+        raise
+    conn.commit()
+    return generation
 
 
 def update_conversation_assignment(

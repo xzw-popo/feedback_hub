@@ -167,13 +167,19 @@ def write_raw_dump(resp: dict, channel: str, tag: str) -> Path:
     return p
 
 
-def upsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
+def upsert_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    commit: bool = True,
+) -> int:
     """把 extract_rows 的结果写入 feedback 表，返回新增行数（已存在的跳过）。"""
     inserted = 0
     for row in rows:
         if db.upsert_feedback(conn, row):
             inserted += 1
-    conn.commit()
+    if commit:
+        conn.commit()
     return inserted
 
 
@@ -196,13 +202,23 @@ def pull(start_dt: datetime, end_dt: datetime, *,
         db.init_schema(conn)
         own_conn = True
     try:
-        inserted = upsert_rows(conn, rows)
-        source_generation_ms = db.record_feedback_source_coverage(
-            conn,
-            channel=channel,
-            start_ts_ms=s_ms,
-            end_ts_ms=e_ms,
-        )
+        for _attempt in range(8):
+            try:
+                inserted = upsert_rows(conn, rows, commit=False)
+                source_generation_ms = db.record_feedback_source_coverage(
+                    conn,
+                    channel=channel,
+                    start_ts_ms=s_ms,
+                    end_ts_ms=e_ms,
+                )
+                break
+            except db.SourceGenerationCollisionError:
+                conn.rollback()
+        else:
+            raise RuntimeError("could not allocate a unique source generation")
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         if own_conn:
             conn.close()

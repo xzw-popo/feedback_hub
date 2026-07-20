@@ -77,6 +77,49 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert started == [first["run_id"]]
 
 
+def test_missing_snapshot_cannot_rebind_a_run_to_changed_live_source(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+    from feedback_hub.tests.test_topic_mining_service import _write_source
+    from feedback_hub.topic_mining.service import run_topic_job
+
+    source = tmp_path / "source.db"
+    _write_source(source)
+    config = TopicMiningConfig(
+        source_db_path=source, data_dir=tmp_path / "data",
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    monkeypatch.setattr(
+        api, "start_run_async",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scheduled=True, reason="scheduled",
+        ),
+    )
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+    created = TestClient(app).post(
+        "/api/topic-mining/runs", json=_spec(),
+    ).json()
+    run = store.get(created["run_id"])
+    manifest = json.loads(run["manifest_json"])
+    trusted_digest = manifest["source_sha256"]
+    snapshot_path = Path(run["artifact_dir"]) / "source_snapshot.sqlite"
+    snapshot_path.unlink()
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "UPDATE feedback SET conversation_id = ? WHERE feedback_id = ?",
+            ("retagged-without-new-generation", "f1"),
+        )
+
+    outcome = run_topic_job(created["run_id"], store=store, config=config)
+
+    assert outcome["error_code"] == "topic_run_error"
+    persisted = json.loads(store.get(created["run_id"])["manifest_json"])
+    assert persisted["source_sha256"] == trusted_digest
+    assert not snapshot_path.exists()
+
+
 def test_same_event_watermark_backfill_creates_a_new_frozen_run_generation(
     tmp_path, monkeypatch,
 ):
