@@ -1,5 +1,6 @@
 import hashlib
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -284,10 +285,15 @@ def test_active_worker_publishes_snapshot_without_moving_open_staging_file(
     source.write_text('{"generation": 1}\n', encoding="utf-8")
     target = artifact_dir / "classification_partial_audit" / source.name
 
-    claimed.publish_worker_files(run["run_id"], [(source, target)])
+    published = claimed.publish_worker_files(
+        run["run_id"], [(source, target)],
+    )
 
     assert source.read_text(encoding="utf-8") == '{"generation": 1}\n'
     assert target.read_text(encoding="utf-8") == '{"generation": 1}\n'
+    assert published[target.resolve()] == hashlib.sha256(
+        source.read_bytes(),
+    ).hexdigest()
 
 
 def test_worker_cannot_promote_snapshot_when_lease_expires_during_copy(
@@ -314,6 +320,46 @@ def test_worker_cannot_promote_snapshot_when_lease_expires_during_copy(
         store.publish_worker_files(
             run["run_id"], claim.claim_token, [(source, target)],
         )
+
+    assert not target.exists()
+
+
+def test_worker_rechecks_lease_after_waiting_for_publication_lock(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(run["run_id"], lease_seconds=1)
+    claimed = store.for_worker_claim(claim.claim_token)
+    artifact_dir = Path(run["artifact_dir"])
+    workspace = claimed.stage_artifact_dir(artifact_dir, "classify")
+    source = workspace / "classified.jsonl"
+    source.write_text("staged\n", encoding="utf-8")
+    target = artifact_dir / source.name
+
+    blocker = sqlite3.connect(store.db_path, timeout=30)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.publish_worker_files,
+                run["run_id"], claim.claim_token, [(source, target)],
+            )
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and not list(
+                artifact_dir.glob(f".{target.name}.*.tmp")
+            ):
+                time.sleep(0.01)
+            prepared = bool(list(artifact_dir.glob(f".{target.name}.*.tmp")))
+            remaining = claim.lease_expires_at_ms / 1000 - time.time()
+            if remaining > 0:
+                time.sleep(remaining + 0.05)
+            blocker.commit()
+            assert prepared
+            with pytest.raises(RuntimeError, match="worker_claim_lost"):
+                future.result(timeout=5)
+    finally:
+        blocker.close()
 
     assert not target.exists()
 

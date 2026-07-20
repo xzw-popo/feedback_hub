@@ -592,27 +592,41 @@ def _checkpoint_attempt(
     files: Sequence[Path],
     *,
     output_names: Sequence[str] | None = None,
+    output_hashes: Mapping[str, str] | None = None,
 ) -> None:
     artifacts = manifest.setdefault("artifacts", {})
     for path in files:
         if path.is_file():
             artifacts[path.name] = _sha256(path)
     inputs, _ = _stage_contract_names(stage, artifact_dir)
-    names = output_names if output_names is not None else (
-        "classification_batches.jsonl",
-        "classification_batches.jsonl.checkpoint.jsonl",
-        "classification_batches.jsonl.run_state.json",
-        "classification_batches.jsonl.failures.jsonl",
-        "classification_audit.jsonl",
-        "classified.jsonl",
+    if output_hashes is not None:
+        outputs = {
+            name: digest
+            for name, digest in output_hashes.items()
+            if _classification_output_name_safe(name)
+            and isinstance(digest, str)
+            and len(digest) == 64
+            and (artifact_dir / name).is_file()
+        }
+    else:
+        names = output_names if output_names is not None else (
+            "classification_batches.jsonl",
+            "classification_batches.jsonl.checkpoint.jsonl",
+            "classification_batches.jsonl.run_state.json",
+            "classification_batches.jsonl.failures.jsonl",
+            "classification_audit.jsonl",
+            "classified.jsonl",
+        )
+        outputs = {
+            name: _sha256(artifact_dir / name)
+            for name in names
+            if _classification_output_name_safe(name)
+            and (artifact_dir / name).is_file()
+        }
+    trusted_inputs = _trusted_stage_input_hashes(
+        manifest, artifact_dir, inputs,
     )
-    outputs = {
-        name: _sha256(artifact_dir / name)
-        for name in names
-        if _classification_output_name_safe(name)
-        and (artifact_dir / name).is_file()
-    }
-    manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": outputs, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
+    manifest.setdefault("stage_attempts", {})[stage] = {"inputs": trusted_inputs, "outputs": outputs, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
     manifest["stage"] = stage
     _write_manifest_mirror(run_id, store, artifact_dir, manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -702,6 +716,32 @@ def _classification_records(
         attempt if isinstance(attempt, Mapping) else None,
         attempt if isinstance(attempt, Mapping) else stage if isinstance(stage, Mapping) else None,
     )
+
+
+def _trusted_stage_input_hashes(
+    manifest: Mapping[str, Any],
+    artifact_dir: Path,
+    names: Sequence[str],
+) -> dict[str, str]:
+    """Reuse prior stage hashes; never re-authenticate mutable canonical input."""
+    stages = manifest.get("stages", {})
+    if not isinstance(stages, Mapping):
+        raise RunVerificationError("manifest_stage_chain")
+    trusted: dict[str, str] = {}
+    for name in names:
+        expected: str | None = None
+        for stage in reversed(_STAGES):
+            record = stages.get(stage)
+            outputs = record.get("outputs") if isinstance(record, Mapping) else None
+            value = outputs.get(name) if isinstance(outputs, Mapping) else None
+            if isinstance(value, str):
+                expected = value
+                break
+        path = artifact_dir / name
+        if expected is None or not path.is_file() or _sha256(path) != expected:
+            raise RunVerificationError("manifest_stage_chain")
+        trusted[name] = expected
+    return trusted
 
 
 def _classification_output_name_safe(name: str) -> bool:
@@ -817,8 +857,15 @@ def _publish_classification_progress(
             for path in sorted(partial_dir.glob("*.json"))
             if path.is_file()
         )
-    if pairs:
-        publisher(run_id, pairs)
+    published: Mapping[Path, str] = publisher(run_id, pairs) if pairs else {}
+    if not isinstance(published, Mapping):  # pragma: no cover - store contract
+        raise RuntimeError("worker artifact publisher omitted digests")
+    output_hashes = {
+        str(target.relative_to(artifact_dir)): str(
+            published[Path(target).resolve()]
+        )
+        for _source, target in pairs
+    }
     # Authenticate each published scheduler checkpoint in the database-backed
     # manifest. A replacement worker may reuse only this fenced generation.
     _checkpoint_attempt(
@@ -828,10 +875,8 @@ def _publish_classification_progress(
         manifest,
         "classify",
         (),
-        output_names=tuple(
-            str(target.relative_to(artifact_dir))
-            for _source, target in pairs
-        ),
+        output_names=tuple(output_hashes),
+        output_hashes=output_hashes,
     )
 
 

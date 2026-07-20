@@ -80,7 +80,9 @@ def test_stale_worker_cannot_replace_manifest_mirror_after_reclaim(tmp_path):
     assert manifest_path.read_text(encoding="utf-8") == '{"writer": "new"}\n'
 
 
-def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
+def test_claimed_classifier_checkpoint_is_incrementally_authenticated(
+    tmp_path, monkeypatch,
+):
     from feedback_hub.topic_mining.service import (
         _classification_output_safe,
         _classification_resume_safe,
@@ -102,7 +104,28 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
         '{"run_status":"running","completed":1,"remaining":1}\n',
         encoding="utf-8",
     )
-    manifest: dict[str, object] = {}
+    manifest: dict[str, object] = {
+        "stages": {
+            "hard_scope": {
+                "outputs": {
+                    "item_contexts.json": hashlib.sha256(
+                        (artifact_dir / "item_contexts.json").read_bytes()
+                    ).hexdigest(),
+                },
+            },
+            "hybrid_recall": {
+                "outputs": {
+                    name: hashlib.sha256(
+                        (artifact_dir / name).read_bytes()
+                    ).hexdigest()
+                    for name in (
+                        "recall_candidates.jsonl",
+                        "recall_manifest.json",
+                    )
+                },
+            },
+        },
+    }
 
     _publish_classification_progress(
         run["run_id"], claimed, artifact_dir, workspace, manifest,
@@ -114,6 +137,15 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
     canonical = artifact_dir / checkpoint.name
     assert canonical.read_text(encoding="utf-8") == checkpoint.read_text(encoding="utf-8")
 
+    recall_path = artifact_dir / "recall_candidates.jsonl"
+    trusted_recall = recall_path.read_bytes()
+    recall_path.write_text('{"tampered":true}\n', encoding="utf-8")
+    with pytest.raises(RunVerificationError, match="manifest_stage_chain"):
+        _publish_classification_progress(
+            run["run_id"], claimed, artifact_dir, workspace, manifest,
+        )
+    recall_path.write_bytes(trusted_recall)
+
     forged_audit = artifact_dir / "classification_audit.jsonl"
     forged_audit.write_text('{"forged":true}\n', encoding="utf-8")
     _publish_classification_progress(
@@ -122,6 +154,24 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
     persisted = json.loads(store.get(run["run_id"])["manifest_json"])
     assert _classification_output_safe(
         persisted, artifact_dir, forged_audit.name,
+    ) is False
+
+    original_publisher = claimed.publish_worker_files
+
+    def publish_then_tamper(run_id, pairs):
+        digests = original_publisher(run_id, pairs)
+        canonical.write_text("tampered after promotion\n", encoding="utf-8")
+        return digests
+
+    monkeypatch.setattr(
+        claimed, "publish_worker_files", publish_then_tamper,
+    )
+    _publish_classification_progress(
+        run["run_id"], claimed, artifact_dir, workspace, manifest,
+    )
+    persisted = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert _classification_output_safe(
+        persisted, artifact_dir, canonical.name,
     ) is False
 
     second = store.claim_worker(

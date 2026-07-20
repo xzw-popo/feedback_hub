@@ -7,7 +7,6 @@ import json
 import os
 import secrets
 import sqlite3
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -371,7 +370,7 @@ class TopicRunStore:
         files: list[tuple[Path, Path]],
         *,
         now_ms: int | None = None,
-    ) -> None:
+    ) -> dict[Path, str]:
         """Snapshot staged files while serializing publication against reclaim."""
         checked_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         with self._connect() as connection:
@@ -413,22 +412,31 @@ class TopicRunStore:
 
         # Slow copies happen before the publication transaction. Re-read the
         # clock and claim immediately before the quick rename phase.
-        prepared: list[tuple[Path, Path]] = []
+        prepared: list[tuple[Path, Path, str]] = []
         try:
             for source_path, target_path in normalized:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target_path.with_name(
                     f".{target_path.name}.{token_hash}.{secrets.token_hex(8)}.tmp"
                 )
-                prepared.append((temporary, target_path))
-                with source_path.open("rb") as source_file, temporary.open("wb") as target_file:
-                    shutil.copyfileobj(source_file, target_file)
-                    target_file.flush()
-                    os.fsync(target_file.fileno())
+                digest = hashlib.sha256()
+                try:
+                    with source_path.open("rb") as source_file, temporary.open("wb") as target_file:
+                        while chunk := source_file.read(1024 * 1024):
+                            target_file.write(chunk)
+                            digest.update(chunk)
+                        target_file.flush()
+                        os.fsync(target_file.fileno())
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
+                prepared.append((temporary, target_path, digest.hexdigest()))
 
-            promotion_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                # Sample after lock acquisition: waiting for another writer
+                # must not let an already expired lease pass this fence.
+                promotion_at_ms = int(time.time() * 1000)
                 current = connection.execute(
                     """SELECT status, worker_claim_token,
                               worker_lease_expires_at_ms
@@ -444,10 +452,14 @@ class TopicRunStore:
                     or int(current["worker_lease_expires_at_ms"]) <= promotion_at_ms
                 ):
                     raise WorkerClaimLostError("worker_claim_lost")
-                for temporary, target_path in prepared:
+                for temporary, target_path, _digest in prepared:
                     os.replace(temporary, target_path)
+            return {
+                target_path: digest
+                for _temporary, target_path, digest in prepared
+            }
         finally:
-            for temporary, _target_path in prepared:
+            for temporary, _target_path, _digest in prepared:
                 temporary.unlink(missing_ok=True)
 
     def _raise_missing_or_lost(self, run_id: str) -> None:
@@ -488,9 +500,11 @@ class ClaimedTopicRunStore:
         self,
         run_id: str,
         files: list[tuple[Path, Path]],
-    ) -> None:
+    ) -> dict[Path, str]:
         self.ensure_worker_claim(run_id)
-        self._store.publish_worker_files(run_id, self._claim_token, files)
+        return self._store.publish_worker_files(
+            run_id, self._claim_token, files,
+        )
 
     def update_status(
         self, run_id: str, status: str, *, stage: str | None = None,
