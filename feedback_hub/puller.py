@@ -211,6 +211,7 @@ def pull(start_dt: datetime, end_dt: datetime, *,
                     start_ts_ms=s_ms,
                     end_ts_ms=e_ms,
                 )
+                conn.commit()
                 break
             except db.SourceGenerationCollisionError:
                 conn.rollback()

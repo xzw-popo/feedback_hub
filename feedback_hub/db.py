@@ -400,7 +400,6 @@ def record_feedback_source_coverage(
                 "source generation allocation collided"
             ) from exc
         raise
-    conn.commit()
     return generation
 
 
