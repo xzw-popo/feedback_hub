@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "classification_labels": {
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "not_matched"
+              }
+            },
+            "type": "object"
+          }
+        }
+      ],
+      "contains": {
+        "properties": {
+          "id": {
+            "const": "matched"
+          }
+        },
+        "type": "object"
+      },
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "enum": [
+              "matched",
+              "not_matched"
+            ]
+          },
+          "meaning": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "meaning"
+        ],
+        "type": "object"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "exclusion_criteria": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "inclusion_criteria": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "lexical_hints": {
+      "additionalProperties": false,
+      "properties": {
+        "contexts": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "objects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "negative_examples": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "objective": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "output": {
+      "additionalProperties": false,
+      "properties": {
+        "preferred_format": {
+          "enum": [
+            "xlsx",
+            "jsonl"
+          ]
+        },
+        "required_fields": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "preferred_format",
+        "required_fields"
+      ],
+      "type": "object"
+    },
+    "positive_examples": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "scope": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "end_time": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "platforms": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "products": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "start_time": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "versions": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "start_time",
+        "end_time"
+      ],
+      "type": "object"
+    },
+    "topic_name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "unit": {
+      "enum": [
+        "feedback",
+        "conversation"
+      ]
+    }
+  },
+  "required": [
+    "classification_labels",
+    "exclusion_criteria",
+    "inclusion_criteria",
+    "lexical_hints",
+    "negative_examples",
+    "objective",
+    "output",
+    "positive_examples",
+    "schema_version",
+    "scope",
+    "topic_name",
+    "unit"
+  ],
+  "type": "object"
+}
