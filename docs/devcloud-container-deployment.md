@@ -170,25 +170,37 @@ LLM_API_KEY=
 LLM_MODEL=
 ```
 
-`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。`TOPIC_MINING_API_TOKEN` 留空时，能力接口不需要鉴权：
+`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。
 
-```bash
-curl -fsS 'http://127.0.0.1:8000/api/topic-mining/capabilities'
-```
-
-若设置了 `TOPIC_MINING_API_TOKEN`，所有专题接口（包括能力接口）都必须携带同一个 token：
-
-```bash
-curl -fsS 'http://127.0.0.1:8000/api/topic-mining/capabilities' \
-  -H "Authorization: Bearer ${TOPIC_MINING_API_TOKEN}"
-```
-
-完成依赖和配置后重启并检查状态：
+完成依赖和配置后，先重启新代码并确认新进程正常，再检查专题能力接口：
 
 ```bash
 APP_PORT=8000 scripts/devcloud_runtime.sh restart
 APP_PORT=8000 scripts/devcloud_runtime.sh status
 ```
+
+`.env` 不会自动导出到当前 shell。保持在 `/opt/feedback_hub`，先用 `env -u` 避免当前 shell 的同名变量遮蔽项目配置，再由当前虚拟环境导入 `feedback_hub.config`，让它加载项目根 `.env`，最后把专题 API token 只保存到临时 shell 变量。以下命令不打印 token；也不要额外 `echo` 该变量：
+
+```bash
+cd /opt/feedback_hub
+TOPIC_CAPABILITIES_URL='http://127.0.0.1:8000/api/topic-mining/capabilities'
+TOPIC_TOKEN="$(
+  env -u TOPIC_MINING_API_TOKEN ./.venv/bin/python -c 'import os; from feedback_hub import config as _feedback_config; print(os.environ.get("TOPIC_MINING_API_TOKEN", ""))'
+)"
+
+if [ -z "$TOPIC_TOKEN" ]; then
+  test "$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" = "200"
+else
+  test "$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" = "401"
+  test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $TOPIC_TOKEN" \
+    "$TOPIC_CAPABILITIES_URL")" = "200"
+fi
+
+unset TOPIC_TOKEN
+```
+
+空 token 分支确认未开启鉴权时返回 `200`；非空分支先确认无 token 请求返回 `401`，再确认携带正确 token 返回 `200`。任何一步不符合预期，`test` 都会以非零状态退出。
 
 专题后端部署不上传或安装 `codex-skills/mining-feedback-topics/`：该目录是单独分发给 Codex 的客户端 Skill，不属于服务运行时。打包部署时应将其排除出服务包。部署也绝不替换生产 `feedback_hub/data/feedback.db`；仅保留既有数据库，并让专题 run 在独立 `topic_mining/` 数据目录内创建快照和产物。
 
