@@ -186,21 +186,31 @@ cd /opt/feedback_hub
 TOPIC_CAPABILITIES_URL='http://127.0.0.1:8000/api/topic-mining/capabilities'
 TOPIC_TOKEN="$(
   env -u TOPIC_MINING_API_TOKEN ./.venv/bin/python -c 'import os; from feedback_hub import config as _feedback_config; print(os.environ.get("TOPIC_MINING_API_TOKEN", ""))'
-)"
+)" || exit 1
 
 if [ -z "$TOPIC_TOKEN" ]; then
-  test "$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" = "200"
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "200" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
 else
-  test "$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" = "401"
-  test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "401" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $TOPIC_TOKEN" \
-    "$TOPIC_CAPABILITIES_URL")" = "200"
+    "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "200" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
 fi
 
+unset TOPIC_HTTP_STATUS
 unset TOPIC_TOKEN
 ```
 
-空 token 分支确认未开启鉴权时返回 `200`；非空分支先确认无 token 请求返回 `401`，再确认携带正确 token 返回 `200`。任何一步不符合预期，`test` 都会以非零状态退出。
+空 token 分支确认未开启鉴权时返回 `200`；非空分支先确认无 token 请求返回 `401`，再确认携带正确 token 返回 `200`。每次 `curl` 的传输状态和 HTTP 状态都独立校验；任何一步不符合预期都会立即退出并传播非零状态，不会被后续成功命令掩盖。
 
 专题后端部署不上传或安装 `codex-skills/mining-feedback-topics/`：该目录是单独分发给 Codex 的客户端 Skill，不属于服务运行时。打包部署时应将其排除出服务包。部署也绝不替换生产 `feedback_hub/data/feedback.db`；仅保留既有数据库，并让专题 run 在独立 `topic_mining/` 数据目录内创建快照和产物。
 
