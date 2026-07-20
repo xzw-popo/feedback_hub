@@ -269,6 +269,8 @@ with tempfile.TemporaryDirectory() as temporary:
     config = TopicMiningConfig(data_dir=data_dir)
     store = TopicRunStore(data_dir / "runs.db", data_dir / "runs")
     run = store.create_or_get(spec, 123)
+    row["run_id"] = run["run_id"]
+    row["data_cutoff_ms"] = run["source_watermark_ms"]
     artifact_dir = Path(run["artifact_dir"])
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(row) + "\n", encoding="utf-8")

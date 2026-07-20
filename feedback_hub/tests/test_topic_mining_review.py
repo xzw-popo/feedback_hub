@@ -91,9 +91,42 @@ def test_overrides_validate_identity_and_decision(overrides, message):
         apply_review_overrides([matched("a", 0.9)], overrides)
 
 
-def test_overrides_cannot_turn_empty_evidence_reject_into_match_or_bypass_explicit_empty_labels():
+def test_override_can_turn_empty_evidence_reject_into_match_with_grounded_evidence():
+    merged = apply_review_overrides(
+        [rejected("a", 0.9)],
+        [{
+            "item_id": "a", "label": "matched", "reason": "原文明确命中", "reviewer": "skill-ai",
+            "evidence": ["工具栏一直显示"],
+        }],
+        evidence_sources={"a": ["游戏全屏后工具栏一直显示"]},
+    )
+
+    assert merged[0].label == "matched"
+    assert merged[0].evidence == ("工具栏一直显示",)
+    assert merged[0].source == "review_override"
+
+
+@pytest.mark.parametrize("evidence", ["工具栏", [], [""], ["原文中不存在"]])
+def test_override_rejects_invalid_or_ungrounded_evidence(evidence):
     with pytest.raises(ValueError, match="evidence"):
-        apply_review_overrides([rejected("a", 0.9)], [{"item_id": "a", "label": "matched", "reason": "改判", "reviewer": "skill-ai"}])
+        apply_review_overrides(
+            [rejected("a", 0.9)],
+            [{
+                "item_id": "a", "label": "matched", "reason": "改判", "reviewer": "skill-ai",
+                "evidence": evidence,
+            }],
+            evidence_sources={"a": ["游戏全屏后工具栏一直显示"]},
+        )
+
+
+@pytest.mark.parametrize("field", ["source_item", "text", "source_url", "formal_labels"])
+def test_override_rejects_client_source_and_formal_label_fields(field):
+    override = {"item_id": "a", "label": "not_matched", "reason": "排除", "reviewer": "skill-ai", field: "tampered"}
+    with pytest.raises(ValueError, match="field"):
+        apply_review_overrides([matched("a", 0.9)], [override])
+
+
+def test_override_cannot_bypass_explicit_empty_labels():
     with pytest.raises(ValueError, match="label"):
         apply_review_overrides([matched("a", 0.9)], [{"item_id": "a", "label": "matched", "reason": "改判", "reviewer": "skill-ai"}], allowed_labels=set())
 

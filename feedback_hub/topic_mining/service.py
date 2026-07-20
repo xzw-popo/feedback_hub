@@ -217,11 +217,20 @@ def submit_review_overrides(
     _verify_manifest(manifest, artifact_dir)
     _require_artifact(manifest, artifact_dir / "classified.jsonl")
     _require_artifact(manifest, artifact_dir / "review_queue.jsonl")
+    _require_artifact(manifest, artifact_dir / "recall_candidates.jsonl")
+    _require_artifact(manifest, artifact_dir / "item_contexts.json")
     classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl", manifest)]
+    recalls = [_recall_from_dict(row) for row in _read_required_jsonl(artifact_dir / "recall_candidates.jsonl", manifest)]
+    contexts = _read_required_json(artifact_dir / "item_contexts.json", manifest)
     spec = validate_topic_spec(json.loads(run["spec_json"]))
-    # Validate before touching the persistent file. It is intentionally only a
-    # decision layer; source text/evidence never comes from client input.
-    apply_review_overrides(classifications, overrides, allowed_labels={entry["id"] for entry in spec.classification_labels})
+    evidence_sources = _authoritative_evidence_sources(recalls, contexts)
+    # Validate before touching the persistent file. Overrides may supply only
+    # evidence copied from hash-verified source text or persisted contexts.
+    apply_review_overrides(
+        classifications, overrides,
+        allowed_labels={entry["id"] for entry in spec.classification_labels},
+        evidence_sources=evidence_sources,
+    )
     _write_jsonl(artifact_dir / "review_overrides.jsonl", [dict(row) for row in overrides])
     _invalidate_export_artifacts(manifest, artifact_dir)
     # Overrides are a declared output of review_queue. Re-checkpoint that
@@ -284,9 +293,27 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
     overrides = _read_required_jsonl(overrides_path, manifest)
-    merged = apply_review_overrides(classifications, overrides, allowed_labels=allowed)
-    final_rows = [_final_row(result, by_id[result.item_id], run_id, _context_texts(contexts, result.item_id)) for result in merged if result.label == "matched"]
-    _validate_final_rows(final_rows, spec, contexts=contexts)
+    evidence_sources = _authoritative_evidence_sources(recalls, contexts)
+    try:
+        merged = apply_review_overrides(
+            classifications, overrides, allowed_labels=allowed,
+            evidence_sources=evidence_sources,
+        )
+    except ValueError as exc:
+        code = "invalid_evidence" if "evidence" in str(exc) else "invalid_review_override"
+        raise RunVerificationError(code) from exc
+    data_cutoff_ms = _required_data_cutoff(run.get("source_watermark_ms"))
+    final_rows = [
+        _final_row(
+            result, by_id[result.item_id], run_id,
+            _context_texts(contexts, result.item_id), data_cutoff_ms,
+        )
+        for result in merged if result.label == "matched"
+    ]
+    _validate_final_rows(
+        final_rows, spec, contexts=contexts, expected_run_id=run_id,
+        expected_data_cutoff_ms=data_cutoff_ms,
+    )
     final_path = artifact_dir / "final_reviewed.jsonl"
     _write_jsonl(final_path, final_rows)
     manifest["verified"] = {"matched_count": len(final_rows), "verified_at_ms": int(time.time() * 1000)}
@@ -295,16 +322,31 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
 
 
-def _final_row(result: ClassificationResult, item: Mapping[str, Any], run_id: str, context_texts: Sequence[str]) -> dict[str, Any]:
+def _final_row(
+    result: ClassificationResult,
+    item: Mapping[str, Any],
+    run_id: str,
+    context_texts: Sequence[str],
+    data_cutoff_ms: int,
+) -> dict[str, Any]:
     evidence_source = {value: ("source_text" if value in str(item.get("text", "")) else "context") for value in result.evidence}
     return {
         "item_id": result.item_id, "label": result.label, "confidence": result.confidence,
         "evidence": list(result.evidence), "reason": result.reason, "source": result.source,
-        "source_item": dict(item), "context_texts": list(context_texts), "evidence_source": evidence_source, "run_id": run_id,
+        "source_item": dict(item), "context_texts": list(context_texts), "evidence_source": evidence_source,
+        "run_id": run_id, "data_cutoff_ms": data_cutoff_ms,
     }
 
 
-def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec, *, contexts: Mapping[str, Any] | None = None) -> None:
+def _validate_final_rows(
+    rows: Sequence[Mapping[str, Any]],
+    spec: TopicSpec,
+    *,
+    contexts: Mapping[str, Any] | None = None,
+    expected_run_id: str,
+    expected_data_cutoff_ms: int,
+) -> None:
+    expected_data_cutoff_ms = _required_data_cutoff(expected_data_cutoff_ms)
     seen: set[str] = set()
     allowed = {entry["id"] for entry in spec.classification_labels}
     for row in rows:
@@ -312,6 +354,11 @@ def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec, *, 
         if not isinstance(item_id, str) or not item_id or item_id in seen:
             raise RunVerificationError("duplicate_item_id")
         seen.add(item_id)
+        if row.get("run_id") != expected_run_id:
+            raise RunVerificationError("invalid_run_id")
+        data_cutoff_ms = row.get("data_cutoff_ms")
+        if isinstance(data_cutoff_ms, bool) or not isinstance(data_cutoff_ms, int) or data_cutoff_ms != expected_data_cutoff_ms:
+            raise RunVerificationError("invalid_data_cutoff")
         if row.get("label") != "matched" or row["label"] not in allowed:
             raise RunVerificationError("invalid_label")
         item = row.get("source_item")
@@ -326,6 +373,27 @@ def _validate_final_rows(rows: Sequence[Mapping[str, Any]], spec: TopicSpec, *, 
             raise RunVerificationError("invalid_evidence")
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
+
+
+def _required_data_cutoff(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RunVerificationError("invalid_data_cutoff")
+    return value
+
+
+def _authoritative_evidence_sources(
+    recalls: Sequence[RecallHit],
+    contexts: Mapping[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    sources: dict[str, tuple[str, ...]] = {}
+    for hit in recalls:
+        if hit.item_id in sources:
+            raise RunVerificationError("duplicate_item_id")
+        text = hit.item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RunVerificationError("missing_text")
+        sources[hit.item_id] = (text, *_context_texts(contexts, hit.item_id))
+    return sources
 
 
 def _item_in_scope(item: Mapping[str, Any], spec: TopicSpec) -> bool:

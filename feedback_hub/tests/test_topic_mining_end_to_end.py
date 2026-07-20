@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import openpyxl
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +17,7 @@ from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.export import export_topic_run
 from feedback_hub.topic_mining.run_store import TopicRunStore
 from feedback_hub.topic_mining.service import (
+    RunVerificationError,
     run_topic_job,
     submit_review_overrides,
     verify_topic_run,
@@ -127,7 +129,7 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
             # Deliberately corrected by the required review override below.
             "win-taskbar": {"label": "matched", "evidence": ["Windows 系统任务栏仍显示"], "reason": "需要人工排除"},
             "win-black-screen": {"label": "not_matched", "evidence": [], "reason": "仅描述黑屏"},
-            "win-paraphrase": {"label": "matched", "evidence": ["悬浮控件遮住画面"], "reason": "语义符合全屏遮挡"},
+            "win-paraphrase": {"label": "not_matched", "evidence": [], "reason": "分类器证据不足"},
         }
         return ModelReply(
             json.dumps({"results": [
@@ -174,13 +176,59 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
     assert "mac-semantic" not in by_id
     assert {row["item_id"] for row in classifications} == set(by_id)
 
-    submit_review_overrides(run["run_id"], [{
-        "item_id": "win-taskbar", "label": "not_matched",
-        "reason": "专题明确排除 Windows 系统任务栏", "reviewer": "fixture-reviewer",
-    }], store=store)
+    overrides_path = artifact_dir / "review_overrides.jsonl"
+    before_invalid_submit = overrides_path.read_bytes()
+    with pytest.raises(ValueError, match="evidence"):
+        submit_review_overrides(run["run_id"], [{
+            "item_id": "win-paraphrase", "label": "matched",
+            "reason": "无根据改判", "reviewer": "fixture-reviewer",
+            "evidence": ["原文中不存在的证据"],
+        }], store=store)
+    assert overrides_path.read_bytes() == before_invalid_submit
+
+    submit_review_overrides(run["run_id"], [
+        {
+            "item_id": "win-taskbar", "label": "not_matched",
+            "reason": "专题明确排除 Windows 系统任务栏", "reviewer": "fixture-reviewer",
+        },
+        {
+            "item_id": "win-paraphrase", "label": "matched",
+            "reason": "受控原文明确描述全屏遮挡", "reviewer": "fixture-reviewer",
+            "evidence": ["悬浮控件遮住画面"],
+        },
+    ], store=store)
+    persisted_overrides = [json.loads(line) for line in overrides_path.read_text(encoding="utf-8").splitlines()]
+    assert persisted_overrides[1]["evidence"] == ["悬浮控件遮住画面"]
+
+    # Even a forged manifest cannot turn ungrounded override evidence into a
+    # verified claim: verification re-checks merged evidence against sources.
+    valid_override_bytes = overrides_path.read_bytes()
+    valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    tampered_overrides = json.loads(valid_override_bytes.decode("utf-8").splitlines()[0]), json.loads(valid_override_bytes.decode("utf-8").splitlines()[1])
+    tampered_overrides[1]["evidence"] = ["伪造证据"]
+    overrides_path.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in tampered_overrides), encoding="utf-8")
+    tampered_manifest = json.loads(json.dumps(valid_manifest))
+    override_hash = hashlib.sha256(overrides_path.read_bytes()).hexdigest()
+    tampered_manifest["artifacts"]["review_overrides.jsonl"] = override_hash
+    for stage_name in ("review_queue", "review_ready"):
+        for direction in ("inputs", "outputs"):
+            if "review_overrides.jsonl" in tampered_manifest["stages"][stage_name][direction]:
+                tampered_manifest["stages"][stage_name][direction]["review_overrides.jsonl"] = override_hash
+    store.update_manifest(run["run_id"], tampered_manifest, stage="review_ready")
+    (artifact_dir / "manifest.json").write_text(json.dumps(tampered_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(RunVerificationError, match="invalid_evidence"):
+        verify_topic_run(run["run_id"], store=store)
+    overrides_path.write_bytes(valid_override_bytes)
+    store.update_manifest(run["run_id"], valid_manifest, stage="review_ready")
+    (artifact_dir / "manifest.json").write_text(json.dumps(valid_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
     assert verify_topic_run(run["run_id"], store=store) == {
         "run_id": run["run_id"], "status": "verified", "matched_count": 2,
     }
+    final_reviewed = [json.loads(line) for line in (artifact_dir / "final_reviewed.jsonl").read_text(encoding="utf-8").splitlines()]
+    final_by_id = {row["item_id"]: row for row in final_reviewed}
+    assert final_by_id["win-paraphrase"]["evidence"] == ["悬浮控件遮住画面"]
+    assert {row["data_cutoff_ms"] for row in final_reviewed} == {int(end.timestamp() * 1000)}
     workbook_path = export_topic_run(run["run_id"], "xlsx", store=store)
     workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
     sheet = workbook["反馈清单"]
@@ -193,4 +241,9 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
     }
     workbook.close()
     assert workbook_ids == {"win-game", "win-paraphrase"}
+    assert "数据截止时间" in headers
+    final_results = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {row["data_cutoff_ms"] for row in final_results} == {int(end.timestamp() * 1000)}
+    quality_report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert quality_report["data_cutoff_ms"] == int(end.timestamp() * 1000)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha_before

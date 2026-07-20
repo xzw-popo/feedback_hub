@@ -11,7 +11,7 @@ from .service import RunVerificationError, _checkpoint, _load_manifest, _require
 from .contracts import validate_topic_spec
 
 
-HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID"]
+HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID", "数据截止时间"]
 
 
 def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | None = None) -> Path:
@@ -32,12 +32,19 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
-    rows = [{**row, "run_id": row.get("run_id", run_id)} for row in rows]
-    _validate_final_rows(rows, spec)
+    data_cutoff_ms = run.get("source_watermark_ms")
+    _validate_final_rows(
+        rows, spec, expected_run_id=run_id,
+        expected_data_cutoff_ms=data_cutoff_ms,
+    )
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))
     jsonl_path = artifact_dir / "final_results.jsonl"
     _write_jsonl(jsonl_path, rows)
-    report = {"run_id": run_id, "status": "verified", "matched_count": len(rows), "artifact": jsonl_path.name}
+    report = {
+        "run_id": run_id, "status": "verified", "matched_count": len(rows),
+        "artifact": jsonl_path.name, "data_cutoff_ms": data_cutoff_ms,
+        "data_cutoff_time": _format_time(data_cutoff_ms),
+    }
     (artifact_dir / "quality_report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     if export_format == "jsonl":
         _checkpoint(run_id, store, artifact_dir, _load_manifest(run, artifact_dir), "verified", [jsonl_path, artifact_dir / "quality_report.json"])
@@ -68,14 +75,15 @@ def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             row["label"], _format_time(item.get("ts_ms")), item["text"], _safe_cell(url), row["reason"],
             "\n".join(row["evidence"]), item.get("platform", ""), item.get("appversion", ""),
             item.get("device_name", ""), item.get("feedback_id", ""), item.get("conversation_id", ""), row["run_id"],
+            _format_time(row["data_cutoff_ms"]),
         ]
         sheet.append([_safe_cell(value) for value in values])
         link = sheet.cell(sheet.max_row, 4)
         link.hyperlink = url
         link.style = "Hyperlink"
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:L{max(sheet.max_row, 1)}"
-    widths = [14, 20, 48, 42, 28, 32, 12, 16, 20, 18, 20, 18]
+    sheet.auto_filter.ref = f"A1:M{max(sheet.max_row, 1)}"
+    widths = [14, 20, 48, 42, 28, 32, 12, 16, 20, 18, 20, 18, 28]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[openpyxl.utils.get_column_letter(index)].width = width
     for row in sheet.iter_rows(min_row=2):

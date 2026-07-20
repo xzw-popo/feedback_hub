@@ -60,12 +60,16 @@ def apply_review_overrides(
     overrides: Sequence[Mapping[str, Any]],
     *,
     allowed_labels: set[str] | None = None,
+    evidence_sources: Mapping[str, Sequence[str]] | None = None,
 ) -> list[ClassificationResult]:
     allowed_labels = {"matched", "not_matched"} if allowed_labels is None else allowed_labels
     original = {result.item_id: result for result in classifications}
     seen: set[str] = set()
-    validated: dict[str, Mapping[str, Any]] = {}
+    validated: dict[str, tuple[Mapping[str, Any], tuple[str, ...]]] = {}
     for override in overrides:
+        unsupported_fields = set(override) - {"item_id", "label", "reason", "reviewer", "evidence"}
+        if unsupported_fields:
+            raise ValueError(f"unsupported override field: {sorted(unsupported_fields)[0]}")
         item_id = _required_override_text(override.get("item_id"), "item_id")
         if item_id in seen:
             raise ValueError(f"duplicate override item_id: {item_id}")
@@ -77,18 +81,26 @@ def apply_review_overrides(
             raise ValueError(f"unsupported override label: {label}")
         _required_override_text(override.get("reason"), "reason")
         _required_override_text(override.get("reviewer"), "reviewer")
-        if label == "matched" and not original[item_id].evidence:
-            raise ValueError("override cannot mark an empty-evidence result as matched")
-        validated[item_id] = override
+        effective_evidence = original[item_id].evidence
+        if "evidence" in override:
+            effective_evidence = _override_evidence(override["evidence"], item_id, evidence_sources)
+        if label == "matched" and not effective_evidence:
+            raise ValueError("matched override evidence must be non-empty")
+        if evidence_sources is not None and effective_evidence:
+            sources = evidence_sources.get(item_id, ())
+            if not all(any(value in source for source in sources) for value in effective_evidence):
+                raise ValueError("override evidence must be an exact source or context substring")
+        validated[item_id] = (override, tuple(effective_evidence))
     merged = []
     for result in classifications:
-        override = validated.get(result.item_id)
-        if override is None:
+        validated_override = validated.get(result.item_id)
+        if validated_override is None:
             merged.append(result)
         else:
+            override, effective_evidence = validated_override
             merged.append(replace(
                 result, label=str(override["label"]).strip(), reason=str(override["reason"]).strip(),
-                source="review_override",
+                evidence=effective_evidence, source="review_override",
             ))
     return merged
 
@@ -136,6 +148,24 @@ def _required_override_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"override {field} must be non-empty")
     return value.strip()
+
+
+def _override_evidence(
+    value: Any,
+    item_id: str,
+    evidence_sources: Mapping[str, Sequence[str]] | None,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or not all(isinstance(entry, str) and entry.strip() for entry in value):
+        raise ValueError("override evidence must be a non-empty string list")
+    if evidence_sources is None or item_id not in evidence_sources:
+        raise ValueError("override evidence requires authoritative evidence sources")
+    sources = evidence_sources[item_id]
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)) or not all(isinstance(source, str) for source in sources):
+        raise ValueError("override evidence sources are invalid")
+    evidence = tuple(value)
+    if not all(any(entry in source for source in sources) for entry in evidence):
+        raise ValueError("override evidence must be an exact source or context substring")
+    return evidence
 
 
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:

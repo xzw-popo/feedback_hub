@@ -16,10 +16,11 @@ def _spec():
     return validate_topic_spec({"schema_version": 1, "topic_name": "专题", "objective": "找工具栏", "scope": {"start_time": "2023-11-14T00:00:00+00:00", "end_time": "2023-11-16T00:00:00+00:00", "platforms": ["Win"], "products": ["微信输入法"]}, "unit": "feedback", "inclusion_criteria": ["工具栏"], "exclusion_criteria": ["系统任务栏"], "positive_examples": ["全屏工具栏"], "negative_examples": ["黑屏"], "lexical_hints": {"objects": ["工具栏"]}, "classification_labels": [{"id": "matched", "meaning": "命中"}, {"id": "not_matched", "meaning": "不命中"}], "output": {"preferred_format": "xlsx", "required_fields": ["feedback_text"]}})
 
 
-def _row(item_id: str = "f-1") -> dict:
+def _row(run_id: str, item_id: str = "f-1") -> dict:
     return {
         "item_id": item_id, "label": "matched", "confidence": 0.9,
         "evidence": ["工具栏一直显示"], "reason": "全屏仍显示", "source": "classifier",
+        "run_id": run_id, "data_cutoff_ms": 123,
         "source_item": {
             "item_id": item_id, "feedback_id": item_id, "conversation_id": "c-1",
             "ts_ms": 1_700_000_000_000, "platform": "Win", "appversion": "1.2",
@@ -33,7 +34,7 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
     artifact_dir = tmp_path / "runs" / run["run_id"]
-    (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(_row()) + "\n", encoding="utf-8")
+    (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
     store.update_status(run["run_id"], "verified", stage="verified")
     manifest = {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}
     store.update_manifest(run["run_id"], manifest, stage="verified", status="verified"); (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -44,6 +45,33 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert ws["D2"].hyperlink.target.startswith("https://")
     assert (artifact_dir / "final_results.jsonl").exists()
     assert (artifact_dir / "quality_report.json").exists()
+    headers = [cell.value for cell in ws[1]]
+    assert "数据截止时间" in headers
+    assert ws.cell(2, headers.index("数据截止时间") + 1).value == "1970-01-01T00:00:00.123000+00:00"
+    final_rows = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["data_cutoff_ms"] for row in final_rows] == [123]
+    report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["data_cutoff_ms"] == 123
+
+
+@pytest.mark.parametrize("cutoff", [None, True, 122, "123"])
+def test_export_rejects_missing_invalid_or_mismatched_data_cutoff(tmp_path, cutoff):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    artifact_dir = tmp_path / "runs" / run["run_id"]
+    row = _row(run["run_id"])
+    if cutoff is None:
+        row.pop("data_cutoff_ms")
+    else:
+        row["data_cutoff_ms"] = cutoff
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    manifest = {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}
+    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified")
+    (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RunVerificationError, match="data_cutoff"):
+        export_topic_run(run["run_id"], "jsonl", store=store)
 
 
 @pytest.mark.parametrize("text", ["=HYPERLINK(\"bad\")", "+1+1", "-1+1", "@SUM(A1)"])
@@ -51,7 +79,7 @@ def test_export_escapes_formula_like_user_text(tmp_path, text):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
     artifact_dir = tmp_path / "runs" / run["run_id"]
-    row = _row()
+    row = _row(run["run_id"])
     row["source_item"]["text"] = text
     row["evidence"] = [text]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -75,8 +103,8 @@ def test_export_rejects_tampered_final_artifact(tmp_path):
     run = store.create_or_get(_spec(), 123)
     artifact_dir = tmp_path / "runs" / run["run_id"]
     final = artifact_dir / "final_reviewed.jsonl"
-    final.write_text(json.dumps(_row()) + "\n", encoding="utf-8")
+    final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
     store.update_manifest(run["run_id"], {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}, stage="verified", status="verified")
-    final.write_text(json.dumps({**_row(), "reason": "tampered"}) + "\n", encoding="utf-8")
+    final.write_text(json.dumps({**_row(run["run_id"]), "reason": "tampered"}) + "\n", encoding="utf-8")
     with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
         export_topic_run(run["run_id"], "xlsx", store=store)
