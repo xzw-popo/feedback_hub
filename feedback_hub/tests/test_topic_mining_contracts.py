@@ -96,3 +96,19 @@ def test_schema_forbids_bottom_layer_retrieval_parameters():
     assert "top_k" not in encoded
     assert "similarity_threshold" not in encoded
     assert schema["additionalProperties"] is False
+
+
+def test_required_output_fields_are_limited_to_the_export_contract():
+    raw = valid_spec()
+    raw["output"]["required_fields"] = ["feedback_text", "not_exported"]
+
+    with pytest.raises(ValueError, match="unsupported fields: not_exported"):
+        validate_topic_spec(raw)
+
+    schema = topic_spec_json_schema()
+    field_schema = schema["properties"]["output"]["properties"][
+        "required_fields"
+    ]["items"]
+    assert set(field_schema["enum"]) == {
+        "feedback_text", "feedback_time", "source_url",
+    }

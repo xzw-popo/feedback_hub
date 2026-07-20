@@ -42,15 +42,23 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         expected_data_cutoff_ms=data_cutoff_ms,
     )
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))
+    export_rows = [_export_row(row) for row in rows]
+    required_fields = tuple(spec.output["required_fields"])
+    if any(
+        not set(required_fields).issubset(export_row)
+        for export_row in export_rows
+    ):
+        raise RunVerificationError("required_output_fields_missing")
     jsonl_path = artifact_dir / "final_results.jsonl"
     jsonl_bytes = "".join(
         json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n"
-        for row in rows
+        for row in export_rows
     ).encode("utf-8")
     report = {
         "run_id": run_id, "status": "verified", "matched_count": len(rows),
         "artifact": jsonl_path.name, "data_cutoff_ms": data_cutoff_ms,
         "data_cutoff_time": _format_time(data_cutoff_ms),
+        "required_fields": list(required_fields),
     }
     report_bytes = (
         json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -76,6 +84,17 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
 
 def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.write_bytes(_xlsx_bytes(rows))
+
+
+def _export_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Add the stable public field names promised by the topic spec."""
+    item = row["source_item"]
+    return {
+        **dict(row),
+        "feedback_text": item["text"],
+        "feedback_time": _format_time(item["ts_ms"]),
+        "source_url": item["source_url"],
+    }
 
 
 def _xlsx_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:

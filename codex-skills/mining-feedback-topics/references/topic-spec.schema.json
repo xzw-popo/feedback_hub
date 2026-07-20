@@ -105,8 +105,11 @@
         },
         "required_fields": {
           "items": {
-            "minLength": 1,
-            "type": "string"
+            "enum": [
+              "feedback_text",
+              "feedback_time",
+              "source_url"
+            ]
           },
           "minItems": 1,
           "type": "array"

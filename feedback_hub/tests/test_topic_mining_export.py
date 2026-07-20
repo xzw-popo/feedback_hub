@@ -101,8 +101,21 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert ws.cell(2, headers.index("数据截止时间") + 1).value == "2023-11-14T22:13:20+00:00"
     final_rows = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["data_cutoff_ms"] for row in final_rows] == [CUTOFF_MS]
+    assert [
+        {
+            "feedback_text": row["feedback_text"],
+            "feedback_time": row["feedback_time"],
+            "source_url": row["source_url"],
+        }
+        for row in final_rows
+    ] == [{
+        "feedback_text": "游戏全屏工具栏一直显示",
+        "feedback_time": "2023-11-14T22:13:20+00:00",
+        "source_url": "https://example.test/chat/1",
+    }]
     report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
     assert report["data_cutoff_ms"] == CUTOFF_MS
+    assert report["required_fields"] == ["feedback_text"]
 
 
 def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):

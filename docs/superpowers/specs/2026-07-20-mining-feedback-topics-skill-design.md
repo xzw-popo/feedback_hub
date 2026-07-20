@@ -118,6 +118,8 @@ output:
   required_fields: [feedback_text, feedback_time, source_url]
 ```
 
+第一版只承诺 `feedback_text`、`feedback_time` 和 `source_url` 三个稳定输出字段；`required_fields` 必须是它们的非空子集。后台在接收规格时拒绝其他字段，并在 JSONL 中使用这些同名顶层键，Excel 中映射为“反馈原文”“反馈时间”和“对应链接”。
+
 必填项是专题名称、目标、时间范围、至少一条纳入条件和至少一条排除条件。平台、产品、正反例和词语提示可以来自用户原始需求，也可以由调用 AI 补全。AI 不得伪造用户没有表达的产品范围；范围缺失且会显著改变结果时才向用户提问。
 
 `lexical_hints` 是宽召回提示，不是命中规则。正反例用于构建向量查询和分类边界，不作为训练数据写回长期标签体系。

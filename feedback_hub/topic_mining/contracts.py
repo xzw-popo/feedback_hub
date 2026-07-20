@@ -32,6 +32,9 @@ _SCOPE_FIELDS = frozenset(
     {"start_time", "end_time", "platforms", "products", "channels", "versions"}
 )
 _OUTPUT_FIELDS = frozenset({"preferred_format", "required_fields"})
+SUPPORTED_OUTPUT_FIELDS = frozenset(
+    {"feedback_text", "feedback_time", "source_url"}
+)
 _LABEL_FIELDS = frozenset({"id", "meaning"})
 _LEXICAL_HINT_FIELDS = frozenset({"objects", "contexts"})
 _RFC3339_DATETIME = re.compile(
@@ -208,9 +211,18 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     preferred_format = _required_string(output_raw["preferred_format"], "output.preferred_format")
     if preferred_format not in {"xlsx", "jsonl"}:
         raise ValueError("output.preferred_format must be xlsx or jsonl")
+    required_fields = _string_list(
+        output_raw["required_fields"], "output.required_fields", required=True,
+    )
+    unsupported_output_fields = set(required_fields) - SUPPORTED_OUTPUT_FIELDS
+    if unsupported_output_fields:
+        raise ValueError(
+            "output.required_fields contains unsupported fields: "
+            + ", ".join(sorted(unsupported_output_fields))
+        )
     output = {
         "preferred_format": preferred_format,
-        "required_fields": list(_string_list(output_raw["required_fields"], "output.required_fields", required=True)),
+        "required_fields": list(required_fields),
     }
 
     return TopicSpec(
@@ -297,7 +309,11 @@ def topic_spec_json_schema() -> dict[str, Any]:
                 "required": ["preferred_format", "required_fields"],
                 "properties": {
                     "preferred_format": {"enum": ["xlsx", "jsonl"]},
-                    "required_fields": {**string_array, "minItems": 1},
+                    "required_fields": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"enum": sorted(SUPPORTED_OUTPUT_FIELDS)},
+                    },
                 },
             },
         },

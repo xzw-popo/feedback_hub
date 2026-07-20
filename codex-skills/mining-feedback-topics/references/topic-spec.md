@@ -15,7 +15,7 @@ Build one JSON or YAML object with these required fields:
 | `negative_examples` | Representative non-matching phrases or cases. |
 | `lexical_hints` | `objects` and `contexts` terms for recall only. |
 | `classification_labels` | Exactly `matched` and `not_matched`, each with `id` and `meaning`. |
-| `output` | `preferred_format` (`xlsx` or `jsonl`) and required output fields. |
+| `output` | `preferred_format` (`xlsx` or `jsonl`) and a non-empty subset of the supported required fields: `feedback_text`, `feedback_time`, and `source_url`. The backend rejects every other field name. |
 
 Treat scope as a hard metadata filter; treat criteria, examples, and hints as semantic guidance. Populate every hard-scope list only from values explicit in the current request; leave unstated lists empty unless one material question is required. Never infer scope from the workspace, examples, prior runs, or likely product context. Keep every target object and behavior named by the user as required inclusion conditions. Add paraphrases only when they preserve that meaning. Put unrequested adjacent objects or behaviors only in exclusion criteria; never broaden the target by adding them to hints or positive examples. Phrase criteria as facts a reviewer can check from source text and context.
 
