@@ -58,8 +58,15 @@ def _is_type(value: Any, type_name: str) -> bool:
     return False
 
 
+def _json_const_matches(value: Any, expected: Any) -> bool:
+    """Match JSON Schema constants without Python's bool/int equality leak."""
+    if isinstance(value, bool) or isinstance(expected, bool):
+        return isinstance(value, bool) and isinstance(expected, bool) and value is expected
+    return value == expected
+
+
 def _validate(value: Any, schema: dict[str, Any], path: str) -> None:
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_const_matches(value, schema["const"]):
         raise _error(path, f"must equal {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
         choices = ", ".join(str(item) for item in schema["enum"])

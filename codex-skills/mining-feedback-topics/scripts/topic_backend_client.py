@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 TIMEOUT_SECONDS = 30
@@ -24,6 +27,9 @@ class TransportError(Exception):
     pass
 
 
+_SAFE_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
 def _redact(text: str, token: str) -> str:
     return text.replace(token, "[REDACTED]") if token else text
 
@@ -32,7 +38,15 @@ def _base_url(value: str | None) -> str:
     base_url = value or os.environ.get("FEEDBACK_TOPIC_API_URL", "")
     if not base_url.strip():
         raise LocalError("FEEDBACK_TOPIC_API_URL or --base-url is required")
-    return base_url.rstrip("/") + "/api/topic-mining"
+    try:
+        parsed = urlsplit(base_url)
+        # Accessing port forces urllib to validate malformed netloc values.
+        parsed.port
+    except ValueError as error:
+        raise LocalError("API base URL must be a valid absolute HTTP(S) URL") from error
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise LocalError("API base URL must be an absolute HTTP(S) URL without query or fragment")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/api/topic-mining", "", ""))
 
 
 def _read_json(path: str, *, require_list: bool = False) -> Any:
@@ -45,27 +59,39 @@ def _read_json(path: str, *, require_list: bool = False) -> Any:
     return value
 
 
-def _request(base_url: str, token: str, method: str, path: str, payload: Any = None) -> tuple[Any, bytes]:
-    body = None
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+def _request(
+    base_url: str, token: str, method: str, path: str, payload: Any = None, *, expect_json: bool = True,
+) -> tuple[dict[str, Any] | None, bytes]:
     try:
+        body = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             raw = response.read()
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = error.read().decode("utf-8", errors="replace")
+        except (OSError, http.client.HTTPException):
+            detail = "response body unavailable"
         raise RuntimeError(f"HTTP {error.code}: {detail}") from error
-    except (urllib.error.URLError, OSError) as error:
+    except TypeError as error:
+        raise LocalError("request payload is not JSON serializable") from error
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as error:
         raise TransportError(str(error)) from error
-    try:
-        return json.loads(raw.decode("utf-8")), raw
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    if not expect_json:
         return None, raw
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TransportError("invalid JSON response") from error
+    if not isinstance(response, dict):
+        raise TransportError("invalid JSON response")
+    return response, raw
 
 
 def _write_atomic(path: str, raw: bytes) -> None:
@@ -82,10 +108,10 @@ def _write_atomic(path: str, raw: bytes) -> None:
         raise LocalError(f"cannot write output: {target.name}") from error
 
 
-def _safe_artifact_name(name: str) -> str:
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
-        raise LocalError("artifact name must be a single filename")
-    return name
+def _safe_path_segment(value: str, label: str) -> str:
+    if not _SAFE_PATH_SEGMENT.fullmatch(value):
+        raise LocalError(f"{label} must be a single safe URL path segment")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -114,26 +140,32 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         response, _ = _request(base_url, token, "POST", "/runs", _read_json(arguments.spec))
         return response
     if command == "get-run":
-        response, _ = _request(base_url, token, "GET", f"/runs/{arguments.run_id}")
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, _ = _request(base_url, token, "GET", f"/runs/{run_id}")
         return response
     if command == "review-queue":
-        response, raw = _request(base_url, token, "GET", f"/runs/{arguments.run_id}/review-queue")
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, raw = _request(base_url, token, "GET", f"/runs/{run_id}/review-queue")
         _write_atomic(arguments.output, raw)
         return response
     if command == "apply-overrides":
-        response, _ = _request(base_url, token, "POST", f"/runs/{arguments.run_id}/overrides", _read_json(arguments.file, require_list=True))
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/overrides", _read_json(arguments.file, require_list=True))
         return response
     if command == "verify":
-        response, _ = _request(base_url, token, "POST", f"/runs/{arguments.run_id}/verify")
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/verify")
         return response
     if command == "export":
-        response, _ = _request(base_url, token, "POST", f"/runs/{arguments.run_id}/export", {"format": arguments.format})
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/export", {"format": arguments.format})
         return response
     if command == "download":
-        name = _safe_artifact_name(arguments.artifact_name)
-        _, raw = _request(base_url, token, "GET", f"/runs/{arguments.run_id}/artifacts/{name}")
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        name = _safe_path_segment(arguments.artifact_name, "artifact name")
+        _, raw = _request(base_url, token, "GET", f"/runs/{run_id}/artifacts/{name}", expect_json=False)
         _write_atomic(arguments.output, raw)
-        return {"output": arguments.output, "run_id": arguments.run_id, "artifact_name": name}
+        return {"output": arguments.output, "run_id": run_id, "artifact_name": name}
     raise LocalError("unknown command")
 
 
