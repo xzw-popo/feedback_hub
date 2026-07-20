@@ -27,6 +27,13 @@ class TransportError(Exception):
     pass
 
 
+class _ClientArgumentParser(argparse.ArgumentParser):
+    """Route parse failures through the same redacted local-error boundary."""
+
+    def error(self, message: str) -> None:
+        raise LocalError(message)
+
+
 _SAFE_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
@@ -115,7 +122,7 @@ def _safe_path_segment(value: str, label: str) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _ClientArgumentParser(description=__doc__)
     parser.add_argument("--base-url", help="Override FEEDBACK_TOPIC_API_URL")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("capabilities")
@@ -170,9 +177,9 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    arguments = _parser().parse_args(argv)
     token = os.environ.get("FEEDBACK_TOPIC_API_TOKEN", "")
     try:
+        arguments = _parser().parse_args(argv)
         result = _run(arguments)
     except LocalError as error:
         print(_redact(str(error), token), file=sys.stderr)

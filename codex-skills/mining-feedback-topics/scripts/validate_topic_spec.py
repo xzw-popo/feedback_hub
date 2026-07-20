@@ -4,10 +4,17 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+_RFC3339_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+_RFC3339_LOCAL_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?$")
 
 
 def _error(path: str, message: str) -> ValueError:
@@ -58,17 +65,21 @@ def _is_type(value: Any, type_name: str) -> bool:
     return False
 
 
-def _json_const_matches(value: Any, expected: Any) -> bool:
-    """Match JSON Schema constants without Python's bool/int equality leak."""
+def _json_value_matches(value: Any, expected: Any) -> bool:
     if isinstance(value, bool) or isinstance(expected, bool):
         return isinstance(value, bool) and isinstance(expected, bool) and value is expected
     return value == expected
 
 
+def _json_const_matches(value: Any, expected: Any) -> bool:
+    """Match JSON Schema constants without Python's bool/int equality leak."""
+    return _json_value_matches(value, expected)
+
+
 def _validate(value: Any, schema: dict[str, Any], path: str) -> None:
     if "const" in schema and not _json_const_matches(value, schema["const"]):
         raise _error(path, f"must equal {schema['const']!r}")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_value_matches(value, option) for option in schema["enum"]):
         choices = ", ".join(str(item) for item in schema["enum"])
         raise _error(path, f"must be one of: {choices}")
 
@@ -81,10 +92,15 @@ def _validate(value: Any, schema: dict[str, Any], path: str) -> None:
         if len(value.strip()) < schema.get("minLength", 0):
             raise _error(path, "must be a non-empty string")
         if schema.get("format") == "date-time":
+            if not _RFC3339_DATETIME.fullmatch(value):
+                if _RFC3339_LOCAL_DATETIME.fullmatch(value):
+                    raise _error(path, "timezone is required")
+                raise _error(path, "must be an RFC3339 datetime")
+            normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
             try:
-                parsed = datetime.fromisoformat(value)
+                parsed = datetime.fromisoformat(normalized)
             except ValueError as error:
-                raise _error(path, "must be an ISO-8601 datetime") from error
+                raise _error(path, "must be an RFC3339 datetime") from error
             if parsed.tzinfo is None or parsed.utcoffset() is None:
                 raise _error(path, "timezone is required")
 

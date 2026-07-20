@@ -14,7 +14,7 @@ import pytest
 import yaml
 
 from feedback_hub.tests.test_topic_mining_contracts import valid_spec
-from feedback_hub.topic_mining.contracts import topic_spec_json_schema
+from feedback_hub.topic_mining.contracts import topic_spec_json_schema, validate_topic_spec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +35,14 @@ def _run_validator(path: Path) -> subprocess.CompletedProcess[str]:
 
 def _load_client_module():
     spec = importlib.util.spec_from_file_location("topic_backend_client", CLIENT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_validator_module():
+    spec = importlib.util.spec_from_file_location("validate_topic_spec", VALIDATOR)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -160,6 +168,44 @@ def test_validator_rejects_boolean_schema_version(tmp_path):
     assert "$.schema_version" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-01-16T00:00:00Z", "2026-01-16t00:00:00z"],
+)
+def test_standalone_and_backend_accept_rfc3339_utc_timestamps(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    raw["scope"]["end_time"] = "2026-07-16T14:00:00Z"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time.isoformat() == "2026-01-16T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-01-16 00:00:00+00:00", "2026-01-16T00:00+00:00", "2026-01-16T00:00:00"],
+)
+def test_standalone_and_backend_reject_non_rfc3339_timestamps(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+    assert result.returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
+def test_validator_enum_comparison_does_not_treat_boolean_as_number():
+    validator = _load_validator_module()
+
+    with pytest.raises(ValueError, match="must be one of"):
+        validator._validate(True, {"enum": [1]}, "$")
+
+
 @pytest.mark.parametrize("unsafe", ["..", "a/b", r"a\\b", "run?other", "run#fragment", "%2F", "run\x00id"])
 def test_client_rejects_unsafe_run_ids_before_building_a_url(monkeypatch, unsafe):
     module = _load_client_module()
@@ -210,6 +256,19 @@ def test_client_maps_invalid_url_and_http_client_exceptions_without_token_leaks(
     monkeypatch.setattr(module.urllib.request, "urlopen", invalid_url)
     code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", "capabilities"])
     assert code == 4
+    assert token not in stderr
+    assert "[REDACTED]" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_client_argument_errors_are_redacted(monkeypatch):
+    token = "secret-value"
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", token)
+    module = _load_client_module()
+
+    code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", f"invalid-{token}"])
+
+    assert code == 2
     assert token not in stderr
     assert "[REDACTED]" in stderr
     assert "Traceback" not in stderr

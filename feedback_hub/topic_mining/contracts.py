@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,10 @@ _SCOPE_FIELDS = frozenset(
 _OUTPUT_FIELDS = frozenset({"preferred_format", "required_fields"})
 _LABEL_FIELDS = frozenset({"id", "meaning"})
 _LEXICAL_HINT_FIELDS = frozenset({"objects", "contexts"})
+_RFC3339_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+_RFC3339_LOCAL_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?$")
 
 
 @dataclass(frozen=True)
@@ -119,10 +124,15 @@ def _string_list(value: Any, field: str, *, required: bool = False) -> tuple[str
 
 def _aware_datetime(value: Any, field: str) -> datetime:
     text = _required_string(value, field)
+    if not _RFC3339_DATETIME.fullmatch(text):
+        if _RFC3339_LOCAL_DATETIME.fullmatch(text):
+            raise ValueError(f"{field} must include a timezone")
+        raise ValueError(f"{field} must be an RFC3339 datetime")
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError as error:
-        raise ValueError(f"{field} must be an ISO-8601 datetime") from error
+        raise ValueError(f"{field} must be an RFC3339 datetime") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{field} must include a timezone")
     return parsed
