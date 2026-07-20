@@ -76,7 +76,22 @@ def test_verify_gate_rejects_pending_even_with_empty_artifacts(tmp_path):
 def test_verify_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
-    store.update_status(run["run_id"], "review_ready", stage="review_ready")
+    snapshot = Path(run["artifact_dir"]) / "source_snapshot.sqlite"
+    with sqlite3.connect(snapshot) as connection:
+        connection.execute("CREATE TABLE feedback (ts_ms INTEGER NOT NULL)")
+        connection.execute("INSERT INTO feedback VALUES (123)")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    store.update_manifest(
+        run["run_id"],
+        {
+            "source_watermark_ms": 123,
+            "source_snapshot": {"max_ts_ms": 123, "sha256": digest},
+            "source_sha256": digest,
+            "artifacts": {snapshot.name: digest},
+        },
+        stage="review_ready",
+        status="review_ready",
+    )
     with sqlite3.connect(store.db_path) as connection:
         connection.execute(
             "UPDATE topic_run SET spec_hash = 'forged' WHERE run_id = ?",
@@ -84,6 +99,15 @@ def test_verify_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
         )
 
     with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        verify_topic_run(run["run_id"], store=store)
+
+
+def test_verify_requires_complete_frozen_snapshot_evidence(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    store.update_status(run["run_id"], "review_ready", stage="review_ready")
+
+    with pytest.raises(RunVerificationError, match="source_snapshot_required"):
         verify_topic_run(run["run_id"], store=store)
 
 

@@ -258,8 +258,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
         finally:
             if incoming_snapshot is not None:
-                for suffix in ("", "-wal", "-shm", "-journal"):
-                    Path(str(incoming_snapshot) + suffix).unlink(missing_ok=True)
+                _cleanup_incoming_snapshot(incoming_snapshot)
 
     @router.get("/runs/{run_id}", dependencies=[Depends(require_token)])
     def get_run(run_id: str) -> dict[str, Any]:
@@ -362,6 +361,15 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
 
 # Application default; tests needing isolated config use make_router directly.
 router = make_router()
+
+
+def _cleanup_incoming_snapshot(snapshot_path: Path) -> None:
+    """Best-effort cleanup must never replace the request's stable result."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            Path(str(snapshot_path) + suffix).unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def _public_run(run: dict[str, Any]) -> dict[str, Any]:

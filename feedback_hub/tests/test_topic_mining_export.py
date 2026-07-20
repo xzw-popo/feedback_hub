@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import openpyxl
@@ -33,14 +34,51 @@ def _row(run_id: str, item_id: str = "f-1") -> dict:
     }
 
 
+def _persist_verified_manifest(
+    store: TopicRunStore,
+    run: dict,
+    *files: Path,
+) -> dict:
+    artifact_dir = Path(run["artifact_dir"])
+    snapshot = artifact_dir / "source_snapshot.sqlite"
+    with sqlite3.connect(snapshot) as connection:
+        connection.execute("CREATE TABLE feedback (ts_ms INTEGER NOT NULL)")
+        connection.execute(
+            "INSERT INTO feedback VALUES (?)", (run["source_watermark_ms"],),
+        )
+    snapshot_digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    manifest = {
+        "source_watermark_ms": run["source_watermark_ms"],
+        "source_snapshot": {
+            "max_ts_ms": run["source_watermark_ms"],
+            "sha256": snapshot_digest,
+        },
+        "source_sha256": snapshot_digest,
+        "artifacts": {
+            snapshot.name: snapshot_digest,
+            **{
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in files
+            },
+        },
+    }
+    store.update_manifest(
+        run["run_id"], manifest, stage="verified", status="verified",
+    )
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    return manifest
+
+
 def test_export_has_unique_ids_links_and_evidence(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), CUTOFF_MS)
     artifact_dir = tmp_path / "runs" / run["run_id"]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
-    store.update_status(run["run_id"], "verified", stage="verified")
-    manifest = {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}
-    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified"); (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _persist_verified_manifest(
+        store, run, artifact_dir / "final_reviewed.jsonl",
+    )
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, read_only=False, data_only=False)
     ws = wb["反馈清单"]
@@ -63,15 +101,7 @@ def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):
     artifact_dir = Path(run["artifact_dir"])
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
-    manifest = {
-        "artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()},
-    }
-    store.update_manifest(
-        run["run_id"], manifest, stage="verified", status="verified",
-    )
-    (artifact_dir / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8",
-    )
+    _persist_verified_manifest(store, run, final)
     before = store.get(run["run_id"])
     publications = []
     publish = store.publish_terminal_artifacts
@@ -91,13 +121,29 @@ def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):
     }
     current_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
     assert set(current_manifest["artifacts"]) == {
-        "final_reviewed.jsonl", "final_results.jsonl", "quality_report.json",
+        "source_snapshot.sqlite", "final_reviewed.jsonl",
+        "final_results.jsonl", "quality_report.json",
     }
 
 
 def test_export_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
-    import sqlite3
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
+    _persist_verified_manifest(store, run, final)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE topic_run SET spec_hash = 'forged' WHERE run_id = ?",
+            (run["run_id"],),
+        )
 
+    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        export_topic_run(run["run_id"], "jsonl", store=store)
+
+
+def test_export_requires_complete_frozen_snapshot_evidence(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), CUTOFF_MS)
     artifact_dir = Path(run["artifact_dir"])
@@ -112,13 +158,8 @@ def test_export_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
     (artifact_dir / "manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8",
     )
-    with sqlite3.connect(store.db_path) as connection:
-        connection.execute(
-            "UPDATE topic_run SET spec_hash = 'forged' WHERE run_id = ?",
-            (run["run_id"],),
-        )
 
-    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+    with pytest.raises(RunVerificationError, match="source_snapshot_required"):
         export_topic_run(run["run_id"], "jsonl", store=store)
 
 
@@ -134,9 +175,7 @@ def test_export_rejects_missing_invalid_or_mismatched_data_cutoff(tmp_path, cuto
         row["data_cutoff_ms"] = cutoff
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    manifest = {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}
-    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified")
-    (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _persist_verified_manifest(store, run, final)
 
     with pytest.raises(RunVerificationError, match="data_cutoff"):
         export_topic_run(run["run_id"], "jsonl", store=store)
@@ -150,17 +189,7 @@ def test_export_rejects_item_newer_than_advertised_cutoff(tmp_path):
     row["source_item"]["ts_ms"] = CUTOFF_MS + 1
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    manifest = {
-        "artifacts": {
-            final.name: hashlib.sha256(final.read_bytes()).hexdigest(),
-        },
-    }
-    store.update_manifest(
-        run["run_id"], manifest, stage="verified", status="verified",
-    )
-    (artifact_dir / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8",
-    )
+    _persist_verified_manifest(store, run, final)
 
     with pytest.raises(RunVerificationError, match="data_cutoff"):
         export_topic_run(run["run_id"], "jsonl", store=store)
@@ -175,9 +204,9 @@ def test_export_escapes_formula_like_user_text(tmp_path, text):
     row["source_item"]["text"] = text
     row["evidence"] = [text]
     (artifact_dir / "final_reviewed.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
-    store.update_status(run["run_id"], "verified", stage="verified")
-    manifest = {"artifacts": {"final_reviewed.jsonl": hashlib.sha256((artifact_dir / "final_reviewed.jsonl").read_bytes()).hexdigest()}}
-    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified"); (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _persist_verified_manifest(
+        store, run, artifact_dir / "final_reviewed.jsonl",
+    )
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, data_only=False)
     assert wb["反馈清单"]["C2"].value.startswith("'")
@@ -196,7 +225,7 @@ def test_export_rejects_tampered_final_artifact(tmp_path):
     artifact_dir = tmp_path / "runs" / run["run_id"]
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
-    store.update_manifest(run["run_id"], {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}, stage="verified", status="verified")
+    _persist_verified_manifest(store, run, final)
     final.write_text(json.dumps({**_row(run["run_id"]), "reason": "tampered"}) + "\n", encoding="utf-8")
     with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
         export_topic_run(run["run_id"], "xlsx", store=store)

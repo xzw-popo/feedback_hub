@@ -157,6 +157,36 @@ def test_create_run_maps_source_snapshot_failure_to_stable_503(tmp_path):
     assert str(config.source_db_path) not in response.text
 
 
+def test_snapshot_cleanup_failure_does_not_replace_the_stable_503(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(
+        source_db_path=tmp_path / "missing-source.db",
+        data_dir=tmp_path / "data",
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    unlink = Path.unlink
+
+    def fail_incoming_cleanup(path, *args, **kwargs):
+        if path.parent.name == ".incoming":
+            raise OSError("incoming path is unavailable")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(api.Path, "unlink", fail_incoming_cleanup)
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/topic-mining/runs", json=_spec(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "source_snapshot_unavailable"
+    assert "incoming path is unavailable" not in response.text
+
+
 def _resume_client(tmp_path, monkeypatch, *, status="pending", claim_now_ms=None):
     import feedback_hub.topic_mining.api as api
 
@@ -650,6 +680,7 @@ def test_jsonl_export_does_not_require_openpyxl():
 import hashlib
 import importlib.abc
 import json
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -719,7 +750,25 @@ with tempfile.TemporaryDirectory() as temporary:
     artifact_dir = Path(run["artifact_dir"])
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    manifest = {"artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()}}
+    snapshot = artifact_dir / "source_snapshot.sqlite"
+    with sqlite3.connect(snapshot) as connection:
+        connection.execute("CREATE TABLE feedback (ts_ms INTEGER NOT NULL)")
+        connection.execute(
+            "INSERT INTO feedback VALUES (?)", (run["source_watermark_ms"],),
+        )
+    snapshot_digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    manifest = {
+        "source_watermark_ms": run["source_watermark_ms"],
+        "source_snapshot": {
+            "max_ts_ms": run["source_watermark_ms"],
+            "sha256": snapshot_digest,
+        },
+        "source_sha256": snapshot_digest,
+        "artifacts": {
+            snapshot.name: snapshot_digest,
+            final.name: hashlib.sha256(final.read_bytes()).hexdigest(),
+        },
+    }
     store.update_manifest(run["run_id"], manifest, stage="verified", status="verified")
     (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     app = FastAPI()

@@ -386,7 +386,9 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
     spec = validate_topic_spec(json.loads(run["spec_json"]))
-    data_cutoff_ms = _effective_data_cutoff(run, manifest)
+    data_cutoff_ms = _effective_data_cutoff(
+        run, manifest, require_snapshot=True,
+    )
     _validate_run_identity(run, spec, data_cutoff_ms)
     for key in _UNRESOLVED_KEYS:
         if int(manifest.get(key, 0) or 0) > 0:
@@ -534,8 +536,12 @@ def _required_data_cutoff(value: Any) -> int:
 def _effective_data_cutoff(
     run: Mapping[str, Any],
     manifest: Mapping[str, Any],
+    *,
+    require_snapshot: bool = False,
 ) -> int:
     cutoff = _required_data_cutoff(run.get("source_watermark_ms"))
+    if require_snapshot and "source_watermark_ms" not in manifest:
+        raise RunVerificationError("source_snapshot_required")
     if "source_watermark_ms" in manifest:
         manifest_cutoff = _required_data_cutoff(
             manifest.get("source_watermark_ms"),
@@ -544,6 +550,8 @@ def _effective_data_cutoff(
             raise RunVerificationError("source_watermark_mismatch")
 
     snapshot_meta = manifest.get("source_snapshot")
+    if require_snapshot and snapshot_meta is None:
+        raise RunVerificationError("source_snapshot_required")
     if snapshot_meta is not None:
         if not isinstance(snapshot_meta, Mapping) or "max_ts_ms" not in snapshot_meta:
             raise RunVerificationError("source_watermark_mismatch")
@@ -552,6 +560,26 @@ def _effective_data_cutoff(
             raise RunVerificationError("source_watermark_mismatch")
 
     snapshot_path = Path(str(run.get("artifact_dir", ""))) / "source_snapshot.sqlite"
+    if require_snapshot and not snapshot_path.is_file():
+        raise RunVerificationError("source_snapshot_required")
+    if require_snapshot:
+        artifacts = manifest.get("artifacts")
+        snapshot_digest = (
+            artifacts.get(snapshot_path.name)
+            if isinstance(artifacts, Mapping)
+            else None
+        )
+        metadata_digest = (
+            snapshot_meta.get("sha256")
+            if isinstance(snapshot_meta, Mapping)
+            else None
+        )
+        if (
+            not isinstance(snapshot_digest, str)
+            or metadata_digest != snapshot_digest
+            or manifest.get("source_sha256") != snapshot_digest
+        ):
+            raise RunVerificationError("source_snapshot_required")
     if snapshot_path.is_file():
         try:
             with sqlite3.connect(

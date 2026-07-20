@@ -29,7 +29,9 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     final_path = artifact_dir / "final_reviewed.jsonl"
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
-    data_cutoff_ms = _effective_data_cutoff(run, manifest)
+    data_cutoff_ms = _effective_data_cutoff(
+        run, manifest, require_snapshot=True,
+    )
     _validate_run_identity(run, spec, data_cutoff_ms)
     try:
         rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
