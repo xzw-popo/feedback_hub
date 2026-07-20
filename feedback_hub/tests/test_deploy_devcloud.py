@@ -96,16 +96,18 @@ def test_topic_mining_health_check_runs_after_restart_and_handles_env_token_bran
     assert authenticated_branch.index("Authorization: Bearer $TOPIC_TOKEN") < authenticated_branch.rindex('= "200"')
 
 
-@pytest.mark.parametrize(("token", "unauth_status", "auth_status", "unauth_exit", "expected_success"), [
-    ("", "200", "200", "0", True),
-    ("", "503", "200", "0", False),
-    ("fixture-token", "401", "200", "0", True),
-    ("fixture-token", "200", "200", "0", False),
+@pytest.mark.parametrize(("token", "unauth_status", "auth_status", "unauth_exit", "auth_exit", "expected_success"), [
+    ("", "200", "200", "0", "0", True),
+    ("", "503", "200", "0", "0", False),
+    ("fixture-token", "401", "200", "0", "0", True),
+    ("fixture-token", "200", "200", "0", "0", False),
+    ("fixture-token", "401", "503", "0", "0", False),
     # Even an expected-looking body must not hide a curl transport failure.
-    ("", "200", "200", "7", False),
+    ("", "200", "200", "7", "0", False),
+    ("fixture-token", "401", "200", "0", "7", False),
 ])
 def test_documented_topic_health_check_propagates_every_failure(
-    tmp_path, token, unauth_status, auth_status, unauth_exit, expected_success,
+    tmp_path, token, unauth_status, auth_status, unauth_exit, auth_exit, expected_success,
 ):
     project = tmp_path / "feedback-hub"
     fake_bin = tmp_path / "bin"
@@ -137,6 +139,7 @@ exit "${STUB_UNAUTH_EXIT:-0}"
         "STUB_UNAUTH_STATUS": unauth_status,
         "STUB_AUTH_STATUS": auth_status,
         "STUB_UNAUTH_EXIT": unauth_exit,
+        "STUB_AUTH_EXIT": auth_exit,
         # Prove the documented env -u path ignores an inherited stale value.
         "TOPIC_MINING_API_TOKEN": "stale-shell-token",
     }
