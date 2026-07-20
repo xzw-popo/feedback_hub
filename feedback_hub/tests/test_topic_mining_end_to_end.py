@@ -6,8 +6,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import openpyxl
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
+from feedback_hub.topic_mining.api import make_router
 from feedback_hub.topic_mining.config import TopicMiningConfig
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.export import export_topic_run
@@ -141,6 +144,26 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
         model_routes=[route], model_call_fn=model_call,
     )
     assert outcome["status"] == "review_ready", outcome
+
+    expected_funnel = {
+        "hard_scope_count": 4,
+        "candidate_count": 4,
+        "classified_count": 4,
+        "review_queue_count": 4,
+    }
+    persisted_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert {
+        key: persisted_manifest["funnel"][key]
+        for key in expected_funnel
+    } == expected_funnel
+
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+    with TestClient(app) as client:
+        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
+    assert response.status_code == 200
+    public_funnel = response.json()["quality"]["funnel"]
+    assert {key: public_funnel[key] for key in expected_funnel} == expected_funnel
 
     artifact_dir = config.data_dir / "runs" / run["run_id"]
     recalls = [json.loads(line) for line in (artifact_dir / "recall_candidates.jsonl").read_text(encoding="utf-8").splitlines()]

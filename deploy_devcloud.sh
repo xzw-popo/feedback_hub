@@ -24,6 +24,7 @@ tar \
   --exclude='.DS_Store' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='codex-skills' \
   --exclude='legacy_cloudbase' \
   --exclude='dashboard/node_modules' \
   --exclude='dashboard/.vite' \

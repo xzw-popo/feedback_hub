@@ -162,6 +162,14 @@ TOPIC_VECTOR_MAX_LAG_SECONDS=21600
 TOPIC_MINING_API_TOKEN=
 ```
 
+专题分类复用现有 OpenAI-compatible LLM 运行时。以下三项是运行分类必需的共享变量，也只允许配置在远端 `.env`，示例不包含真实地址、模型名或密钥：
+
+```dotenv
+LLM_API_URL=
+LLM_API_KEY=
+LLM_MODEL=
+```
+
 `TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。`TOPIC_MINING_API_TOKEN` 留空时，能力接口不需要鉴权：
 
 ```bash
