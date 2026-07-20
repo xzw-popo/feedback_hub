@@ -105,6 +105,49 @@ def test_existing_run_repairs_missing_artifact_directory(tmp_path, valid_topic_s
     assert artifact_dir.is_dir()
 
 
+def test_create_run_atomically_installs_only_the_first_frozen_snapshot(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    first_snapshot = tmp_path / "first.sqlite"
+    first_snapshot.write_bytes(b"first-frozen-snapshot")
+    first_digest = hashlib.sha256(first_snapshot.read_bytes()).hexdigest()
+    first_manifest = {
+        "artifacts": {"source_snapshot.sqlite": first_digest},
+        "source_watermark_ms": 1234,
+    }
+
+    first = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        initial_files={"source_snapshot.sqlite": first_snapshot},
+        initial_manifest=first_manifest,
+        initial_stage="snapshot",
+    )
+    second_snapshot = tmp_path / "second.sqlite"
+    second_snapshot.write_bytes(b"same-watermark-but-new-content")
+    second = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        initial_files={"source_snapshot.sqlite": second_snapshot},
+        initial_manifest={
+            "artifacts": {
+                "source_snapshot.sqlite": hashlib.sha256(
+                    second_snapshot.read_bytes(),
+                ).hexdigest(),
+            },
+            "source_watermark_ms": 1234,
+        },
+        initial_stage="snapshot",
+    )
+
+    canonical = Path(first["artifact_dir"]) / "source_snapshot.sqlite"
+    assert first["created"] is True
+    assert second["created"] is False
+    assert canonical.read_bytes() == b"first-frozen-snapshot"
+    assert json.loads(store.get(first["run_id"])["manifest_json"]) == first_manifest
+
+
 def test_existing_run_database_is_migrated_with_worker_lease_columns(tmp_path):
     db_path = tmp_path / "runs.db"
     with sqlite3.connect(db_path) as connection:
@@ -244,6 +287,38 @@ def test_expired_worker_cannot_renew_or_publish(tmp_path, valid_topic_spec):
         store.assert_worker_claim(
             run["run_id"], claim.claim_token, now_ms=2_000,
         )
+
+
+def test_expired_worker_can_record_failure_until_a_new_token_takes_over(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    first = store.claim_worker(
+        run["run_id"], lease_seconds=1, now_ms=1_000,
+    )
+    monkeypatch.setattr(
+        "feedback_hub.topic_mining.run_store.time.time", lambda: 3.0,
+    )
+
+    assert store.fail_worker_claim(
+        run["run_id"], first.claim_token,
+        error_code="worker_heartbeat_lost",
+        error_message="heartbeat failed",
+    ) is True
+    assert store.get(run["run_id"])["status"] == "failed"
+
+    second = store.claim_worker(
+        run["run_id"], lease_seconds=1, now_ms=4_000,
+    )
+    third = store.claim_worker(
+        run["run_id"], lease_seconds=1, now_ms=5_000,
+    )
+    assert store.fail_worker_claim(
+        run["run_id"], second.claim_token,
+        error_code="stale", error_message="stale",
+    ) is False
+    assert store.get(run["run_id"])["worker_claim_token"] == third.claim_token
 
 
 def test_stale_generation_cannot_promote_over_new_worker_artifact(
@@ -566,3 +641,33 @@ def test_committed_terminal_publication_tolerates_mirror_write_failure(
     assert manifest["artifacts"]["final_results.jsonl"] == hashlib.sha256(
         b"published\n",
     ).hexdigest()
+
+
+def test_terminal_publication_fsyncs_staging_parent_before_database_intent(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_manifest(
+        run["run_id"], {"artifacts": {}},
+        stage="verified", status="verified",
+    )
+    before = store.get(run["run_id"])
+    fsynced = []
+    fsync_directory = store._fsync_directory
+
+    def observe(path):
+        fsynced.append(Path(path))
+        fsync_directory(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", observe)
+
+    store.publish_terminal_artifacts(
+        run["run_id"],
+        expected_manifest_json=before["manifest_json"],
+        manifest={"artifacts": {}},
+        stage="verified", status="verified",
+        files={"final_results.jsonl": b"published\n"},
+    )
+
+    assert Path(run["artifact_dir"]) / ".publications" in fsynced

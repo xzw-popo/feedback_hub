@@ -25,8 +25,15 @@ def _spec():
 
 
 def _client(tmp_path, *, token: str = ""):
+    from feedback_hub.tests.test_topic_mining_service import _write_source
+
     app = FastAPI()
-    config = TopicMiningConfig(data_dir=tmp_path / "data", api_token=token)
+    source = tmp_path / "source.db"
+    if not source.is_file():
+        _write_source(source)
+    config = TopicMiningConfig(
+        source_db_path=source, data_dir=tmp_path / "data", api_token=token,
+    )
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
     app.include_router(make_router(config=config, store=store))
     return TestClient(app)
@@ -68,6 +75,52 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert first["scheduled"] is True
     assert second["scheduled"] is False
     assert started == [first["run_id"]]
+
+
+def test_create_run_freezes_snapshot_before_scheduling_and_never_replaces_it(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+    from feedback_hub.tests.test_topic_mining_service import _write_source
+
+    source = tmp_path / "source.db"
+    start_ms, end_ms = _write_source(source)
+    config = TopicMiningConfig(
+        source_db_path=source, data_dir=tmp_path / "data",
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    scheduled_snapshots = []
+
+    def start(run_id, **_kwargs):
+        scheduled_snapshots.append(
+            (Path(store.get(run_id)["artifact_dir"]) / "source_snapshot.sqlite").is_file()
+        )
+        return SimpleNamespace(scheduled=True, reason="scheduled")
+
+    monkeypatch.setattr(api, "start_run_async", start)
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+    client = TestClient(app)
+
+    first = client.post("/api/topic-mining/runs", json=_spec()).json()
+    snapshot_path = Path(store.get(first["run_id"])["artifact_dir"]) / "source_snapshot.sqlite"
+    first_digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest() if snapshot_path.is_file() else None
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "same-watermark-backfill", "c-backfill", 1, start_ms + 500,
+                "Win", "1", "pc", "PC", "u-backfill", 1,
+                "https://example.test/backfill", "历史回填",
+            ),
+        )
+    second = client.post("/api/topic-mining/runs", json=_spec()).json()
+
+    assert end_ms == first["source_watermark_ms"]
+    assert first["run_id"] == second["run_id"]
+    assert scheduled_snapshots == [True]
+    assert first_digest is not None
+    assert hashlib.sha256(snapshot_path.read_bytes()).hexdigest() == first_digest
 
 
 def test_get_run_reports_one_effective_snapshot_cutoff(tmp_path):
@@ -368,6 +421,59 @@ def test_heartbeat_failure_is_persisted_before_slow_pipeline_unwind(
     assert failed["error_code"] == "worker_heartbeat_lost"
     assert failed["worker_claim_token"] is None
     assert failed["manifest_json"] == "{}"
+
+
+def test_heartbeat_failure_retries_persistence_during_slow_pipeline_unwind(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=1)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=config.worker_lease_seconds,
+    )
+    fail_worker_claim = store.fail_worker_claim
+    raw_store = store
+    fail_attempts = []
+    observed_during_unwind = []
+
+    def renew_failure(*_args, **_kwargs):
+        raise sqlite3.OperationalError("temporary renewal failure")
+
+    def transient_failure(*args, **kwargs):
+        fail_attempts.append(len(fail_attempts) + 1)
+        if len(fail_attempts) <= 2:
+            raise sqlite3.OperationalError("temporary failure write outage")
+        return fail_worker_claim(*args, **kwargs)
+
+    def slow_unwind(run_id, *, store: object, config):
+        del store, config
+        deadline = time.monotonic() + 1.5
+        current = None
+        while time.monotonic() < deadline:
+            current = raw_store.get(run_id)
+            if current["status"] == "failed":
+                break
+            time.sleep(0.02)
+        observed_during_unwind.append(current["status"])
+
+    monkeypatch.setattr(store, "renew_worker_claim", renew_failure)
+    monkeypatch.setattr(store, "fail_worker_claim", transient_failure)
+    monkeypatch.setattr(api, "run_topic_job", slow_unwind)
+
+    api._run_claimed_job(
+        run_id=run["run_id"], store=store, config=config,
+        claim_token=claim.claim_token,
+    )
+
+    failed = store.get(run["run_id"])
+    assert observed_during_unwind == ["failed"]
+    assert len(fail_attempts) >= 3
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_heartbeat_lost"
+    assert failed["worker_claim_token"] is None
 
 
 @pytest.mark.parametrize("status", ["review_ready", "verified"])

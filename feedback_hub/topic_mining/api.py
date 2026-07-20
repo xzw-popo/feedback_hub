@@ -5,10 +5,8 @@ import hashlib
 import hmac
 import json
 import os
-import sqlite3
 import threading
-from dataclasses import dataclass
-from datetime import timezone
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 
 from .config import TopicMiningConfig
-from .contracts import validate_topic_spec
+from .contracts import topic_spec_hash, validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
+from .source import create_source_snapshot
 from .service import (
     RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
@@ -87,9 +86,34 @@ def _run_claimed_job(
     stop_heartbeat = threading.Event()
     claim_lost = threading.Event()
     heartbeat_failed = threading.Event()
+    heartbeat_failure_persisted = threading.Event()
+    retry_wait = threading.Event()
     heartbeat_interval = max(0.25, config.worker_lease_seconds / 3)
     heartbeat_thread: threading.Thread | None = None
     heartbeat_started = False
+
+    def persist_heartbeat_failure(
+        *, cancellation_event: threading.Event | None,
+    ) -> bool:
+        while not heartbeat_failure_persisted.is_set():
+            try:
+                persisted = store.fail_worker_claim(
+                    run_id,
+                    claim_token,
+                    error_code="worker_heartbeat_lost",
+                    error_message="topic worker heartbeat was lost",
+                )
+            except Exception:
+                waiter = cancellation_event or retry_wait
+                if waiter.wait(0.1):
+                    return False
+                continue
+            if persisted:
+                heartbeat_failure_persisted.set()
+            # False means the token was already replaced or the run already
+            # reached another terminal state; the stale worker must stop.
+            return persisted
+        return True
 
     def heartbeat() -> None:
         while not stop_heartbeat.wait(heartbeat_interval):
@@ -100,17 +124,9 @@ def _run_claimed_job(
                     lease_seconds=config.worker_lease_seconds,
                 )
             except Exception:
-                try:
-                    store.fail_worker_claim(
-                        run_id,
-                        claim_token,
-                        error_code="worker_heartbeat_lost",
-                        error_message="topic worker heartbeat was lost",
-                    )
-                except Exception:
-                    pass
                 heartbeat_failed.set()
                 claim_lost.set()
+                persist_heartbeat_failure(cancellation_event=stop_heartbeat)
                 return
             if not renewed:
                 claim_lost.set()
@@ -138,12 +154,7 @@ def _run_claimed_job(
                 raise WorkerClaimLostError("worker_claim_lost")
         except WorkerClaimLostError:
             if heartbeat_failed.is_set():
-                store.fail_worker_claim(
-                    run_id,
-                    claim_token,
-                    error_code="worker_heartbeat_lost",
-                    error_message="topic worker heartbeat was lost",
-                )
+                persist_heartbeat_failure(cancellation_event=None)
         except Exception:
             store.fail_worker_claim(
                 run_id,
@@ -184,10 +195,51 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
 
     @router.post("/runs", dependencies=[Depends(require_token)])
     def create_run(payload: dict[str, Any]) -> dict[str, Any]:
+        incoming_snapshot: Path | None = None
         try:
             spec = validate_topic_spec(payload)
-            watermark = _source_watermark(config.source_db_path, spec)
-            run = store.create_or_get(spec, watermark)
+            incoming_dir = config.data_dir / ".incoming"
+            incoming_dir.mkdir(parents=True, exist_ok=True)
+            incoming_snapshot = incoming_dir / (
+                hashlib.sha256(os.urandom(32)).hexdigest() + ".sqlite"
+            )
+            snapshot = create_source_snapshot(
+                config.source_db_path, incoming_snapshot,
+            )
+            if snapshot.max_ts_ms is None:
+                raise ValueError("source database is empty")
+            watermark = int(snapshot.max_ts_ms)
+            spec_hash = topic_spec_hash(spec)
+            run_id = hashlib.sha256(
+                f"{spec_hash}:{watermark}".encode("utf-8")
+            ).hexdigest()[:16]
+            final_snapshot = store.artifacts_dir / run_id / "source_snapshot.sqlite"
+            snapshot_data = asdict(snapshot)
+            snapshot_data["path"] = str(final_snapshot)
+            manifest = {
+                "manifest_version": 2,
+                "stage": "snapshot",
+                "artifacts": {"source_snapshot.sqlite": snapshot.sha256},
+                "stages": {
+                    "snapshot": {
+                        "inputs": {},
+                        "outputs": {"source_snapshot.sqlite": snapshot.sha256},
+                        "input_count": 0,
+                        "output_count": snapshot.row_count,
+                    },
+                },
+                "funnel": {"snapshot_count": snapshot.row_count},
+                "source_snapshot": snapshot_data,
+                "source_watermark_ms": watermark,
+                "source_sha256": snapshot.sha256,
+            }
+            run = store.create_or_get(
+                spec,
+                watermark,
+                initial_files={"source_snapshot.sqlite": incoming_snapshot},
+                initial_manifest=manifest,
+                initial_stage="snapshot",
+            )
             scheduled = False
             if run["created"]:
                 start = start_run_async(run["run_id"], store=store, config=config)
@@ -199,6 +251,9 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             return result
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
+        finally:
+            if incoming_snapshot is not None:
+                incoming_snapshot.unlink(missing_ok=True)
 
     @router.get("/runs/{run_id}", dependencies=[Depends(require_token)])
     def get_run(run_id: str) -> dict[str, Any]:
@@ -296,22 +351,6 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
 
 # Application default; tests needing isolated config use make_router directly.
 router = make_router()
-
-
-def _source_watermark(source_path: Path, spec: Any) -> int:
-    """Read only enough metadata to key a run; never create or alter source DB."""
-    path = Path(source_path)
-    if path.is_file():
-        try:
-            with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as connection:
-                row = connection.execute("SELECT MAX(ts_ms) FROM feedback").fetchone()
-            if row and isinstance(row[0], int):
-                return row[0]
-        except sqlite3.Error:
-            # The worker will record a stable failure with full auditing.  Use
-            # deterministic scope cutoff only so create remains idempotent.
-            pass
-    return int(spec.scope.end_time.astimezone(timezone.utc).timestamp() * 1000)
 
 
 def _public_run(run: dict[str, Any]) -> dict[str, Any]:

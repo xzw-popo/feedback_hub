@@ -96,28 +96,46 @@ class TopicRunStore:
                         f"ALTER TABLE topic_run ADD COLUMN {name} {sql_type}"
                     )
 
-    def create_or_get(self, spec: TopicSpec, source_watermark_ms: int) -> dict[str, Any]:
+    def create_or_get(
+        self,
+        spec: TopicSpec,
+        source_watermark_ms: int,
+        *,
+        initial_files: Mapping[str, Path] | None = None,
+        initial_manifest: Mapping[str, Any] | None = None,
+        initial_stage: str = "created",
+    ) -> dict[str, Any]:
+        """Create one run, optionally installing a frozen snapshot first."""
+        if (initial_files is None) != (initial_manifest is None):
+            raise ValueError("initial files and manifest must be provided together")
+        if not isinstance(initial_stage, str) or not initial_stage:
+            raise ValueError("initial stage is required")
         spec_hash = topic_spec_hash(spec)
         run_id = hashlib.sha256(f"{spec_hash}:{source_watermark_ms}".encode("utf-8")).hexdigest()[:16]
         artifact_dir = self.artifacts_dir / run_id
         # An artifact directory is part of a usable run.  Create (or repair) it
         # before publishing the database row, so workers never see a run that
         # cannot write its isolated outputs.
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if initial_files is None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
         now_ms = int(time.time() * 1000)
+        manifest_json = json.dumps(
+            dict(initial_manifest or {}), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
         record = {
             "run_id": run_id,
             "spec_hash": spec_hash,
             "spec_json": json.dumps(spec.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             "source_watermark_ms": int(source_watermark_ms),
             "status": "pending",
-            "stage": "created",
+            "stage": initial_stage,
             "error_code": None,
             "error_message": None,
             "artifact_dir": str(artifact_dir),
             "created_at_ms": now_ms,
             "updated_at_ms": now_ms,
-            "manifest_json": "{}",
+            "manifest_json": manifest_json,
             "worker_claim_token": None,
             "worker_claimed_at_ms": None,
             "worker_lease_expires_at_ms": None,
@@ -125,6 +143,47 @@ class TopicRunStore:
         }
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
+                (spec_hash, int(source_watermark_ms)),
+            ).fetchone()
+            if row is not None:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                result = dict(row)
+                result["created"] = False
+                return result
+            if initial_files is not None:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                self._fsync_directory(self.artifacts_dir)
+                artifacts = initial_manifest.get("artifacts")
+                if not isinstance(artifacts, Mapping):
+                    raise ValueError("initial manifest artifacts must be an object")
+                for name, source in initial_files.items():
+                    if not self._terminal_name_safe(name):
+                        raise ValueError("invalid initial artifact name")
+                    source_path = Path(source)
+                    expected = artifacts.get(name)
+                    if (
+                        not source_path.is_file()
+                        or not isinstance(expected, str)
+                        or self._sha256(source_path) != expected
+                    ):
+                        raise ValueError("initial artifact hash mismatch")
+                    target = artifact_dir / name
+                    temporary = target.with_name(
+                        f".{target.name}.{secrets.token_hex(8)}.tmp"
+                    )
+                    try:
+                        with source_path.open("rb") as source_handle, temporary.open("wb") as target_handle:
+                            while chunk := source_handle.read(1024 * 1024):
+                                target_handle.write(chunk)
+                            target_handle.flush()
+                            os.fsync(target_handle.fileno())
+                        os.replace(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                self._fsync_directory(artifact_dir)
+                self._write_manifest_mirror(artifact_dir, initial_manifest)
             cursor = connection.execute(
                 """INSERT INTO topic_run (
                     run_id, spec_hash, spec_json, source_watermark_ms, status, stage,
@@ -136,7 +195,7 @@ class TopicRunStore:
                     :error_code, :error_message, :artifact_dir, :created_at_ms, :updated_at_ms, :manifest_json,
                     :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms,
                     :publication_json
-                ) ON CONFLICT(spec_hash, source_watermark_ms) DO NOTHING""",
+                )""",
                 record,
             )
             created = cursor.rowcount == 1
@@ -274,11 +333,9 @@ class TopicRunStore:
                        worker_claimed_at_ms = NULL,
                        worker_lease_expires_at_ms = NULL
                    WHERE run_id = ? AND status = 'running'
-                     AND worker_claim_token = ?
-                     AND worker_lease_expires_at_ms > ?""",
+                     AND worker_claim_token = ?""",
                 (
                     error_code, error_message, now_ms, run_id, claim_token,
-                    now_ms,
                 ),
             )
         return cursor.rowcount == 1
@@ -359,8 +416,12 @@ class TopicRunStore:
             raise ValueError("terminal artifact cannot be published and deleted")
 
         publication_id = secrets.token_hex(16)
-        publication_dir = artifact_dir / ".publications" / publication_id
-        publication_dir.mkdir(parents=True, exist_ok=False)
+        publication_root = artifact_dir / ".publications"
+        publication_root.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory(artifact_dir)
+        publication_dir = publication_root / publication_id
+        publication_dir.mkdir(exist_ok=False)
+        self._fsync_directory(publication_root)
         file_records: dict[str, dict[str, str]] = {}
         try:
             for name, raw in normalized_files.items():
