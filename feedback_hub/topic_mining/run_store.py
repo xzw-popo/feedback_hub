@@ -113,11 +113,54 @@ class TopicRunStore:
         spec_hash = topic_spec_hash(spec)
         run_id = hashlib.sha256(f"{spec_hash}:{source_watermark_ms}".encode("utf-8")).hexdigest()[:16]
         artifact_dir = self.artifacts_dir / run_id
-        # An artifact directory is part of a usable run.  Create (or repair) it
-        # before publishing the database row, so workers never see a run that
-        # cannot write its isolated outputs.
-        if initial_files is None:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
+                (spec_hash, int(source_watermark_ms)),
+            ).fetchone()
+        if existing is not None:
             artifact_dir.mkdir(parents=True, exist_ok=True)
+            self._fsync_directory(self.artifacts_dir)
+            result = dict(existing)
+            result["created"] = False
+            return result
+
+        # Copy/hash large snapshots before taking the global runs.db write
+        # lock. Publication under the lock is then only durable renames.
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._fsync_directory(self.artifacts_dir)
+        prepared_initial: list[tuple[Path, Path]] = []
+        if initial_files is not None:
+            artifacts = initial_manifest.get("artifacts")
+            if not isinstance(artifacts, Mapping):
+                raise ValueError("initial manifest artifacts must be an object")
+            try:
+                for name, source in initial_files.items():
+                    if not self._terminal_name_safe(name):
+                        raise ValueError("invalid initial artifact name")
+                    source_path = Path(source)
+                    expected = artifacts.get(name)
+                    if (
+                        not source_path.is_file()
+                        or not isinstance(expected, str)
+                        or self._sha256(source_path) != expected
+                    ):
+                        raise ValueError("initial artifact hash mismatch")
+                    target = artifact_dir / name
+                    temporary = target.with_name(
+                        f".{target.name}.{secrets.token_hex(8)}.initial"
+                    )
+                    with source_path.open("rb") as source_handle, temporary.open("wb") as target_handle:
+                        while chunk := source_handle.read(1024 * 1024):
+                            target_handle.write(chunk)
+                        target_handle.flush()
+                        os.fsync(target_handle.fileno())
+                    prepared_initial.append((temporary, target))
+                self._fsync_directory(artifact_dir)
+            except Exception:
+                for temporary, _target in prepared_initial:
+                    temporary.unlink(missing_ok=True)
+                raise
         now_ms = int(time.time() * 1000)
         manifest_json = json.dumps(
             dict(initial_manifest or {}), ensure_ascii=False, sort_keys=True,
@@ -141,68 +184,44 @@ class TopicRunStore:
             "worker_lease_expires_at_ms": None,
             "publication_json": None,
         }
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
-                (spec_hash, int(source_watermark_ms)),
-            ).fetchone()
-            if row is not None:
-                artifact_dir.mkdir(parents=True, exist_ok=True)
-                result = dict(row)
-                result["created"] = False
-                return result
-            if initial_files is not None:
-                artifact_dir.mkdir(parents=True, exist_ok=True)
-                self._fsync_directory(self.artifacts_dir)
-                artifacts = initial_manifest.get("artifacts")
-                if not isinstance(artifacts, Mapping):
-                    raise ValueError("initial manifest artifacts must be an object")
-                for name, source in initial_files.items():
-                    if not self._terminal_name_safe(name):
-                        raise ValueError("invalid initial artifact name")
-                    source_path = Path(source)
-                    expected = artifacts.get(name)
-                    if (
-                        not source_path.is_file()
-                        or not isinstance(expected, str)
-                        or self._sha256(source_path) != expected
-                    ):
-                        raise ValueError("initial artifact hash mismatch")
-                    target = artifact_dir / name
-                    temporary = target.with_name(
-                        f".{target.name}.{secrets.token_hex(8)}.tmp"
-                    )
-                    try:
-                        with source_path.open("rb") as source_handle, temporary.open("wb") as target_handle:
-                            while chunk := source_handle.read(1024 * 1024):
-                                target_handle.write(chunk)
-                            target_handle.flush()
-                            os.fsync(target_handle.fileno())
-                        os.replace(temporary, target)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                self._fsync_directory(artifact_dir)
-                self._write_manifest_mirror(artifact_dir, initial_manifest)
-            cursor = connection.execute(
-                """INSERT INTO topic_run (
-                    run_id, spec_hash, spec_json, source_watermark_ms, status, stage,
-                    error_code, error_message, artifact_dir, created_at_ms, updated_at_ms, manifest_json,
-                    worker_claim_token, worker_claimed_at_ms, worker_lease_expires_at_ms,
-                    publication_json
-                ) VALUES (
-                    :run_id, :spec_hash, :spec_json, :source_watermark_ms, :status, :stage,
-                    :error_code, :error_message, :artifact_dir, :created_at_ms, :updated_at_ms, :manifest_json,
-                    :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms,
-                    :publication_json
-                )""",
-                record,
-            )
-            created = cursor.rowcount == 1
-            row = connection.execute(
-                "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
-                (spec_hash, int(source_watermark_ms)),
-            ).fetchone()
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
+                    (spec_hash, int(source_watermark_ms)),
+                ).fetchone()
+                if row is not None:
+                    result = dict(row)
+                    result["created"] = False
+                    return result
+                for temporary, target in prepared_initial:
+                    os.replace(temporary, target)
+                if initial_files is not None:
+                    self._fsync_directory(artifact_dir)
+                    self._write_manifest_mirror(artifact_dir, initial_manifest)
+                cursor = connection.execute(
+                    """INSERT INTO topic_run (
+                        run_id, spec_hash, spec_json, source_watermark_ms, status, stage,
+                        error_code, error_message, artifact_dir, created_at_ms, updated_at_ms, manifest_json,
+                        worker_claim_token, worker_claimed_at_ms, worker_lease_expires_at_ms,
+                        publication_json
+                    ) VALUES (
+                        :run_id, :spec_hash, :spec_json, :source_watermark_ms, :status, :stage,
+                        :error_code, :error_message, :artifact_dir, :created_at_ms, :updated_at_ms, :manifest_json,
+                        :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms,
+                        :publication_json
+                    )""",
+                    record,
+                )
+                created = cursor.rowcount == 1
+                row = connection.execute(
+                    "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
+                    (spec_hash, int(source_watermark_ms)),
+                ).fetchone()
+        finally:
+            for temporary, _target in prepared_initial:
+                temporary.unlink(missing_ok=True)
         if row is None:  # pragma: no cover - defensive safeguard for damaged stores
             raise RuntimeError("topic run disappeared during creation")
         result = dict(row)

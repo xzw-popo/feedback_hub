@@ -123,7 +123,7 @@ def test_create_run_freezes_snapshot_before_scheduling_and_never_replaces_it(
     assert hashlib.sha256(snapshot_path.read_bytes()).hexdigest() == first_digest
 
 
-def test_get_run_reports_one_effective_snapshot_cutoff(tmp_path):
+def test_get_run_rejects_row_and_snapshot_cutoff_mismatch(tmp_path):
     config = TopicMiningConfig(data_dir=tmp_path / "data")
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
     run = store.create_or_get(validate_topic_spec(_spec()), 123)
@@ -133,12 +133,28 @@ def test_get_run_reports_one_effective_snapshot_cutoff(tmp_path):
     app = FastAPI()
     app.include_router(make_router(config=config, store=store))
 
-    payload = TestClient(app).get(
+    response = TestClient(app).get(
         f"/api/topic-mining/runs/{run['run_id']}"
-    ).json()
+    )
 
-    assert payload["source_watermark_ms"] == 456
-    assert payload["quality"]["source_watermark_ms"] == 456
+    assert response.status_code == 409
+    assert response.json()["detail"] == "source_watermark_mismatch"
+
+
+def test_create_run_maps_source_snapshot_failure_to_stable_503(tmp_path):
+    config = TopicMiningConfig(
+        source_db_path=tmp_path / "missing-source.db",
+        data_dir=tmp_path / "data",
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    response = TestClient(app).post("/api/topic-mining/runs", json=_spec())
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "source_snapshot_unavailable"
+    assert str(config.source_db_path) not in response.text
 
 
 def _resume_client(tmp_path, monkeypatch, *, status="pending", claim_now_ms=None):

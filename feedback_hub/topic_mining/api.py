@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -249,18 +250,28 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             result = _public_run(current)
             result["scheduled"] = scheduled
             return result
+        except (sqlite3.Error, OSError):
+            raise HTTPException(
+                status_code=503, detail="source_snapshot_unavailable",
+            ) from None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
         finally:
             if incoming_snapshot is not None:
-                incoming_snapshot.unlink(missing_ok=True)
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    Path(str(incoming_snapshot) + suffix).unlink(missing_ok=True)
 
     @router.get("/runs/{run_id}", dependencies=[Depends(require_token)])
     def get_run(run_id: str) -> dict[str, Any]:
         run = get_topic_run(run_id, store=store)
         if run is None:
             raise HTTPException(status_code=404, detail="topic run not found")
-        return _public_run(run)
+        try:
+            return _public_run(run)
+        except RunVerificationError as exc:
+            raise HTTPException(
+                status_code=409, detail=_redact(str(exc), config),
+            ) from None
 
     @router.post("/runs/{run_id}/resume", dependencies=[Depends(require_token)])
     def resume_run(run_id: str) -> dict[str, Any]:

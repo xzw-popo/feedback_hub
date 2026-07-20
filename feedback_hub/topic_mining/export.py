@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _require_run, _validate_final_rows, _verify_manifest, read_verified_artifact_bytes
+from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _require_run, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
 
 
@@ -29,11 +29,12 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     final_path = artifact_dir / "final_reviewed.jsonl"
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
+    data_cutoff_ms = _effective_data_cutoff(run, manifest)
+    _validate_run_identity(run, spec, data_cutoff_ms)
     try:
         rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
-    data_cutoff_ms = _effective_data_cutoff(run, manifest)
     _validate_final_rows(
         rows, spec, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,

@@ -148,6 +148,49 @@ def test_create_run_atomically_installs_only_the_first_frozen_snapshot(
     assert json.loads(store.get(first["run_id"])["manifest_json"]) == first_manifest
 
 
+def test_initial_snapshot_is_prepared_before_the_global_database_write_lock(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    snapshot = tmp_path / "snapshot.sqlite"
+    snapshot.write_bytes(b"large-frozen-snapshot")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    sha256 = store._sha256
+
+    def hash_while_an_unrelated_writer_can_start(path):
+        with sqlite3.connect(store.db_path, timeout=0) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+        return sha256(path)
+
+    monkeypatch.setattr(store, "_sha256", hash_while_an_unrelated_writer_can_start)
+
+    run = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        initial_files={"source_snapshot.sqlite": snapshot},
+        initial_manifest={
+            "artifacts": {"source_snapshot.sqlite": digest},
+        },
+        initial_stage="snapshot",
+    )
+
+    assert run["created"] is True
+
+
+def test_plain_create_fsyncs_the_artifact_parent_before_publishing_the_row(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    synced = []
+
+    monkeypatch.setattr(store, "_fsync_directory", synced.append)
+
+    run = store.create_or_get(valid_topic_spec, 1234)
+
+    assert run["created"] is True
+    assert store.artifacts_dir in synced
+
+
 def test_existing_run_database_is_migrated_with_worker_lease_columns(tmp_path):
     db_path = tmp_path / "runs.db"
     with sqlite3.connect(db_path) as connection:

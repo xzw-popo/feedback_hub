@@ -95,6 +95,33 @@ def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):
     }
 
 
+def test_export_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
+    import sqlite3
+
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
+    manifest = {
+        "artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()},
+    }
+    store.update_manifest(
+        run["run_id"], manifest, stage="verified", status="verified",
+    )
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE topic_run SET spec_hash = 'forged' WHERE run_id = ?",
+            (run["run_id"],),
+        )
+
+    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        export_topic_run(run["run_id"], "jsonl", store=store)
+
+
 @pytest.mark.parametrize("cutoff", [None, True, CUTOFF_MS - 1, str(CUTOFF_MS)])
 def test_export_rejects_missing_invalid_or_mismatched_data_cutoff(tmp_path, cutoff):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")

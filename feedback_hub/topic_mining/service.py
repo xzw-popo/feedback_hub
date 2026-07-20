@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import time
 from urllib.parse import urlparse
 from dataclasses import asdict
@@ -19,7 +20,7 @@ from typing import Any, Mapping, Sequence
 
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
-from .contracts import TopicSpec, validate_topic_spec
+from .contracts import TopicSpec, topic_spec_hash, validate_topic_spec
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
 from .run_store import RunPublicationConflictError, TopicRunStore
@@ -384,13 +385,15 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     artifact_dir = Path(run["artifact_dir"])
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
+    spec = validate_topic_spec(json.loads(run["spec_json"]))
+    data_cutoff_ms = _effective_data_cutoff(run, manifest)
+    _validate_run_identity(run, spec, data_cutoff_ms)
     for key in _UNRESOLVED_KEYS:
         if int(manifest.get(key, 0) or 0) > 0:
             raise RunVerificationError(key)
     _require_stage_chain(manifest, artifact_dir)
     if run["status"] == "verified":
         _require_artifact(manifest, artifact_dir / "final_reviewed.jsonl")
-    spec = validate_topic_spec(json.loads(run["spec_json"]))
     recall_path, classified_path, contexts_path, overrides_path, review_queue_path = (artifact_dir / "recall_candidates.jsonl", artifact_dir / "classified.jsonl", artifact_dir / "item_contexts.json", artifact_dir / "review_overrides.jsonl", artifact_dir / "review_queue.jsonl")
     for path in (recall_path, classified_path, contexts_path, overrides_path, review_queue_path):
         _require_artifact(manifest, path)
@@ -432,7 +435,6 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     _require_review_decisions(
         _read_required_jsonl(review_queue_path, manifest), overrides,
     )
-    data_cutoff_ms = _effective_data_cutoff(run, manifest)
     final_rows = [
         _final_row(
             result, by_id[result.item_id], run_id,
@@ -533,8 +535,58 @@ def _effective_data_cutoff(
     run: Mapping[str, Any],
     manifest: Mapping[str, Any],
 ) -> int:
-    value = manifest.get("source_watermark_ms", run.get("source_watermark_ms"))
-    return _required_data_cutoff(value)
+    cutoff = _required_data_cutoff(run.get("source_watermark_ms"))
+    if "source_watermark_ms" in manifest:
+        manifest_cutoff = _required_data_cutoff(
+            manifest.get("source_watermark_ms"),
+        )
+        if manifest_cutoff != cutoff:
+            raise RunVerificationError("source_watermark_mismatch")
+
+    snapshot_meta = manifest.get("source_snapshot")
+    if snapshot_meta is not None:
+        if not isinstance(snapshot_meta, Mapping) or "max_ts_ms" not in snapshot_meta:
+            raise RunVerificationError("source_watermark_mismatch")
+        snapshot_cutoff = _required_data_cutoff(snapshot_meta.get("max_ts_ms"))
+        if snapshot_cutoff != cutoff:
+            raise RunVerificationError("source_watermark_mismatch")
+
+    snapshot_path = Path(str(run.get("artifact_dir", ""))) / "source_snapshot.sqlite"
+    if snapshot_path.is_file():
+        try:
+            with sqlite3.connect(
+                f"file:{snapshot_path.resolve()}?mode=ro", uri=True,
+            ) as connection:
+                row = connection.execute(
+                    "SELECT MAX(ts_ms) FROM feedback",
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise RunVerificationError("invalid_source_snapshot") from exc
+        actual_cutoff = row[0] if row is not None else None
+        if (
+            isinstance(actual_cutoff, bool)
+            or not isinstance(actual_cutoff, int)
+            or actual_cutoff != cutoff
+        ):
+            raise RunVerificationError("source_watermark_mismatch")
+    return cutoff
+
+
+def _validate_run_identity(
+    run: Mapping[str, Any],
+    spec: TopicSpec,
+    source_watermark_ms: int,
+) -> None:
+    persisted_hash = run.get("spec_hash")
+    expected_hash = topic_spec_hash(spec)
+    expected_run_id = hashlib.sha256(
+        f"{expected_hash}:{source_watermark_ms}".encode("utf-8"),
+    ).hexdigest()[:16]
+    if (
+        persisted_hash != expected_hash
+        or run.get("run_id") != expected_run_id
+    ):
+        raise RunVerificationError("run_identity_mismatch")
 
 
 def _require_review_decisions(
