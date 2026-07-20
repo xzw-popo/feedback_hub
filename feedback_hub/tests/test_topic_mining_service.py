@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from feedback_hub.topic_mining.service import RunVerificationError, verify_topic_run
+from feedback_hub.topic_mining.service import (
+    RunVerificationError,
+    submit_review_overrides,
+    verify_topic_run,
+)
 from feedback_hub.topic_mining.run_store import TopicRunStore
 
 
@@ -27,6 +31,30 @@ def _write_source(path, *, include_end=True):
             rows.append(("boundary-b", "c2", 1, end, "Win", "1", "pc", "PC", "u2", 1, "https://example.test/2", "范围结束"))
         connection.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     return start, end
+
+
+def _review_every_queue_item(run: dict, store: TopicRunStore) -> None:
+    artifact_dir = Path(run["artifact_dir"])
+    queue = [
+        json.loads(line)
+        for line in (artifact_dir / "review_queue.jsonl").read_text(
+            encoding="utf-8",
+        ).splitlines()
+        if line.strip()
+    ]
+    submit_review_overrides(
+        run["run_id"],
+        [
+            {
+                "item_id": row["item_id"],
+                "label": row["label"],
+                "reason": "确认现有判定",
+                "reviewer": "fixture-reviewer",
+            }
+            for row in queue
+        ],
+        store=store,
+    )
 
 
 def test_verify_blocks_unresolved_classifier_failure(tmp_path):
@@ -272,7 +300,17 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
     assert recovered["status"] == "review_ready"
     recovered_manifest = json.loads(recovered["manifest_json"])
     assert recovered_manifest["unresolved_vector_items"] == 0
+    with pytest.raises(RunVerificationError, match="review_decisions_incomplete"):
+        verify_topic_run(stale_run["run_id"], store=stale_store)
+    _review_every_queue_item(recovered, stale_store)
     assert verify_topic_run(stale_run["run_id"], store=stale_store)["status"] == "verified"
+    final_rows = [
+        json.loads(line)
+        for line in (
+            Path(recovered["artifact_dir"]) / "final_reviewed.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert {row["data_cutoff_ms"] for row in final_rows} == {end}
 
 
 def test_run_maps_classifier_quota_pause(tmp_path):
@@ -400,5 +438,6 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
         verify_topic_run(run["run_id"], store=store)
     store.update_manifest(run["run_id"], original_manifest, stage="review_ready")
     manifest_path.write_text(json.dumps(original_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    _review_every_queue_item(store.get(run["run_id"]), store)
     assert verify_topic_run(run["run_id"], store=store)["status"] == "verified"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before

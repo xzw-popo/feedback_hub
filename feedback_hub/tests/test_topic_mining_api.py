@@ -70,6 +70,24 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert started == [first["run_id"]]
 
 
+def test_get_run_reports_one_effective_snapshot_cutoff(tmp_path):
+    config = TopicMiningConfig(data_dir=tmp_path / "data")
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    store.update_manifest(
+        run["run_id"], {"source_watermark_ms": 456}, stage="snapshot",
+    )
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    payload = TestClient(app).get(
+        f"/api/topic-mining/runs/{run['run_id']}"
+    ).json()
+
+    assert payload["source_watermark_ms"] == 456
+    assert payload["quality"]["source_watermark_ms"] == 456
+
+
 def _resume_client(tmp_path, monkeypatch, *, status="pending", claim_now_ms=None):
     import feedback_hub.topic_mining.api as api
 
@@ -521,7 +539,7 @@ with tempfile.TemporaryDirectory() as temporary:
     data_dir = Path(temporary)
     config = TopicMiningConfig(data_dir=data_dir)
     store = TopicRunStore(data_dir / "runs.db", data_dir / "runs")
-    run = store.create_or_get(spec, 123)
+    run = store.create_or_get(spec, 1700000000000)
     row["run_id"] = run["run_id"]
     row["data_cutoff_ms"] = run["source_watermark_ms"]
     artifact_dir = Path(run["artifact_dir"])

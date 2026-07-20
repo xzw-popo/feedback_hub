@@ -14,7 +14,7 @@ Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). Configure `
 | `export RUN_ID --format xlsx|jsonl` | Create an artifact only after verification. |
 | `download RUN_ID ARTIFACT --output FILE` | Atomically save the returned artifact. |
 
-Run from the Skill directory and copy this complete sequence. Keep the override command visible; execute it only when the queue needs decisions. Replace placeholders with returned or chosen values, and use the artifact name returned by `export`:
+Run from the Skill directory and copy this complete sequence. Keep the override command visible; execute it for every non-empty queue. Replace placeholders with returned or chosen values, and use the artifact name returned by `export`:
 
 ```bash
 python3 scripts/topic_backend_client.py capabilities
@@ -29,6 +29,8 @@ python3 scripts/topic_backend_client.py verify RUN_ID
 python3 scripts/topic_backend_client.py export RUN_ID --format xlsx
 python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH
 ```
+
+`OVERRIDES_PATH` must contain one explicit decision for every item returned by `review-queue`, even when confirming the existing label. A decision that sets an evidence-free item to `matched` must include a non-empty `evidence` list whose strings are exact substrings of the returned `source_item.text` or `context_items` text. Partial or extra decision IDs keep verification blocked.
 
 Statuses are `pending`, `running`, `review_ready`, `verified`, `failed`, and `paused_quota_exhausted`. A paused or failed run is inspectable, not exportable. After `paused_quota_exhausted`, repair quota or model-service access and run `resume RUN_ID` on the original run. After a repairable `failed`, fix the reported service or configuration failure and resume the original run. Do not create a replacement run. Pending orphan runs can resume immediately; running runs resume only after the backend-owned worker lease is stale. `review_ready` and `verified` reject resume. The caller never supplies lease, concurrency, route, model, or retrieval controls. Client exit categories are `2` local input/configuration error, `3` service response error, and `4` transport or invalid-response error; repair the reported category without exposing tokens.
 

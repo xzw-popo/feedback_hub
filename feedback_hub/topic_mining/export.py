@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _checkpoint, _load_manifest, _require_run, _validate_final_rows, _verify_manifest, _write_jsonl, read_verified_artifact_bytes
+from .service import RunVerificationError, _checkpoint, _effective_data_cutoff, _load_manifest, _require_run, _validate_final_rows, _verify_manifest, _write_jsonl, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
 
 
@@ -32,7 +32,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
-    data_cutoff_ms = run.get("source_watermark_ms")
+    data_cutoff_ms = _effective_data_cutoff(run, manifest)
     _validate_final_rows(
         rows, spec, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,

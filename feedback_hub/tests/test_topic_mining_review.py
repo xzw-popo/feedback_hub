@@ -30,6 +30,7 @@ def test_review_queue_includes_vector_only_match_and_negative_conflict():
         run_id="topic_1",
         classifications=[matched("a", 0.91), matched("b", 0.92)],
         recall_by_id={"a": recall(channels=("vector",)), "b": recall(negative_query_hits=("negative:0",))},
+        contexts={"a": [{"item_id": "context-a", "text": "上下文原文"}]},
         per_label_sample=0,
     )
     assert {row["item_id"] for row in queue} == {"a", "b"}
@@ -37,6 +38,10 @@ def test_review_queue_includes_vector_only_match_and_negative_conflict():
     assert queue[1]["review_reasons"] == ["negative_query_conflict"]
     assert queue[0]["source_item"]["text"] == "text"
     assert queue[0]["source_url"] == "https://example.test/feedback/unused"
+    assert queue[0]["context_items"] == [
+        {"item_id": "context-a", "text": "上下文原文"},
+    ]
+    assert queue[1]["context_items"] == []
 
 
 def test_review_queue_includes_all_mandatory_reasons_and_stable_samples():

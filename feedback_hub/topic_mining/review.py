@@ -17,6 +17,7 @@ def build_review_queue(
     classifications: Sequence[ClassificationResult],
     recall_by_id: Mapping[str, RecallHit],
     *,
+    contexts: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     per_label_sample: int = 20,
 ) -> list[dict[str, Any]]:
     if per_label_sample < 0 or per_label_sample > 20:
@@ -38,7 +39,10 @@ def build_review_queue(
                 reasons.add("vector_only_match")
             if hit.negative_query_hits:
                 reasons.add("negative_query_conflict")
-        rows[result.item_id] = _queue_row(result, hit, reasons)
+        rows[result.item_id] = _queue_row(
+            result, hit, reasons,
+            () if contexts is None else contexts.get(result.item_id, ()),
+        )
     for label in sorted({result.label for result in classifications}):
         selected = _hash_select(run_id, [result for result in classifications if result.label == label], "deterministic_label_sample", per_label_sample)
         for result in selected:
@@ -124,7 +128,12 @@ def persist_review_artifacts(
     write_review_overrides(artifact_dir / "review_overrides.jsonl", overrides)
 
 
-def _queue_row(result: ClassificationResult, hit: RecallHit | None, reasons: set[str]) -> dict[str, Any]:
+def _queue_row(
+    result: ClassificationResult,
+    hit: RecallHit | None,
+    reasons: set[str],
+    context_items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
     source_item = dict(hit.item) if hit is not None else {}
     return {
         "item_id": result.item_id,
@@ -137,6 +146,7 @@ def _queue_row(result: ClassificationResult, hit: RecallHit | None, reasons: set
         "review_reasons": sorted(reasons),
         "source_item": source_item,
         "source_url": source_item.get("source_url"),
+        "context_items": [dict(item) for item in context_items],
     }
 
 

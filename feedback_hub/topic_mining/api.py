@@ -19,7 +19,7 @@ from .config import TopicMiningConfig
 from .contracts import validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .service import (
-    RunVerificationError, _artifact_valid, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
+    RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
@@ -308,12 +308,13 @@ def _source_watermark(source_path: Path, spec: Any) -> int:
 def _public_run(run: dict[str, Any]) -> dict[str, Any]:
     manifest = _manifest(run)
     classifier = manifest.get("classifier", {}) if isinstance(manifest.get("classifier"), dict) else {}
+    source_watermark_ms = _effective_data_cutoff(run, manifest)
     return {
         "run_id": run["run_id"], "status": run["status"], "stage": run["stage"],
         "error_code": run.get("error_code"), "error_message": run.get("error_message"),
-        "created": bool(run.get("created", False)), "source_watermark_ms": run["source_watermark_ms"],
+        "created": bool(run.get("created", False)), "source_watermark_ms": source_watermark_ms,
         "quality": {
-            "funnel": manifest.get("funnel", {}), "source_watermark_ms": manifest.get("source_watermark_ms"),
+            "funnel": manifest.get("funnel", {}), "source_watermark_ms": source_watermark_ms,
             "vector_watermark_ms": manifest.get("vector_watermark_ms"),
             "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items")},
             "models": classifier.get("models", []), "retry_total": classifier.get("retry_total", 0),

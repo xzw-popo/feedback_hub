@@ -186,7 +186,13 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
         }], store=store)
     assert overrides_path.read_bytes() == before_invalid_submit
 
-    submit_review_overrides(run["run_id"], [
+    review_queue = [
+        json.loads(line)
+        for line in (artifact_dir / "review_queue.jsonl").read_text(
+            encoding="utf-8",
+        ).splitlines()
+    ]
+    decisions = [
         {
             "item_id": "win-taskbar", "label": "not_matched",
             "reason": "专题明确排除 Windows 系统任务栏", "reviewer": "fixture-reviewer",
@@ -196,7 +202,12 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
             "reason": "受控原文明确描述全屏遮挡", "reviewer": "fixture-reviewer",
             "evidence": ["悬浮控件遮住画面"],
         },
-    ], store=store)
+    ]
+    decisions.extend({
+        "item_id": row["item_id"], "label": row["label"],
+        "reason": "确认现有判定", "reviewer": "fixture-reviewer",
+    } for row in review_queue if row["item_id"] not in {"win-taskbar", "win-paraphrase"})
+    submit_review_overrides(run["run_id"], decisions, store=store)
     persisted_overrides = [json.loads(line) for line in overrides_path.read_text(encoding="utf-8").splitlines()]
     assert persisted_overrides[1]["evidence"] == ["悬浮控件遮住画面"]
 
@@ -204,8 +215,14 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
     # verified claim: verification re-checks merged evidence against sources.
     valid_override_bytes = overrides_path.read_bytes()
     valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
-    tampered_overrides = json.loads(valid_override_bytes.decode("utf-8").splitlines()[0]), json.loads(valid_override_bytes.decode("utf-8").splitlines()[1])
-    tampered_overrides[1]["evidence"] = ["伪造证据"]
+    tampered_overrides = [
+        json.loads(line)
+        for line in valid_override_bytes.decode("utf-8").splitlines()
+    ]
+    next(
+        row for row in tampered_overrides
+        if row["item_id"] == "win-paraphrase"
+    )["evidence"] = ["伪造证据"]
     overrides_path.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in tampered_overrides), encoding="utf-8")
     tampered_manifest = json.loads(json.dumps(valid_manifest))
     override_hash = hashlib.sha256(overrides_path.read_bytes()).hexdigest()

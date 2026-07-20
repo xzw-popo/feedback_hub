@@ -14,10 +14,17 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy_devcloud.sh"
 DEPLOY_DOC = REPO_ROOT / "docs" / "devcloud-container-deployment.md"
 
 
-def _archive_excludes() -> list[str]:
+def _archive_excludes(project: Path | None = None) -> list[str]:
     script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
     archive_block = script.split("tar \\\n", 1)[1].split('-czf "$ARCHIVE" .', 1)[0]
-    return re.findall(r"--exclude='([^']+)'", archive_block)
+    excludes = re.findall(r"--exclude='([^']+)'", archive_block)
+    if project is not None:
+        excludes.extend(
+            str(path.relative_to(project))
+            for path in project.rglob(".env*")
+            if path.name != ".env.example"
+        )
+    return excludes
 
 
 def _topic_mining_doc_section() -> str:
@@ -47,18 +54,38 @@ def test_devcloud_archive_explicitly_excludes_distributable_skills():
     assert "--exclude='codex-skills'" in script
 
 
+def test_devcloud_archive_excludes_local_data_and_secret_envs_but_keeps_example():
+    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert "--exclude='feedback_hub/data'" in script
+    assert "-name '.env'" in script
+    assert "-name '.env.*'" in script
+    assert "! -name '.env.example'" in script
+    assert "rm -f \"$ARCHIVE\"" in script
+    assert "rm -f \\\"${REMOTE_ARCHIVE}\\\"" in script
+
+
 def test_devcloud_archive_excludes_skill_fixture_but_keeps_backend(tmp_path):
     project = tmp_path / "project"
     skill_marker = project / "codex-skills" / "marker.txt"
     backend_marker = project / "feedback_hub" / "marker.txt"
+    data_marker = project / "feedback_hub" / "data" / "private.db"
+    root_env = project / ".env"
+    nested_env = project / "dashboard" / ".env.production"
+    env_example = project / ".env.example"
     skill_marker.parent.mkdir(parents=True)
     backend_marker.parent.mkdir(parents=True)
+    data_marker.parent.mkdir(parents=True)
+    nested_env.parent.mkdir(parents=True)
     skill_marker.write_text("skill", encoding="utf-8")
     backend_marker.write_text("backend", encoding="utf-8")
+    data_marker.write_text("private", encoding="utf-8")
+    root_env.write_text("TOKEN=secret", encoding="utf-8")
+    nested_env.write_text("TOKEN=secret", encoding="utf-8")
+    env_example.write_text("TOKEN=example", encoding="utf-8")
     archive = tmp_path / "fixture.tar.gz"
 
     subprocess.run(
-        ["tar", *(f"--exclude={value}" for value in _archive_excludes()), "-czf", str(archive), "."],
+        ["tar", *(f"--exclude={value}" for value in _archive_excludes(project)), "-czf", str(archive), "."],
         cwd=project,
         check=True,
     )
@@ -66,6 +93,10 @@ def test_devcloud_archive_excludes_skill_fixture_but_keeps_backend(tmp_path):
 
     assert "./codex-skills/marker.txt" not in entries
     assert "./feedback_hub/marker.txt" in entries
+    assert "./feedback_hub/data/private.db" not in entries
+    assert "./.env" not in entries
+    assert "./dashboard/.env.production" not in entries
+    assert "./.env.example" in entries
 
 
 def test_topic_mining_deployment_docs_require_shared_llm_runtime_configuration():

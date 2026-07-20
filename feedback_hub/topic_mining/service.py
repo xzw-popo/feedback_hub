@@ -264,7 +264,10 @@ def _run_pipeline(
     overrides_path = artifact_dir / "review_overrides.jsonl"
     if classifications_rebuilt or not _stage_valid(manifest, "review_queue", artifact_dir):
         _ensure_worker_active(run_id, store)
-        queue = build_review_queue(run_id, classifications, {row.item_id: row for row in recalls})
+        queue = build_review_queue(
+            run_id, classifications, {row.item_id: row for row in recalls},
+            contexts=contexts,
+        )
         review_workspace = _stage_workspace(store, artifact_dir, "review_queue")
         persist_review_artifacts(
             review_workspace, queue,
@@ -315,7 +318,8 @@ def submit_review_overrides(
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
     _require_artifact(manifest, artifact_dir / "classified.jsonl")
-    _require_artifact(manifest, artifact_dir / "review_queue.jsonl")
+    review_queue_path = artifact_dir / "review_queue.jsonl"
+    _require_artifact(manifest, review_queue_path)
     _require_artifact(manifest, artifact_dir / "recall_candidates.jsonl")
     _require_artifact(manifest, artifact_dir / "item_contexts.json")
     classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl", manifest)]
@@ -329,6 +333,9 @@ def submit_review_overrides(
         classifications, overrides,
         allowed_labels={entry["id"] for entry in spec.classification_labels},
         evidence_sources=evidence_sources,
+    )
+    _require_review_decisions(
+        _read_required_jsonl(review_queue_path, manifest), overrides,
     )
     _write_jsonl(artifact_dir / "review_overrides.jsonl", [dict(row) for row in overrides])
     _invalidate_export_artifacts(manifest, artifact_dir)
@@ -363,8 +370,8 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     if run["status"] == "verified":
         _require_artifact(manifest, artifact_dir / "final_reviewed.jsonl")
     spec = validate_topic_spec(json.loads(run["spec_json"]))
-    recall_path, classified_path, contexts_path, overrides_path = (artifact_dir / "recall_candidates.jsonl", artifact_dir / "classified.jsonl", artifact_dir / "item_contexts.json", artifact_dir / "review_overrides.jsonl")
-    for path in (recall_path, classified_path, contexts_path, overrides_path):
+    recall_path, classified_path, contexts_path, overrides_path, review_queue_path = (artifact_dir / "recall_candidates.jsonl", artifact_dir / "classified.jsonl", artifact_dir / "item_contexts.json", artifact_dir / "review_overrides.jsonl", artifact_dir / "review_queue.jsonl")
+    for path in (recall_path, classified_path, contexts_path, overrides_path, review_queue_path):
         _require_artifact(manifest, path)
     recalls = [_recall_from_dict(row) for row in _read_required_jsonl(recall_path, manifest)]
     classifications = [_classification_from_dict(row) for row in _read_required_jsonl(classified_path, manifest)]
@@ -401,7 +408,10 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     except ValueError as exc:
         code = "invalid_evidence" if "evidence" in str(exc) else "invalid_review_override"
         raise RunVerificationError(code) from exc
-    data_cutoff_ms = _required_data_cutoff(run.get("source_watermark_ms"))
+    _require_review_decisions(
+        _read_required_jsonl(review_queue_path, manifest), overrides,
+    )
+    data_cutoff_ms = _effective_data_cutoff(run, manifest)
     final_rows = [
         _final_row(
             result, by_id[result.item_id], run_id,
@@ -463,6 +473,9 @@ def _validate_final_rows(
         item = row.get("source_item")
         if not isinstance(item, Mapping) or not isinstance(item.get("text"), str) or not item["text"].strip():
             raise RunVerificationError("missing_text")
+        item_ts_ms = item.get("ts_ms")
+        if isinstance(item_ts_ms, bool) or not isinstance(item_ts_ms, int) or item_ts_ms > expected_data_cutoff_ms:
+            raise RunVerificationError("invalid_data_cutoff")
         url = item.get("source_url")
         if not _valid_source_url(url):
             raise RunVerificationError("missing_link")
@@ -478,6 +491,30 @@ def _required_data_cutoff(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise RunVerificationError("invalid_data_cutoff")
     return value
+
+
+def _effective_data_cutoff(
+    run: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> int:
+    value = manifest.get("source_watermark_ms", run.get("source_watermark_ms"))
+    return _required_data_cutoff(value)
+
+
+def _require_review_decisions(
+    queue: Sequence[Mapping[str, Any]],
+    decisions: Sequence[Mapping[str, Any]],
+) -> None:
+    queue_ids = [row.get("item_id") for row in queue]
+    decision_ids = [row.get("item_id") for row in decisions]
+    if (
+        any(not isinstance(value, str) or not value for value in queue_ids)
+        or len(queue_ids) != len(set(queue_ids))
+        or any(not isinstance(value, str) or not value for value in decision_ids)
+        or len(decision_ids) != len(set(decision_ids))
+        or set(queue_ids) != set(decision_ids)
+    ):
+        raise RunVerificationError("review_decisions_incomplete")
 
 
 def _authoritative_evidence_sources(

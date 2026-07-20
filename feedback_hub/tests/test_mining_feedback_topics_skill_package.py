@@ -262,6 +262,22 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
     assert positions == sorted(positions)
 
 
+def test_review_contract_requires_complete_context_grounded_decisions():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8")
+    policy = (
+        SKILL_ROOT / "references" / "review-policy.md"
+    ).read_text(encoding="utf-8")
+
+    assert "one explicit decision for every item" in contract
+    assert "context_items" in skill
+    assert "context_items" in policy
+    assert "non-empty string list" in policy
+    assert "exact substring" in policy
+
+
 def test_skill_requires_repair_then_resume_of_the_original_recoverable_run():
     skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
     contract = (
