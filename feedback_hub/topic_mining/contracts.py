@@ -35,7 +35,7 @@ _OUTPUT_FIELDS = frozenset({"preferred_format", "required_fields"})
 _LABEL_FIELDS = frozenset({"id", "meaning"})
 _LEXICAL_HINT_FIELDS = frozenset({"objects", "contexts"})
 _RFC3339_DATETIME = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$"
 )
 _RFC3339_LOCAL_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?$")
 

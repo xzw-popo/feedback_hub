@@ -12,7 +12,7 @@ from typing import Any
 
 
 _RFC3339_DATETIME = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$"
 )
 _RFC3339_LOCAL_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?$")
 
@@ -76,6 +76,21 @@ def _json_const_matches(value: Any, expected: Any) -> bool:
     return _json_value_matches(value, expected)
 
 
+def _parse_rfc3339(value: str, path: str) -> datetime:
+    if not _RFC3339_DATETIME.fullmatch(value):
+        if _RFC3339_LOCAL_DATETIME.fullmatch(value):
+            raise _error(path, "timezone is required")
+        raise _error(path, "must be an RFC3339 datetime")
+    normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise _error(path, "must be an RFC3339 datetime") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _error(path, "timezone is required")
+    return parsed
+
+
 def _validate(value: Any, schema: dict[str, Any], path: str) -> None:
     if "const" in schema and not _json_const_matches(value, schema["const"]):
         raise _error(path, f"must equal {schema['const']!r}")
@@ -92,17 +107,7 @@ def _validate(value: Any, schema: dict[str, Any], path: str) -> None:
         if len(value.strip()) < schema.get("minLength", 0):
             raise _error(path, "must be a non-empty string")
         if schema.get("format") == "date-time":
-            if not _RFC3339_DATETIME.fullmatch(value):
-                if _RFC3339_LOCAL_DATETIME.fullmatch(value):
-                    raise _error(path, "timezone is required")
-                raise _error(path, "must be an RFC3339 datetime")
-            normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
-            try:
-                parsed = datetime.fromisoformat(normalized)
-            except ValueError as error:
-                raise _error(path, "must be an RFC3339 datetime") from error
-            if parsed.tzinfo is None or parsed.utcoffset() is None:
-                raise _error(path, "timezone is required")
+            _parse_rfc3339(value, path)
 
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -144,6 +149,22 @@ def _matches(value: Any, schema: dict[str, Any]) -> bool:
     return True
 
 
+def _validate_scope_time_order(value: Any) -> None:
+    if not isinstance(value, dict):
+        return
+    scope = value.get("scope")
+    if not isinstance(scope, dict):
+        return
+    start_time = scope.get("start_time")
+    end_time = scope.get("end_time")
+    if not isinstance(start_time, str) or not isinstance(end_time, str):
+        return
+    start = _parse_rfc3339(start_time, "$.scope.start_time")
+    end = _parse_rfc3339(end_time, "$.scope.end_time")
+    if start >= end:
+        raise _error("$.scope.end_time", "must be after $.scope.start_time")
+
+
 def main(argv: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if argv is None else argv
     if len(arguments) != 1:
@@ -153,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         value = _load_input(path)
         _validate(value, _load_schema(), "$")
+        _validate_scope_time_order(value)
     except ValueError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(2)

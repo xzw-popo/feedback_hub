@@ -199,6 +199,62 @@ def test_standalone_and_backend_reject_non_rfc3339_timestamps(tmp_path, timestam
         validate_topic_spec(raw)
 
 
+@pytest.mark.parametrize("timestamp", ["2026-01-16T00:00:00+00:60", "2026-01-16T00:00:00+24:00"])
+def test_standalone_and_backend_reject_invalid_rfc3339_offset_bounds(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
+@pytest.mark.parametrize("timestamp", ["2026-01-16T00:00:00+23:59", "2026-01-16T00:00:00-00:00"])
+def test_standalone_and_backend_accept_valid_rfc3339_offset_bounds(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    "start_time,end_time",
+    [
+        ("2026-01-16T00:00:00Z", "2026-01-15T23:59:59Z"),
+        ("2026-01-16T00:00:00Z", "2026-01-16T00:00:00Z"),
+        ("2026-01-16T00:00:00Z", "2026-01-16T01:00:00+01:00"),
+    ],
+)
+def test_standalone_and_backend_reject_non_increasing_scope_instants(tmp_path, start_time, end_time):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = start_time
+    raw["scope"]["end_time"] = end_time
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+    assert result.returncode == 2
+    assert "$.scope.end_time" in result.stderr
+    with pytest.raises(ValueError, match="scope.end_time"):
+        validate_topic_spec(raw)
+
+
+def test_standalone_and_backend_compare_different_scope_offsets_as_instants(tmp_path):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = "2026-01-16T00:30:00+01:00"
+    raw["scope"]["end_time"] = "2026-01-16T00:00:00Z"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time < validate_topic_spec(raw).scope.end_time
+
+
 def test_validator_enum_comparison_does_not_treat_boolean_as_number():
     validator = _load_validator_module()
 
