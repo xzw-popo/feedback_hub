@@ -583,18 +583,35 @@ def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest:
     store.update_manifest(run_id, manifest, stage=stage)
 
 
-def _checkpoint_attempt(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest: dict[str, Any], stage: str, files: Sequence[Path]) -> None:
+def _checkpoint_attempt(
+    run_id: str,
+    store: TopicRunStore,
+    artifact_dir: Path,
+    manifest: dict[str, Any],
+    stage: str,
+    files: Sequence[Path],
+    *,
+    output_names: Sequence[str] | None = None,
+) -> None:
     artifacts = manifest.setdefault("artifacts", {})
     for path in files:
         if path.is_file():
             artifacts[path.name] = _sha256(path)
     inputs, _ = _stage_contract_names(stage, artifact_dir)
-    names = ("classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl", "classification_batches.jsonl.run_state.json", "classification_batches.jsonl.failures.jsonl", "classification_audit.jsonl", "classified.jsonl")
-    outputs = {name: _sha256(artifact_dir / name) for name in names if (artifact_dir / name).is_file()}
-    partial_dir = artifact_dir / "classification_partial_audit"
-    if partial_dir.is_dir():
-        for path in sorted(partial_dir.glob("*.json")):
-            outputs[str(path.relative_to(artifact_dir))] = _sha256(path)
+    names = output_names if output_names is not None else (
+        "classification_batches.jsonl",
+        "classification_batches.jsonl.checkpoint.jsonl",
+        "classification_batches.jsonl.run_state.json",
+        "classification_batches.jsonl.failures.jsonl",
+        "classification_audit.jsonl",
+        "classified.jsonl",
+    )
+    outputs = {
+        name: _sha256(artifact_dir / name)
+        for name in names
+        if _classification_output_name_safe(name)
+        and (artifact_dir / name).is_file()
+    }
     manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": outputs, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
     manifest["stage"] = stage
     _write_manifest_mirror(run_id, store, artifact_dir, manifest)
@@ -805,7 +822,16 @@ def _publish_classification_progress(
     # Authenticate each published scheduler checkpoint in the database-backed
     # manifest. A replacement worker may reuse only this fenced generation.
     _checkpoint_attempt(
-        run_id, store, artifact_dir, manifest, "classify", (),
+        run_id,
+        store,
+        artifact_dir,
+        manifest,
+        "classify",
+        (),
+        output_names=tuple(
+            str(target.relative_to(artifact_dir))
+            for _source, target in pairs
+        ),
     )
 
 

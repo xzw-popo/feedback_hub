@@ -82,6 +82,7 @@ def test_stale_worker_cannot_replace_manifest_mirror_after_reclaim(tmp_path):
 
 def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
     from feedback_hub.topic_mining.service import (
+        _classification_output_safe,
         _classification_resume_safe,
         _publish_classification_progress,
     )
@@ -112,6 +113,16 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
     assert checkpoint.is_file(), "publishing must not move a scheduler's open file"
     canonical = artifact_dir / checkpoint.name
     assert canonical.read_text(encoding="utf-8") == checkpoint.read_text(encoding="utf-8")
+
+    forged_audit = artifact_dir / "classification_audit.jsonl"
+    forged_audit.write_text('{"forged":true}\n', encoding="utf-8")
+    _publish_classification_progress(
+        run["run_id"], claimed, artifact_dir, workspace, manifest,
+    )
+    persisted = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert _classification_output_safe(
+        persisted, artifact_dir, forged_audit.name,
+    ) is False
 
     second = store.claim_worker(
         run["run_id"], lease_seconds=60,

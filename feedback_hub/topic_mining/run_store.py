@@ -375,49 +375,80 @@ class TopicRunStore:
         """Snapshot staged files while serializing publication against reclaim."""
         checked_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT artifact_dir FROM topic_run
-                   WHERE run_id = ? AND status = 'running'
-                     AND worker_claim_token = ?
-                     AND worker_lease_expires_at_ms > ?""",
-                (run_id, claim_token, checked_at_ms),
+                """SELECT artifact_dir, status, worker_claim_token,
+                          worker_lease_expires_at_ms
+                   FROM topic_run WHERE run_id = ?""",
+                (run_id,),
             ).fetchone()
             if row is None:
-                self._raise_missing_or_lost(run_id)
+                raise KeyError(run_id)
+            if (
+                row["status"] != "running"
+                or row["worker_claim_token"] != claim_token
+                or row["worker_lease_expires_at_ms"] is None
+                or int(row["worker_lease_expires_at_ms"]) <= checked_at_ms
+            ):
+                raise WorkerClaimLostError("worker_claim_lost")
             artifact_dir = Path(str(row["artifact_dir"])).resolve()
-            token_hash = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()[:16]
-            claim_root = (artifact_dir / ".worker_claims" / token_hash).resolve()
-            normalized: list[tuple[Path, Path]] = []
-            for source, target in files:
-                source_path = Path(source).resolve()
-                target_path = Path(target).resolve()
-                if not source_path.is_file():
-                    raise FileNotFoundError(source_path)
-                try:
-                    source_path.relative_to(claim_root)
-                except ValueError as exc:
-                    raise ValueError("worker artifact source must belong to its claim") from exc
-                try:
-                    relative_target = target_path.relative_to(artifact_dir)
-                except ValueError as exc:
-                    raise ValueError("worker artifact target must stay in its run") from exc
-                if not relative_target.parts or relative_target.parts[0] == ".worker_claims":
-                    raise ValueError("worker artifact target is reserved")
-                normalized.append((source_path, target_path))
+        token_hash = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()[:16]
+        claim_root = (artifact_dir / ".worker_claims" / token_hash).resolve()
+        normalized: list[tuple[Path, Path]] = []
+        for source, target in files:
+            source_path = Path(source).resolve()
+            target_path = Path(target).resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(source_path)
+            try:
+                source_path.relative_to(claim_root)
+            except ValueError as exc:
+                raise ValueError("worker artifact source must belong to its claim") from exc
+            try:
+                relative_target = target_path.relative_to(artifact_dir)
+            except ValueError as exc:
+                raise ValueError("worker artifact target must stay in its run") from exc
+            if not relative_target.parts or relative_target.parts[0] == ".worker_claims":
+                raise ValueError("worker artifact target is reserved")
+            normalized.append((source_path, target_path))
+
+        # Slow copies happen before the publication transaction. Re-read the
+        # clock and claim immediately before the quick rename phase.
+        prepared: list[tuple[Path, Path]] = []
+        try:
             for source_path, target_path in normalized:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target_path.with_name(
-                    f".{target_path.name}.{token_hash}.tmp"
+                    f".{target_path.name}.{token_hash}.{secrets.token_hex(8)}.tmp"
                 )
-                try:
-                    with source_path.open("rb") as source_file, temporary.open("wb") as target_file:
-                        shutil.copyfileobj(source_file, target_file)
-                        target_file.flush()
-                        os.fsync(target_file.fileno())
+                prepared.append((temporary, target_path))
+                with source_path.open("rb") as source_file, temporary.open("wb") as target_file:
+                    shutil.copyfileobj(source_file, target_file)
+                    target_file.flush()
+                    os.fsync(target_file.fileno())
+
+            promotion_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """SELECT status, worker_claim_token,
+                              worker_lease_expires_at_ms
+                       FROM topic_run WHERE run_id = ?""",
+                    (run_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(run_id)
+                if (
+                    current["status"] != "running"
+                    or current["worker_claim_token"] != claim_token
+                    or current["worker_lease_expires_at_ms"] is None
+                    or int(current["worker_lease_expires_at_ms"]) <= promotion_at_ms
+                ):
+                    raise WorkerClaimLostError("worker_claim_lost")
+                for temporary, target_path in prepared:
                     os.replace(temporary, target_path)
-                finally:
-                    temporary.unlink(missing_ok=True)
+        finally:
+            for temporary, _target_path in prepared:
+                temporary.unlink(missing_ok=True)
 
     def _raise_missing_or_lost(self, run_id: str) -> None:
         if self.get(run_id) is None:

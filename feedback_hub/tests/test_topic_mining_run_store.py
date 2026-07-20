@@ -290,6 +290,34 @@ def test_active_worker_publishes_snapshot_without_moving_open_staging_file(
     assert target.read_text(encoding="utf-8") == '{"generation": 1}\n'
 
 
+def test_worker_cannot_promote_snapshot_when_lease_expires_during_copy(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=1, now_ms=1_000,
+    )
+    claimed = store.for_worker_claim(claim.claim_token)
+    artifact_dir = Path(run["artifact_dir"])
+    workspace = claimed.stage_artifact_dir(artifact_dir, "classify")
+    source = workspace / "classified.jsonl"
+    source.write_text("staged\n", encoding="utf-8")
+    target = artifact_dir / source.name
+    clock = iter((1.0, 3.0))
+    monkeypatch.setattr(
+        "feedback_hub.topic_mining.run_store.time.time",
+        lambda: next(clock),
+    )
+
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        store.publish_worker_files(
+            run["run_id"], claim.claim_token, [(source, target)],
+        )
+
+    assert not target.exists()
+
+
 def test_unfenced_stale_worker_cannot_publish_over_new_claim(
     tmp_path, valid_topic_spec,
 ):
