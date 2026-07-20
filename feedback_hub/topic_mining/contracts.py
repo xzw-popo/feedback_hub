@@ -123,7 +123,11 @@ def _string_list(value: Any, field: str, *, required: bool = False) -> tuple[str
 
 
 def _aware_datetime(value: Any, field: str) -> datetime:
-    text = _required_string(value, field)
+    # Unlike semantic text fields, RFC3339 timestamps are syntax tokens.
+    # Preserve raw input so leading/trailing whitespace is rejected, not trimmed.
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    text = value
     if not _RFC3339_DATETIME.fullmatch(text):
         if _RFC3339_LOCAL_DATETIME.fullmatch(text):
             raise ValueError(f"{field} must include a timezone")

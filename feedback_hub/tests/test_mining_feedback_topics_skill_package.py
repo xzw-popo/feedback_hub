@@ -199,6 +199,21 @@ def test_standalone_and_backend_reject_non_rfc3339_timestamps(tmp_path, timestam
         validate_topic_spec(raw)
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    [" 2026-01-16T00:00:00Z", "2026-01-16T00:00:00Z ", "   "],
+)
+def test_standalone_and_backend_reject_timestamp_whitespace(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
 @pytest.mark.parametrize("timestamp", ["2026-01-16T00:00:00+00:60", "2026-01-16T00:00:00+24:00"])
 def test_standalone_and_backend_reject_invalid_rfc3339_offset_bounds(tmp_path, timestamp):
     raw = valid_spec()
