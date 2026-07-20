@@ -129,6 +129,81 @@ def test_skill_frontmatter_has_only_name_and_description():
     assert metadata["description"].startswith("Use when")
 
 
+def test_skill_guidance_has_auditable_ordered_workflow_and_direct_resources():
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    body = text.split("---", 2)[2]
+    assert len(body.split()) < 500
+    for resource in (
+        "[topic spec](references/topic-spec.md)",
+        "[backend contract](references/backend-contract.md)",
+        "[review policy](references/review-policy.md)",
+        "[validate_topic_spec.py](scripts/validate_topic_spec.py)",
+        "[topic_backend_client.py](scripts/topic_backend_client.py)",
+    ):
+        assert resource in body
+        assert f"`{resource}" not in body
+    gates = ("capabilities", "validate", "create", "inspect", "review", "verify", "export", "deliver")
+    positions = [body.lower().index(gate) for gate in gates]
+    assert positions == sorted(positions)
+    for condition in (
+        "data coverage",
+        "vector watermark",
+        "exact classification coverage",
+        "source evidence",
+        "valid links",
+    ):
+        assert condition in body.lower()
+
+
+def test_skill_guidance_does_not_embed_topic_rules_or_backend_tuning():
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    body = text.split("---", 2)[2].lower()
+    forbidden = (
+        "左下角",
+        "右上角",
+        "163 条",
+        "147 条",
+        "310 条",
+        "select ",
+        "top-k",
+        "similarity threshold",
+        "api_key",
+        "bearer ",
+        "https://",
+    )
+    for value in forbidden:
+        assert value not in body
+
+
+def test_skill_guidance_keeps_unverified_or_plan_only_work_inside_the_backend_contract():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "do not query source databases or vector tools directly" in body
+    assert "do not claim artifacts, results, or validation" in body
+    assert "do not expand the user's named object into a different object or product" in body
+
+
+def test_skill_guidance_preserves_user_named_target_objects():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "keep each user-named target object and behavior as required inclusion conditions" in body
+    assert "put unrequested adjacent objects or behaviors only in exclusion criteria" in body
+
+
+def test_skill_guidance_copies_hard_scope_and_client_commands_without_invention():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "populate each hard-scope field only with values explicit in the current request" in body
+    assert "leave every other hard-scope field empty" in body
+    assert "copy client commands from the backend contract verbatim" in body
+
+
+def test_skill_guidance_shapes_blocked_pre_run_responses():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "a blocked pre-run response contains four slots" in body
+    for slot in ("proposed inclusion", "proposed exclusion", "one material scope question", "service or configuration blocker"):
+        assert slot in body
+    assert "if start or end time is missing, ask the single time-range question" in body
+    assert "never default to all history" in body
+
+
 def test_client_download_uses_atomic_replace(tmp_path, monkeypatch):
     module = _load_client_module()
     target = tmp_path / "result.xlsx"
