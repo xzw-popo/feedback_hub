@@ -140,6 +140,50 @@ cd /opt/feedback_hub
 APP_PORT=8000 scripts/devcloud_runtime.sh status
 ```
 
+### 5.1 部署一次性反馈专题挖掘后端
+
+专题挖掘后端提供 `/api/topic-mining/*`，用于创建只读、可审核的专题 run。它不是日常拉取或通用打标流程的一部分：源数据库只读，快照和 run 状态只写入 `feedback_hub/data/topic_mining/`。
+
+部署代码后，在远端虚拟环境安装专题依赖：
+
+```bash
+cd /opt/feedback_hub
+./.venv/bin/pip install -r requirements-topic-mining.txt
+```
+
+在远端 `.env` 配置以下六个 `TOPIC_*` 变量；token 只能写在 `.env`，不要提交或复制到 Skill 源码：
+
+```dotenv
+TOPIC_MINING_DATA_DIR=/opt/feedback_hub/feedback_hub/data/topic_mining
+TOPIC_VECTOR_API_URL=https://your-internal-vector-service
+TOPIC_VECTOR_API_TOKEN=
+TOPIC_VECTOR_INDEX=feedback-items-v1
+TOPIC_VECTOR_MAX_LAG_SECONDS=21600
+TOPIC_MINING_API_TOKEN=
+```
+
+`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。`TOPIC_MINING_API_TOKEN` 留空时，能力接口不需要鉴权：
+
+```bash
+curl -fsS 'http://127.0.0.1:8000/api/topic-mining/capabilities'
+```
+
+若设置了 `TOPIC_MINING_API_TOKEN`，所有专题接口（包括能力接口）都必须携带同一个 token：
+
+```bash
+curl -fsS 'http://127.0.0.1:8000/api/topic-mining/capabilities' \
+  -H "Authorization: Bearer ${TOPIC_MINING_API_TOKEN}"
+```
+
+完成依赖和配置后重启并检查状态：
+
+```bash
+APP_PORT=8000 scripts/devcloud_runtime.sh restart
+APP_PORT=8000 scripts/devcloud_runtime.sh status
+```
+
+专题后端部署不上传或安装 `codex-skills/mining-feedback-topics/`：该目录是单独分发给 Codex 的客户端 Skill，不属于服务运行时。打包部署时应将其排除出服务包。部署也绝不替换生产 `feedback_hub/data/feedback.db`；仅保留既有数据库，并让专题 run 在独立 `topic_mining/` 数据目录内创建快照和产物。
+
 ## 6. 数据更新方案
 
 数据更新有两种方式：容器自动更新，或本机更新后同步数据库到容器。

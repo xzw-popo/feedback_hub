@@ -56,12 +56,22 @@ def run_topic_job(
     vector_client: Any | None = None,
     classifier_routes: Sequence[Any] | None = None,
     classifier_call_fn: Any | None = None,
+    model_routes: Sequence[Any] | None = None,
+    model_call_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Run (or resume) a topic job. External clients are injectable for E2E tests.
 
     A status update is persisted after every valid artifact.  The callback
     parameters deliberately make no lower-level retrieval/model tuning public.
+    ``model_*`` is the public integration-contract spelling; the older
+    ``classifier_*`` names remain supported for existing internal callers.
     """
+    if classifier_routes is not None and model_routes is not None:
+        raise ValueError("provide only one of classifier_routes or model_routes")
+    if classifier_call_fn is not None and model_call_fn is not None:
+        raise ValueError("provide only one of classifier_call_fn or model_call_fn")
+    selected_routes = model_routes if model_routes is not None else classifier_routes
+    selected_call_fn = model_call_fn if model_call_fn is not None else classifier_call_fn
     config = config or TopicMiningConfig()
     store = store or default_store(config)
     run = _require_run(run_id, store)
@@ -71,7 +81,7 @@ def run_topic_job(
     try:
         _run_pipeline(
             run_id=run_id, store=store, config=config, vector_client=vector_client,
-            classifier_routes=classifier_routes, classifier_call_fn=classifier_call_fn,
+            classifier_routes=selected_routes, classifier_call_fn=selected_call_fn,
         )
     except Exception as exc:  # stable status is more useful than a background traceback
         _record_failure(run_id, store, exc, config)
@@ -214,6 +224,17 @@ def submit_review_overrides(
     apply_review_overrides(classifications, overrides, allowed_labels={entry["id"] for entry in spec.classification_labels})
     _write_jsonl(artifact_dir / "review_overrides.jsonl", [dict(row) for row in overrides])
     _invalidate_export_artifacts(manifest, artifact_dir)
+    # Overrides are a declared output of review_queue. Re-checkpoint that
+    # stage before review_ready so the full verification chain continues to
+    # authenticate the latest approved reviewer decisions.
+    _checkpoint(
+        run_id,
+        store,
+        artifact_dir,
+        manifest,
+        "review_queue",
+        [artifact_dir / "review_queue.jsonl", artifact_dir / "review_overrides.jsonl"],
+    )
     _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [artifact_dir / "review_overrides.jsonl"])
     return [dict(row) for row in overrides]
 
