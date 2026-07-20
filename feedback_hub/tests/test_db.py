@@ -55,6 +55,26 @@ def test_init_schema_is_idempotent(conn):
     db.init_schema(conn)
 
 
+def test_source_coverage_generation_is_unique_and_monotonic(conn):
+    first = db.record_feedback_source_coverage(
+        conn, channel="pc", start_ts_ms=1, end_ts_ms=2,
+        completed_at_ms=100,
+    )
+    second = db.record_feedback_source_coverage(
+        conn, channel="pc", start_ts_ms=2, end_ts_ms=3,
+        completed_at_ms=100,
+    )
+
+    assert (first, second) == (100, 101)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """INSERT INTO feedback_source_coverage (
+                channel, start_ts_ms, end_ts_ms, completed_at_ms
+            ) VALUES (?, ?, ?, ?)""",
+            ("pc", 3, 4, second),
+        )
+
+
 def _sample_feedback_row() -> dict:
     return {
         "feedback_id": "fb_001",

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -344,6 +345,59 @@ def upsert_feedback(conn: Any, row: dict[str, Any]) -> bool:
         sql = f"INSERT OR IGNORE INTO feedback ({cols}) VALUES ({_ph(len(FEEDBACK_COLUMNS))})"
     cur = conn.execute(sql, vals)
     return cur.rowcount > 0
+
+
+def record_feedback_source_coverage(
+    conn: Any,
+    *,
+    channel: str,
+    start_ts_ms: int,
+    end_ts_ms: int,
+    completed_at_ms: int | None = None,
+) -> int:
+    """Record one successful pull window and return its monotonic generation."""
+    if not isinstance(channel, str) or not channel.strip():
+        raise ValueError("coverage channel is required")
+    if (
+        isinstance(start_ts_ms, bool)
+        or isinstance(end_ts_ms, bool)
+        or not isinstance(start_ts_ms, int)
+        or not isinstance(end_ts_ms, int)
+        or end_ts_ms <= start_ts_ms
+    ):
+        raise ValueError("coverage window must be a non-empty integer interval")
+    proposed = (
+        int(time.time() * 1000)
+        if completed_at_ms is None
+        else int(completed_at_ms)
+    )
+    ph = "%s" if _db_mode() == "mysql" else "?"
+    for _attempt in range(8):
+        row = conn.execute(
+            "SELECT MAX(completed_at_ms) AS value FROM feedback_source_coverage"
+        ).fetchone()
+        previous = _row_get(row, "value") if row is not None else None
+        generation = max(proposed, int(previous or 0) + 1)
+        try:
+            conn.execute(
+                f"""INSERT INTO feedback_source_coverage (
+                    channel, start_ts_ms, end_ts_ms, completed_at_ms
+                ) VALUES ({ph}, {ph}, {ph}, {ph})""",
+                (channel.strip(), start_ts_ms, end_ts_ms, generation),
+            )
+        except Exception as exc:
+            mysql_code = exc.args[0] if getattr(exc, "args", ()) else None
+            is_generation_collision = (
+                isinstance(exc, sqlite3.IntegrityError)
+                and "unique" in str(exc).lower()
+            ) or mysql_code == 1062
+            if not is_generation_collision:
+                raise
+            conn.rollback()
+            continue
+        conn.commit()
+        return generation
+    raise RuntimeError("could not allocate a unique source generation")
 
 
 def update_conversation_assignment(

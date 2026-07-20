@@ -17,6 +17,8 @@ class VectorResponseError(ValueError):
 
 @dataclass(frozen=True)
 class VectorCapabilities:
+    """The watermark is the ingestion coverage generation, not event MAX(ts)."""
+
     index: str
     schema_version: int
     supported_units: tuple[str, ...]
@@ -33,6 +35,8 @@ class VectorHit:
 
 @dataclass(frozen=True)
 class VectorSearchResult:
+    """Search results authenticated against one ingestion coverage generation."""
+
     index: str
     watermark_ts_ms: int
     hits: tuple[VectorHit, ...]

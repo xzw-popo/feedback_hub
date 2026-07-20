@@ -30,6 +30,17 @@ def _write_source(path, *, include_end=True):
         if include_end:
             rows.append(("boundary-b", "c2", 1, end, "Win", "1", "pc", "PC", "u2", 1, "https://example.test/2", "范围结束"))
         connection.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        coverage_end = end if include_end else start + 1000
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start, coverage_end, coverage_end),
+        )
     return start, end
 
 
@@ -80,12 +91,21 @@ def test_verify_rejects_a_run_whose_persisted_identity_was_tampered(tmp_path):
     with sqlite3.connect(snapshot) as connection:
         connection.execute("CREATE TABLE feedback (ts_ms INTEGER NOT NULL)")
         connection.execute("INSERT INTO feedback VALUES (123)")
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute("INSERT INTO feedback_source_coverage VALUES (123)")
     digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     store.update_manifest(
         run["run_id"],
         {
             "source_watermark_ms": 123,
-            "source_snapshot": {"max_ts_ms": 123, "sha256": digest},
+            "source_snapshot": {
+                "max_ts_ms": 123, "coverage_watermark_ms": 123,
+                "sha256": digest,
+            },
             "source_sha256": digest,
             "artifacts": {snapshot.name: digest},
         },
@@ -120,13 +140,21 @@ def test_effective_cutoff_rejects_the_actual_snapshot_maximum_mismatch(tmp_path)
     with sqlite3.connect(snapshot) as connection:
         connection.execute("CREATE TABLE feedback (ts_ms INTEGER NOT NULL)")
         connection.execute("INSERT INTO feedback VALUES (122)")
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute("INSERT INTO feedback_source_coverage VALUES (123)")
 
     with pytest.raises(RunVerificationError, match="source_watermark_mismatch"):
         _effective_data_cutoff(
             run,
             {
                 "source_watermark_ms": 123,
-                "source_snapshot": {"max_ts_ms": 123},
+                "source_snapshot": {
+                    "max_ts_ms": 123, "coverage_watermark_ms": 123,
+                },
             },
         )
 
@@ -464,6 +492,7 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
     source = tmp_path / "source.db"
     start = int(datetime(2023, 11, 14, tzinfo=timezone.utc).timestamp() * 1000)
     end = int(datetime(2023, 11, 16, tzinfo=timezone.utc).timestamp() * 1000)
+    source_generation = end + 10_000
     with sqlite3.connect(source) as connection:
         connection.execute("CREATE TABLE feedback (feedback_id TEXT PRIMARY KEY, conversation_id TEXT, msg_seq INTEGER, ts_ms INTEGER, platform TEXT, appversion TEXT, channel TEXT, device_name TEXT, user_vid TEXT, service_vid INTEGER, external_chat_url TEXT, text TEXT)")
         connection.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
@@ -471,16 +500,27 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
             ("f1", "c1", 1, start + 1000, "Win", "1", "pc", "PC", "u1", 1, "https://example.test/1", "游戏全屏工具栏一直显示"),
             ("boundary-b", "c2", 1, end, "Win", "1", "pc", "PC", "u2", 1, "https://example.test/2", "范围结束"),
         ])
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start, end, source_generation),
+        )
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     config = TopicMiningConfig(source_db_path=source, data_dir=tmp_path / "data", vector_api_url="https://vector.test", vector_max_lag_seconds=1_000_000, classifier_concurrency=1)
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
-    run = store.create_or_get(_spec(), end)
+    run = store.create_or_get(_spec(), source_generation)
 
     class FakeVector:
         def capabilities(self):
-            return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
+            return VectorCapabilities("feedback-items-v1", 1, ("feedback",), source_generation)
         def search(self, *_args):
-            return VectorSearchResult("feedback-items-v1", end, (VectorHit("f1", "objective:0", .9, 1),))
+            return VectorSearchResult("feedback-items-v1", source_generation, (VectorHit("f1", "objective:0", .9, 1),))
 
     route = ModelRoute("test", "openai_compatible", "https://model.test", "not-a-secret", "test")
     def call_fn(_prompt, **_kwargs):

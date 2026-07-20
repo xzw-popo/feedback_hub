@@ -82,6 +82,16 @@ def _create_source(path, start: datetime, end: datetime) -> None:
             ("coverage-boundary", "c-boundary", 1, end_ms, "Win", "1", "pc", "PC", "u6", 6,
              "https://example.test/boundary", "范围结束边界"),
         ])
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start_ms, end_ms, end_ms),
+        )
 
 
 def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_matches(tmp_path):

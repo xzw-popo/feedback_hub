@@ -24,7 +24,7 @@ from .contracts import TopicSpec, topic_spec_hash, validate_topic_spec
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
 from .run_store import RunPublicationConflictError, TopicRunStore
-from .source import DataCoverageError, build_item_contexts, create_source_snapshot, fetch_scoped_items
+from .source import DataCoverageError, SourceReadinessError, build_item_contexts, create_source_snapshot, fetch_scoped_items
 from .vector_client import HttpVectorSearchClient
 
 
@@ -125,9 +125,8 @@ def _run_pipeline(
         snapshot = create_source_snapshot(
             config.source_db_path,
             staged_snapshot_path,
-            max_ts_ms=persisted_watermark_ms,
         )
-        if snapshot.max_ts_ms != persisted_watermark_ms:
+        if snapshot.coverage_watermark_ms != persisted_watermark_ms:
             raise RunVerificationError("source_watermark_mismatch")
         _ensure_worker_active(run_id, store)
         snapshot_hashes = _promote_stage_files(
@@ -138,7 +137,7 @@ def _run_pipeline(
         snapshot_data["path"] = str(snapshot_path)
         manifest.update({
             "source_snapshot": snapshot_data,
-            "source_watermark_ms": snapshot.max_ts_ms,
+            "source_watermark_ms": snapshot.coverage_watermark_ms,
             "source_sha256": snapshot.sha256,
         })
         _checkpoint(
@@ -146,7 +145,7 @@ def _run_pipeline(
             output_hashes=snapshot_hashes,
         )
     snapshot_meta = manifest.get("source_snapshot") or {}
-    source_watermark_ms = int(snapshot_meta.get("max_ts_ms") or run["source_watermark_ms"])
+    source_watermark_ms = int(run["source_watermark_ms"])
 
     scoped_path = artifact_dir / "scoped_items.jsonl"
     contexts_path = artifact_dir / "item_contexts.json"
@@ -553,10 +552,25 @@ def _effective_data_cutoff(
     if require_snapshot and snapshot_meta is None:
         raise RunVerificationError("source_snapshot_required")
     if snapshot_meta is not None:
-        if not isinstance(snapshot_meta, Mapping) or "max_ts_ms" not in snapshot_meta:
+        if (
+            not isinstance(snapshot_meta, Mapping)
+            or "max_ts_ms" not in snapshot_meta
+            or "coverage_watermark_ms" not in snapshot_meta
+        ):
             raise RunVerificationError("source_watermark_mismatch")
-        snapshot_cutoff = _required_data_cutoff(snapshot_meta.get("max_ts_ms"))
-        if snapshot_cutoff != cutoff:
+        snapshot_watermark = _required_data_cutoff(
+            snapshot_meta.get("coverage_watermark_ms"),
+        )
+        if snapshot_watermark != cutoff:
+            raise RunVerificationError("source_watermark_mismatch")
+        snapshot_max_ts_ms = snapshot_meta.get("max_ts_ms")
+        if (
+            snapshot_max_ts_ms is not None
+            and (
+                isinstance(snapshot_max_ts_ms, bool)
+                or not isinstance(snapshot_max_ts_ms, int)
+            )
+        ):
             raise RunVerificationError("source_watermark_mismatch")
 
     snapshot_path = Path(str(run.get("artifact_dir", ""))) / "source_snapshot.sqlite"
@@ -586,15 +600,20 @@ def _effective_data_cutoff(
                 f"file:{snapshot_path.resolve()}?mode=ro", uri=True,
             ) as connection:
                 row = connection.execute(
-                    "SELECT MAX(ts_ms) FROM feedback",
+                    """SELECT
+                        (SELECT MAX(ts_ms) FROM feedback),
+                        (SELECT MAX(completed_at_ms)
+                         FROM feedback_source_coverage)""",
                 ).fetchone()
         except sqlite3.Error as exc:
             raise RunVerificationError("invalid_source_snapshot") from exc
-        actual_cutoff = row[0] if row is not None else None
+        actual_max_ts_ms = row[0] if row is not None else None
+        actual_watermark = row[1] if row is not None else None
         if (
-            isinstance(actual_cutoff, bool)
-            or not isinstance(actual_cutoff, int)
-            or actual_cutoff != cutoff
+            actual_max_ts_ms != snapshot_meta.get("max_ts_ms")
+            or isinstance(actual_watermark, bool)
+            or not isinstance(actual_watermark, int)
+            or actual_watermark != cutoff
         ):
             raise RunVerificationError("source_watermark_mismatch")
     return cutoff
@@ -1337,6 +1356,8 @@ def _record_failure(run_id: str, store: TopicRunStore, exc: Exception, config: T
         return
     if isinstance(exc, DataCoverageError):
         code = "data_coverage_error"
+    elif isinstance(exc, SourceReadinessError):
+        code = "source_readiness_error"
     elif name == "VectorIndexStaleError":
         code = "vector_index_stale"
     elif "unresolved_classifier_items" in str(exc):
@@ -1345,7 +1366,7 @@ def _record_failure(run_id: str, store: TopicRunStore, exc: Exception, config: T
         code = "topic_run_error"
     run = _require_run(run_id, store)
     manifest = _load_manifest(run, Path(run["artifact_dir"]))
-    if code == "data_coverage_error":
+    if code in {"data_coverage_error", "source_readiness_error"}:
         manifest["unresolved_coverage_items"] = 1
     if code == "vector_index_stale":
         manifest["unresolved_vector_items"] = 1

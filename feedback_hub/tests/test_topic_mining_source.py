@@ -72,6 +72,16 @@ def source_db(tmp_path):
         ("f8", "c7", 1, _ms(4), "Win", "3.1", "wetype", "pc", "u6", 99, None, "结束边界"),
     ]
     conn.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.execute(
+        """CREATE TABLE feedback_source_coverage (
+            channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+            end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+        ("wetype", _ms(0), _ms(4), _ms(5)),
+    )
     conn.commit()
     conn.close()
     return path
@@ -87,6 +97,7 @@ def test_snapshot_and_scope_do_not_modify_source(tmp_path, source_db, valid_topi
     assert source_db.read_bytes() == before
     assert hashlib.sha256(source_db.read_bytes()).hexdigest() == before_hash
     assert snapshot.row_count == 9
+    assert snapshot.coverage_watermark_ms == _ms(5)
     assert {item["platform"] for item in items} == {"Win"}
     assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
 
@@ -112,7 +123,8 @@ def test_feedback_scope_uses_half_open_time_bounds_and_stable_item_keys(source_d
 
     assert {frozenset(item) for item in items} == {frozenset({
         "item_id", "feedback_id", "conversation_id", "ts_ms", "platform", "appversion",
-        "channel", "device_name", "user_vid", "text", "source_url",
+        "channel", "device_name", "user_vid", "service_vid", "text",
+        "source_url",
     })}
     assert [item["item_id"] for item in items] == ["f1", "f2", "f3"]
     assert len({item["feedback_id"] for item in items}) == len(items)
@@ -130,12 +142,106 @@ def test_conversation_items_aggregate_in_msg_sequence_order_and_fallback_source_
     assert c1["source_url"] == db.build_external_chat_url("wetype", 77, "u1")
 
 
-def test_build_feedback_context_uses_same_user_within_30_minutes(source_db, valid_topic_spec):
+def test_build_feedback_context_prefers_ready_conversation_identity(
+    source_db, valid_topic_spec,
+):
     scoped_feedback_items = fetch_scoped_items(source_db, valid_topic_spec)
 
     contexts = build_item_contexts(scoped_feedback_items, unit="feedback", window_ms=1_800_000)
 
-    assert [row["feedback_id"] for row in contexts["f2"]] == ["f1", "f2", "f3"]
+    assert [row["feedback_id"] for row in contexts["f2"]] == ["f1", "f2"]
+
+
+def test_blank_user_ids_never_share_context_between_unrelated_feedback():
+    items = [
+        {
+            "item_id": "anonymous-a", "feedback_id": "anonymous-a",
+            "conversation_id": "pending", "user_vid": "", "ts_ms": 1,
+            "text": "工具栏遮挡", "channel": "wetype",
+        },
+        {
+            "item_id": "anonymous-b", "feedback_id": "anonymous-b",
+            "conversation_id": "pending", "user_vid": "", "ts_ms": 2,
+            "text": "无关隐私文本", "channel": "wetype",
+        },
+    ]
+
+    contexts = build_item_contexts(items, unit="feedback", window_ms=1_800_000)
+
+    assert [row["item_id"] for row in contexts["anonymous-a"]] == [
+        "anonymous-a",
+    ]
+    assert [row["item_id"] for row in contexts["anonymous-b"]] == [
+        "anonymous-b",
+    ]
+
+
+def test_conversation_unit_rejects_placeholder_conversation_ids(
+    source_db, valid_topic_spec,
+):
+    with sqlite3.connect(source_db) as connection:
+        connection.executemany(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "pending-a", "pending", 1, _ms(2, 10), "Win", "3.1",
+                    "wetype", "pc", "user-a", 77, None, "用户 A",
+                ),
+                (
+                    "pending-b", "pending", 1, _ms(2, 20), "Win", "3.1",
+                    "wetype", "pc", "user-b", 77, None, "用户 B",
+                ),
+            ],
+        )
+    conversation_spec = validate_topic_spec({
+        **valid_topic_spec.to_dict(), "unit": "conversation",
+    })
+
+    with pytest.raises(ValueError, match="conversation_source_not_ready"):
+        fetch_scoped_items(source_db, conversation_spec)
+
+
+def test_explicit_pull_coverage_allows_a_quiet_interval_tail(
+    source_db, valid_topic_spec,
+):
+    with sqlite3.connect(source_db) as connection:
+        connection.execute("DELETE FROM feedback WHERE ts_ms = ?", (_ms(4),))
+        connection.execute("DELETE FROM feedback_source_coverage")
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("wetype", _ms(0), _ms(4), _ms(5)),
+        )
+
+    items = fetch_scoped_items(source_db, valid_topic_spec)
+
+    assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
+
+
+def test_explicit_pull_coverage_rejects_an_internal_gap(
+    source_db, valid_topic_spec,
+):
+    with sqlite3.connect(source_db) as connection:
+        connection.execute("DELETE FROM feedback_source_coverage")
+        connection.executemany(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            [
+                ("wetype", _ms(0), _ms(2), _ms(5)),
+                ("wetype", _ms(3), _ms(4), _ms(5, 1)),
+            ],
+        )
+
+    with pytest.raises(DataCoverageError):
+        fetch_scoped_items(source_db, valid_topic_spec)
+
+
+def test_missing_pull_coverage_metadata_is_a_stable_coverage_error(
+    source_db, valid_topic_spec,
+):
+    with sqlite3.connect(source_db) as connection:
+        connection.execute("DROP TABLE feedback_source_coverage")
+
+    with pytest.raises(DataCoverageError):
+        fetch_scoped_items(source_db, valid_topic_spec)
 
 
 def test_missing_source_date_range_raises_before_retrieval(source_db, valid_topic_spec):

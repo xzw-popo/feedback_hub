@@ -30,6 +30,17 @@ CREATE INDEX IF NOT EXISTS idx_feedback_conv    ON feedback(conversation_id, msg
 CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback(user_vid, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_feedback_ts      ON feedback(ts_ms);
 
+-- 1a. 数据拉取覆盖区间（即使区间内 0 条反馈也要记录）
+CREATE TABLE IF NOT EXISTS feedback_source_coverage (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel         TEXT NOT NULL,
+    start_ts_ms     INTEGER NOT NULL,
+    end_ts_ms       INTEGER NOT NULL,
+    completed_at_ms INTEGER NOT NULL UNIQUE,
+    CHECK (end_ts_ms > start_ts_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_coverage_channel_window
+    ON feedback_source_coverage(channel, start_ts_ms, end_ts_ms);
 -- 2. 消息级标签（保留每条消息的原始打标）
 CREATE TABLE IF NOT EXISTS message_label (
     feedback_id     TEXT PRIMARY KEY,

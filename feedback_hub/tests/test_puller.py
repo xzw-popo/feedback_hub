@@ -137,6 +137,15 @@ def test_pull_end_to_end_with_mock(tmp_path, monkeypatch):
     assert result["fetched_count"] == 1
     assert result["inserted_count"] == 1
     assert result["skipped_dup_count"] == 0
+    with db.connect(tmp_path / "fb.db") as verify:
+        coverage = verify.execute(
+            """SELECT channel, start_ts_ms, end_ts_ms, completed_at_ms
+               FROM feedback_source_coverage"""
+        ).fetchone()
+    assert coverage["channel"] == "wetype"
+    assert coverage["start_ts_ms"] == int(start.timestamp()) * 1000
+    assert coverage["end_ts_ms"] == int(end.timestamp()) * 1000
+    assert coverage["completed_at_ms"] >= coverage["end_ts_ms"]
     assert (tmp_path / "raw").exists()
     raw_files = list((tmp_path / "raw").glob("raw_wetype_*.json"))
     assert len(raw_files) == 1

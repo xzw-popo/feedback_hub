@@ -197,6 +197,12 @@ def pull(start_dt: datetime, end_dt: datetime, *,
         own_conn = True
     try:
         inserted = upsert_rows(conn, rows)
+        source_generation_ms = db.record_feedback_source_coverage(
+            conn,
+            channel=channel,
+            start_ts_ms=s_ms,
+            end_ts_ms=e_ms,
+        )
     finally:
         if own_conn:
             conn.close()
@@ -206,6 +212,7 @@ def pull(start_dt: datetime, end_dt: datetime, *,
         "fetched_count": len(rows),
         "inserted_count": inserted,
         "skipped_dup_count": len(rows) - inserted,
+        "source_generation_ms": source_generation_ms,
         "raw_dump": str(raw_path),
         "debug": debug,
     }

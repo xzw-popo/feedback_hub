@@ -46,11 +46,21 @@ def _persist_verified_manifest(
         connection.execute(
             "INSERT INTO feedback VALUES (?)", (run["source_watermark_ms"],),
         )
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?)",
+            (run["source_watermark_ms"],),
+        )
     snapshot_digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     manifest = {
         "source_watermark_ms": run["source_watermark_ms"],
         "source_snapshot": {
             "max_ts_ms": run["source_watermark_ms"],
+            "coverage_watermark_ms": run["source_watermark_ms"],
             "sha256": snapshot_digest,
         },
         "source_sha256": snapshot_digest,

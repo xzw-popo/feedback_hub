@@ -77,7 +77,7 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert started == [first["run_id"]]
 
 
-def test_create_run_freezes_snapshot_before_scheduling_and_never_replaces_it(
+def test_same_event_watermark_backfill_creates_a_new_frozen_run_generation(
     tmp_path, monkeypatch,
 ):
     import feedback_hub.topic_mining.api as api
@@ -85,6 +85,14 @@ def test_create_run_freezes_snapshot_before_scheduling_and_never_replaces_it(
 
     source = tmp_path / "source.db"
     start_ms, end_ms = _write_source(source)
+    first_generation_ms = end_ms + 10_000
+    second_generation_ms = first_generation_ms + 1
+    with sqlite3.connect(source) as connection:
+        connection.execute("DELETE FROM feedback_source_coverage")
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start_ms, end_ms, first_generation_ms),
+        )
     config = TopicMiningConfig(
         source_db_path=source, data_dir=tmp_path / "data",
     )
@@ -114,13 +122,62 @@ def test_create_run_freezes_snapshot_before_scheduling_and_never_replaces_it(
                 "https://example.test/backfill", "历史回填",
             ),
         )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start_ms, end_ms, second_generation_ms),
+        )
     second = client.post("/api/topic-mining/runs", json=_spec()).json()
 
-    assert end_ms == first["source_watermark_ms"]
-    assert first["run_id"] == second["run_id"]
-    assert scheduled_snapshots == [True]
+    assert first["source_watermark_ms"] == first_generation_ms
+    assert second["source_watermark_ms"] == second_generation_ms
+    assert first["run_id"] != second["run_id"]
+    assert scheduled_snapshots == [True, True]
     assert first_digest is not None
     assert hashlib.sha256(snapshot_path.read_bytes()).hexdigest() == first_digest
+    second_snapshot_path = (
+        Path(store.get(second["run_id"])["artifact_dir"])
+        / "source_snapshot.sqlite"
+    )
+    with sqlite3.connect(second_snapshot_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM feedback WHERE feedback_id = ?",
+            ("same-watermark-backfill",),
+        ).fetchone()[0] == 1
+
+
+def test_create_run_rejects_incomplete_pull_coverage_before_publishing(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+    from feedback_hub.tests.test_topic_mining_service import _write_source
+
+    source = tmp_path / "source.db"
+    start_ms, end_ms = _write_source(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute("DELETE FROM feedback_source_coverage")
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start_ms, start_ms + 1000, end_ms),
+        )
+    config = TopicMiningConfig(
+        source_db_path=source, data_dir=tmp_path / "data",
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    started = []
+    monkeypatch.setattr(
+        api, "start_run_async",
+        lambda run_id, **_kwargs: started.append(run_id),
+    )
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    response = TestClient(app).post("/api/topic-mining/runs", json=_spec())
+
+    assert response.status_code == 422
+    assert "does not cover" in response.json()["detail"]
+    assert started == []
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM topic_run").fetchone()[0] == 0
 
 
 def test_get_run_rejects_row_and_snapshot_cutoff_mismatch(tmp_path):
@@ -756,11 +813,21 @@ with tempfile.TemporaryDirectory() as temporary:
         connection.execute(
             "INSERT INTO feedback VALUES (?)", (run["source_watermark_ms"],),
         )
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?)",
+            (run["source_watermark_ms"],),
+        )
     snapshot_digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     manifest = {
         "source_watermark_ms": run["source_watermark_ms"],
         "source_snapshot": {
             "max_ts_ms": run["source_watermark_ms"],
+            "coverage_watermark_ms": run["source_watermark_ms"],
             "sha256": snapshot_digest,
         },
         "source_sha256": snapshot_digest,

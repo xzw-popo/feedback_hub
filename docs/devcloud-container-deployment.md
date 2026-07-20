@@ -170,7 +170,9 @@ LLM_API_KEY=
 LLM_MODEL=
 ```
 
-`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。
+`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。向量服务返回的 `watermark_ts_ms` 必须是从 `feedback_source_coverage.completed_at_ms` 传递的同一数据代际，不能用最后一条反馈的事件时间代替。
+
+新版 schema 会创建 `feedback_source_coverage`，每次 `feedback_hub pull` 成功后写入本次的 channel、拉取起止区间和单调递增的数据代际。专题服务只读这张表：它用覆盖区间区分“该时段没有反馈”和“该时段尚未同步”，并用数据代际区分最大反馈时间不变的历史补录。旧数据库在首次启动新代码时只会建表，不会猜测历史覆盖范围；在运行专题前，必须用正常拉取流程同步请求的完整时间段。如果 run 返回 `data_coverage_error`，应补拉缺失区间并新建数据代际下的 run，不得伪造边界反馈或手工绕过验证。
 
 完成依赖和配置后，先重启新代码并确认新进程正常，再检查专题能力接口：
 

@@ -22,6 +22,7 @@ class SourceSnapshot:
     min_ts_ms: int | None
     max_ts_ms: int | None
     row_count: int
+    coverage_watermark_ms: int | None
 
 
 class DataCoverageError(ValueError):
@@ -38,6 +39,10 @@ class DataCoverageError(ValueError):
 
 class UnsupportedSourceFilterError(ValueError):
     """Raised when a requested scope cannot be represented by this source."""
+
+
+class SourceReadinessError(ValueError):
+    """Raised when source identities are not ready for the requested unit."""
 
 
 _FIXED_SOURCE_PRODUCT = "微信输入法"
@@ -81,6 +86,12 @@ def create_source_snapshot(
             )
     with _readonly_connection(snapshot_path) as snapshot:
         row = snapshot.execute("SELECT MIN(ts_ms), MAX(ts_ms), COUNT(*) FROM feedback").fetchone()
+        try:
+            coverage_row = snapshot.execute(
+                "SELECT MAX(completed_at_ms) FROM feedback_source_coverage",
+            ).fetchone()
+        except sqlite3.Error:
+            coverage_row = None
     return SourceSnapshot(
         path=snapshot_path,
         sha256=_sha256(snapshot_path),
@@ -88,6 +99,11 @@ def create_source_snapshot(
         min_ts_ms=row[0],
         max_ts_ms=row[1],
         row_count=row[2],
+        coverage_watermark_ms=(
+            coverage_row[0]
+            if coverage_row is not None
+            else None
+        ),
     )
 
 
@@ -97,15 +113,61 @@ def _scope_ms(spec: TopicSpec) -> tuple[int, int]:
     return start, end
 
 
-def _source_coverage(connection: sqlite3.Connection, start_ms: int, end_ms: int) -> None:
-    source_min_ms, source_max_ms = connection.execute("SELECT MIN(ts_ms), MAX(ts_ms) FROM feedback").fetchone()
-    if source_min_ms is None or start_ms < source_min_ms or end_ms > source_max_ms:
-        raise DataCoverageError(start_ms, end_ms, source_min_ms, source_max_ms)
+def _source_coverage(
+    connection: sqlite3.Connection,
+    spec: TopicSpec,
+    start_ms: int,
+    end_ms: int,
+) -> None:
+    try:
+        if spec.scope.channels:
+            channels = list(spec.scope.channels)
+        else:
+            channels = [
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT DISTINCT channel FROM (
+                        SELECT channel FROM feedback
+                        UNION ALL
+                        SELECT channel FROM feedback_source_coverage
+                    ) WHERE TRIM(channel) <> '' ORDER BY channel"""
+                )
+            ]
+    except sqlite3.Error as exc:
+        raise DataCoverageError(start_ms, end_ms, None, None) from exc
+    if not channels:
+        raise DataCoverageError(start_ms, end_ms, None, None)
+    for channel in channels:
+        try:
+            rows = connection.execute(
+                """SELECT start_ts_ms, end_ts_ms
+                   FROM feedback_source_coverage
+                   WHERE channel = ? AND end_ts_ms > ? AND start_ts_ms < ?
+                   ORDER BY start_ts_ms, end_ts_ms""",
+                (channel, start_ms, end_ms),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise DataCoverageError(start_ms, end_ms, None, None) from exc
+        cursor = start_ms
+        for covered_start, covered_end in rows:
+            if covered_end <= cursor:
+                continue
+            if covered_start > cursor:
+                break
+            cursor = max(cursor, int(covered_end))
+            if cursor >= end_ms:
+                break
+        if cursor < end_ms:
+            source_min_ms = min((int(row[0]) for row in rows), default=None)
+            source_max_ms = max((int(row[1]) for row in rows), default=None)
+            raise DataCoverageError(
+                start_ms, end_ms, source_min_ms, source_max_ms,
+            )
 
 
 def _filtered_rows(connection: sqlite3.Connection, spec: TopicSpec) -> list[sqlite3.Row]:
     start_ms, end_ms = _scope_ms(spec)
-    _source_coverage(connection, start_ms, end_ms)
+    _source_coverage(connection, spec, start_ms, end_ms)
     clauses = ["ts_ms >= ?", "ts_ms < ?", "TRIM(text) <> ''"]
     params: list[Any] = [start_ms, end_ms]
     for column, values in (
@@ -126,6 +188,14 @@ def _filtered_rows(connection: sqlite3.Connection, spec: TopicSpec) -> list[sqli
     ).fetchall()
 
 
+def validate_source_coverage(source_path: Path, spec: TopicSpec) -> None:
+    """Require explicit continuous pull coverage without reading result rows."""
+    _validate_source_filters(spec)
+    start_ms, end_ms = _scope_ms(spec)
+    with _readonly_connection(Path(source_path)) as connection:
+        _source_coverage(connection, spec, start_ms, end_ms)
+
+
 def _source_url(row: sqlite3.Row) -> str:
     return row["external_chat_url"] or db.build_external_chat_url(
         row["channel"], row["service_vid"], row["user_vid"]
@@ -143,6 +213,7 @@ def _item(row: sqlite3.Row) -> dict[str, Any]:
         "channel": row["channel"] or "",
         "device_name": row["device_name"] or "",
         "user_vid": row["user_vid"] or "",
+        "service_vid": row["service_vid"],
         "text": row["text"].strip(),
         "source_url": _source_url(row),
     }
@@ -155,6 +226,9 @@ def fetch_scoped_items(source_path: Path, spec: TopicSpec) -> list[dict[str, Any
         rows = _filtered_rows(connection, spec)
     if spec.unit == "feedback":
         return [_item(row) for row in rows]
+
+    if any(_conversation_id_unready(row["conversation_id"]) for row in rows):
+        raise SourceReadinessError("conversation_source_not_ready")
 
     grouped: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
@@ -173,6 +247,7 @@ def fetch_scoped_items(source_path: Path, spec: TopicSpec) -> list[dict[str, Any
             "channel": first["channel"] or "",
             "device_name": first["device_name"] or "",
             "user_vid": first["user_vid"] or "",
+            "service_vid": first["service_vid"],
             "text": "\n".join(row["text"].strip() for row in messages),
             "source_url": _source_url(first),
         })
@@ -185,9 +260,29 @@ def build_item_contexts(items: Iterable[dict[str, Any]], unit: str, window_ms: i
     ordered = sorted(items, key=lambda item: (item["ts_ms"], item["item_id"]))
     contexts: dict[str, list[dict[str, Any]]] = {}
     for item in ordered:
+        identity = _context_identity(item)
         contexts[item["item_id"]] = [
             candidate for candidate in ordered
-            if candidate["user_vid"] == item["user_vid"]
+            if _context_identity(candidate) == identity
             and abs(candidate["ts_ms"] - item["ts_ms"]) <= window_ms
         ]
     return contexts
+
+
+def _conversation_id_unready(value: Any) -> bool:
+    return not isinstance(value, str) or value.strip().lower() in {
+        "", "pending", "unknown", "none", "null",
+    }
+
+
+def _context_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
+    conversation_id = item.get("conversation_id")
+    if not _conversation_id_unready(conversation_id):
+        return ("conversation", str(conversation_id).strip())
+    user_vid = item.get("user_vid")
+    if isinstance(user_vid, str) and user_vid.strip():
+        return (
+            "user", str(item.get("channel") or ""),
+            str(item.get("service_vid") or ""), user_vid.strip(),
+        )
+    return ("item", str(item.get("item_id") or ""))

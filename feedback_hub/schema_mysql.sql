@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS feedback (
     INDEX idx_feedback_ts      (ts_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 1a. 数据拉取覆盖区间（即使区间内 0 条反馈也要记录）
+CREATE TABLE IF NOT EXISTS feedback_source_coverage (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    channel         VARCHAR(64) NOT NULL,
+    start_ts_ms     BIGINT NOT NULL,
+    end_ts_ms       BIGINT NOT NULL,
+    completed_at_ms BIGINT NOT NULL,
+    INDEX idx_feedback_coverage_channel_window
+        (channel, start_ts_ms, end_ts_ms),
+    UNIQUE INDEX uq_feedback_coverage_generation (completed_at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 2. 消息级标签（保留每条消息的原始打标）
 CREATE TABLE IF NOT EXISTS message_label (
     feedback_id     VARCHAR(255) PRIMARY KEY,

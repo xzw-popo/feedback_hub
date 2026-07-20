@@ -17,7 +17,7 @@ from fastapi.responses import Response
 from .config import TopicMiningConfig
 from .contracts import topic_spec_hash, validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
-from .source import create_source_snapshot
+from .source import create_source_snapshot, validate_source_coverage
 from .service import (
     RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
@@ -207,9 +207,10 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             snapshot = create_source_snapshot(
                 config.source_db_path, incoming_snapshot,
             )
-            if snapshot.max_ts_ms is None:
-                raise ValueError("source database is empty")
-            watermark = int(snapshot.max_ts_ms)
+            validate_source_coverage(snapshot.path, spec)
+            if snapshot.coverage_watermark_ms is None:
+                raise ValueError("source coverage metadata is unavailable")
+            watermark = int(snapshot.coverage_watermark_ms)
             spec_hash = topic_spec_hash(spec)
             run_id = hashlib.sha256(
                 f"{spec_hash}:{watermark}".encode("utf-8")
