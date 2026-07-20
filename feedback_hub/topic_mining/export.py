@@ -6,9 +6,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
-
 from .run_store import TopicRunStore
 from .service import RunVerificationError, _checkpoint, _load_manifest, _require_run, _validate_final_rows, _verify_manifest, _write_jsonl, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
@@ -52,6 +49,9 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
 
 
 def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = "反馈清单"

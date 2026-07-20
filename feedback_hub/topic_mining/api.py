@@ -16,7 +16,6 @@ from fastapi.responses import Response
 
 from .config import TopicMiningConfig
 from .contracts import validate_topic_spec
-from .export import export_topic_run
 from .run_store import TopicRunStore
 from .service import (
     RunVerificationError, _artifact_valid, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
@@ -25,6 +24,11 @@ from .service import (
 
 
 _RUN_CONTEXTS: dict[str, tuple[TopicRunStore, TopicMiningConfig]] = {}
+_FINAL_DELIVERABLES = frozenset({
+    "final_results.jsonl",
+    "quality_report.json",
+    "feedback_list.xlsx",
+})
 
 
 def start_run_async(run_id: str, *, store: TopicRunStore | None = None, config: TopicMiningConfig | None = None) -> None:
@@ -115,6 +119,8 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         _get_or_404(run_id, store)
         export_format = payload.get("format", "xlsx")
         try:
+            from .export import export_topic_run
+
             path = export_topic_run(run_id, export_format, store=store)
         except RunVerificationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -125,16 +131,23 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
     @router.get("/runs/{run_id}/artifacts/{artifact_name}", dependencies=[Depends(require_token)])
     def artifact(run_id: str, artifact_name: str):
         run = _get_or_404(run_id, store)
-        # Resolve exclusively through the persisted manifest. Never normalize
-        # or join a caller-controlled path before this allowlist lookup.
+        # Download authority comes from run state and this final-deliverable
+        # contract, never from arbitrary names present in an internal manifest.
+        if (
+            run["status"] != "verified"
+            or artifact_name not in _FINAL_DELIVERABLES
+            or "/" in artifact_name
+            or "\\" in artifact_name
+        ):
+            raise HTTPException(status_code=404, detail="topic artifact not found")
         manifest = _manifest(run)
+        artifacts = manifest.get("artifacts", {}) if isinstance(manifest, dict) else {}
+        if not isinstance(artifacts, dict) or artifact_name not in artifacts:
+            raise HTTPException(status_code=404, detail="topic artifact not found")
         try:
             _verify_manifest(manifest, Path(run["artifact_dir"]))
         except RunVerificationError:
             raise HTTPException(status_code=409, detail="topic artifact hash mismatch") from None
-        allowed = manifest.get("artifacts", {}) if isinstance(manifest, dict) else {}
-        if artifact_name not in allowed or "/" in artifact_name or "\\" in artifact_name:
-            raise HTTPException(status_code=404, detail="topic artifact not found")
         path = Path(run["artifact_dir"]) / artifact_name
         if not path.is_file():
             raise HTTPException(status_code=404, detail="topic artifact not found")
