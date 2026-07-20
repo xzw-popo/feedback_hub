@@ -57,6 +57,44 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert report["data_cutoff_ms"] == CUTOFF_MS
 
 
+def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(_row(run["run_id"])) + "\n", encoding="utf-8")
+    manifest = {
+        "artifacts": {final.name: hashlib.sha256(final.read_bytes()).hexdigest()},
+    }
+    store.update_manifest(
+        run["run_id"], manifest, stage="verified", status="verified",
+    )
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    before = store.get(run["run_id"])
+    publications = []
+    publish = store.publish_terminal_artifacts
+
+    def observe(*args, **kwargs):
+        publications.append(kwargs)
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(store, "publish_terminal_artifacts", observe)
+
+    export_topic_run(run["run_id"], "jsonl", store=store)
+
+    assert len(publications) == 1
+    assert publications[0]["expected_manifest_json"] == before["manifest_json"]
+    assert set(publications[0]["files"]) == {
+        "final_results.jsonl", "quality_report.json",
+    }
+    current_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert set(current_manifest["artifacts"]) == {
+        "final_reviewed.jsonl", "final_results.jsonl", "quality_report.json",
+    }
+
+
 @pytest.mark.parametrize("cutoff", [None, True, CUTOFF_MS - 1, str(CUTOFF_MS)])
 def test_export_rejects_missing_invalid_or_mismatched_data_cutoff(tmp_path, cutoff):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")

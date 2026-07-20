@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _checkpoint, _effective_data_cutoff, _load_manifest, _require_run, _validate_final_rows, _verify_manifest, _write_jsonl, read_verified_artifact_bytes
+from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _require_run, _validate_final_rows, _verify_manifest, read_verified_artifact_bytes
 from .contracts import validate_topic_spec
 
 
@@ -39,23 +40,42 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     )
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))
     jsonl_path = artifact_dir / "final_results.jsonl"
-    _write_jsonl(jsonl_path, rows)
+    jsonl_bytes = "".join(
+        json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n"
+        for row in rows
+    ).encode("utf-8")
     report = {
         "run_id": run_id, "status": "verified", "matched_count": len(rows),
         "artifact": jsonl_path.name, "data_cutoff_ms": data_cutoff_ms,
         "data_cutoff_time": _format_time(data_cutoff_ms),
     }
-    (artifact_dir / "quality_report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    report_bytes = (
+        json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    files = {
+        jsonl_path.name: jsonl_bytes,
+        "quality_report.json": report_bytes,
+    }
     if export_format == "jsonl":
-        _checkpoint(run_id, store, artifact_dir, _load_manifest(run, artifact_dir), "verified", [jsonl_path, artifact_dir / "quality_report.json"])
+        _publish_terminal_mutation(
+            run, store, manifest, stage="verified", status="verified",
+            files=files,
+        )
         return jsonl_path
     workbook_path = artifact_dir / "feedback_list.xlsx"
-    _write_xlsx(workbook_path, rows)
-    _checkpoint(run_id, store, artifact_dir, _load_manifest(run, artifact_dir), "verified", [jsonl_path, artifact_dir / "quality_report.json", workbook_path])
+    files[workbook_path.name] = _xlsx_bytes(rows)
+    _publish_terminal_mutation(
+        run, store, manifest, stage="verified", status="verified",
+        files=files,
+    )
     return workbook_path
 
 
 def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.write_bytes(_xlsx_bytes(rows))
+
+
+def _xlsx_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -90,7 +110,9 @@ def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         for cell in row:
             cell.font = Font(name="Aptos", size=10)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-    workbook.save(path)
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def _safe_cell(value: Any) -> str:

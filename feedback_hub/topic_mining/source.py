@@ -64,12 +64,21 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def create_source_snapshot(source_path: Path, snapshot_path: Path) -> SourceSnapshot:
-    """Use SQLite backup from a read-only source into an isolated artifact file."""
+def create_source_snapshot(
+    source_path: Path,
+    snapshot_path: Path,
+    *,
+    max_ts_ms: int | None = None,
+) -> SourceSnapshot:
+    """Copy a read-only source and optionally freeze it at a run watermark."""
     source_path, snapshot_path = Path(source_path), Path(snapshot_path)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     with _readonly_connection(source_path) as source, sqlite3.connect(snapshot_path) as destination:
         source.backup(destination)
+        if max_ts_ms is not None:
+            destination.execute(
+                "DELETE FROM feedback WHERE ts_ms > ?", (int(max_ts_ms),),
+            )
     with _readonly_connection(snapshot_path) as snapshot:
         row = snapshot.execute("SELECT MIN(ts_ms), MAX(ts_ms), COUNT(*) FROM feedback").fetchone()
     return SourceSnapshot(

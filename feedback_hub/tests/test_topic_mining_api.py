@@ -318,6 +318,58 @@ def test_heartbeat_renewal_failure_cancels_stale_pipeline_publication(
     assert failed["manifest_json"] == "{}"
 
 
+def test_heartbeat_failure_is_persisted_before_slow_pipeline_unwind(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+    import feedback_hub.topic_mining.run_store as run_store_module
+
+    clock = {"seconds": 1.0}
+    monkeypatch.setattr(run_store_module.time, "time", lambda: clock["seconds"])
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=1)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=config.worker_lease_seconds,
+    )
+    heartbeat_failure_persisted = api.threading.Event()
+    fail_worker_claim = store.fail_worker_claim
+
+    def renew_failure(*_args, **_kwargs):
+        raise sqlite3.OperationalError("temporary renewal failure")
+
+    def observe_failure(*args, **kwargs):
+        result = fail_worker_claim(*args, **kwargs)
+        if api.threading.current_thread() is not api.threading.main_thread():
+            heartbeat_failure_persisted.set()
+        return result
+
+    def delayed_stale_publish(run_id, *, store, config):
+        del config
+        heartbeat_failure_persisted.wait(timeout=0.75)
+        clock["seconds"] = 3.0
+        store.update_manifest(
+            run_id, {"writer": "stale-worker"},
+            stage="review_ready", status="review_ready",
+        )
+
+    monkeypatch.setattr(store, "renew_worker_claim", renew_failure)
+    monkeypatch.setattr(store, "fail_worker_claim", observe_failure)
+    monkeypatch.setattr(api, "run_topic_job", delayed_stale_publish)
+
+    api._run_claimed_job(
+        run_id=run["run_id"], store=store, config=config,
+        claim_token=claim.claim_token,
+    )
+
+    failed = store.get(run["run_id"])
+    assert heartbeat_failure_persisted.is_set()
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_heartbeat_lost"
+    assert failed["worker_claim_token"] is None
+    assert failed["manifest_json"] == "{}"
+
+
 @pytest.mark.parametrize("status", ["review_ready", "verified"])
 def test_resume_rejects_nonrecoverable_run_with_conflict(
     tmp_path, monkeypatch, status,

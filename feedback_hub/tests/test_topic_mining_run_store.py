@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -140,6 +141,7 @@ def test_existing_run_database_is_migrated_with_worker_lease_columns(tmp_path):
         }
     assert {
         "worker_claim_token", "worker_claimed_at_ms", "worker_lease_expires_at_ms",
+        "publication_json",
     } <= columns
     # A legacy running row has no live lease and is therefore an orphan that
     # can be reclaimed after the schema upgrade.
@@ -441,3 +443,126 @@ def test_terminal_run_cannot_be_claimed(tmp_path, valid_topic_spec, status):
 
     assert claim.claimed is False
     assert claim.reason == "run_not_recoverable"
+
+
+def test_terminal_publication_recovers_after_files_precede_database_commit(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_manifest(
+        run["run_id"], {"artifacts": {}},
+        stage="review_ready", status="review_ready",
+    )
+    before = store.get(run["run_id"])
+
+    def crash_before_database_commit(*_args, **_kwargs):
+        raise OSError("simulated process crash")
+
+    monkeypatch.setattr(
+        store, "_finalize_terminal_publication",
+        crash_before_database_commit,
+    )
+    with pytest.raises(OSError, match="simulated process crash"):
+        store.publish_terminal_artifacts(
+            run["run_id"],
+            expected_manifest_json=before["manifest_json"],
+            manifest={"artifacts": {}, "verified": {"matched_count": 1}},
+            stage="verified",
+            status="verified",
+            files={"final_reviewed.jsonl": b'{"item_id":"f1"}\n'},
+        )
+
+    with sqlite3.connect(store.db_path) as connection:
+        persisted = connection.execute(
+            "SELECT status, manifest_json, publication_json FROM topic_run WHERE run_id = ?",
+            (run["run_id"],),
+        ).fetchone()
+    assert persisted[0] == "review_ready"
+    assert persisted[1] == before["manifest_json"]
+    assert persisted[2]
+    with pytest.raises(RuntimeError, match="run_publication_conflict"):
+        store.update_manifest(
+            run["run_id"], {"writer": "concurrent"}, stage="review_ready",
+        )
+
+    recovered_store = TopicRunStore(store.db_path, tmp_path / "runs")
+    assert recovered_store.recover_terminal_publication(run["run_id"]) is True
+    recovered = recovered_store.get(run["run_id"])
+    recovered_manifest = json.loads(recovered["manifest_json"])
+    assert recovered["status"] == "verified"
+    assert recovered["stage"] == "verified"
+    assert recovered["publication_json"] is None
+    assert recovered_manifest["artifacts"]["final_reviewed.jsonl"] == hashlib.sha256(
+        b'{"item_id":"f1"}\n',
+    ).hexdigest()
+    assert (Path(run["artifact_dir"]) / "final_reviewed.jsonl").read_bytes() == b'{"item_id":"f1"}\n'
+
+
+def test_terminal_publication_rejects_stale_manifest_without_lost_update(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_manifest(
+        run["run_id"], {"artifacts": {}},
+        stage="verified", status="verified",
+    )
+    before = store.get(run["run_id"])
+    store.publish_terminal_artifacts(
+        run["run_id"],
+        expected_manifest_json=before["manifest_json"],
+        manifest={"artifacts": {}},
+        stage="verified",
+        status="verified",
+        files={"feedback_list.xlsx": b"first-export"},
+    )
+
+    with pytest.raises(RuntimeError, match="run_publication_conflict"):
+        store.publish_terminal_artifacts(
+            run["run_id"],
+            expected_manifest_json=before["manifest_json"],
+            manifest={"artifacts": {}},
+            stage="verified",
+            status="verified",
+            files={"final_results.jsonl": b"stale-export\n"},
+        )
+
+    current = store.get(run["run_id"])
+    manifest = json.loads(current["manifest_json"])
+    assert set(manifest["artifacts"]) == {"feedback_list.xlsx"}
+    assert (Path(run["artifact_dir"]) / "feedback_list.xlsx").read_bytes() == b"first-export"
+    assert not (Path(run["artifact_dir"]) / "final_results.jsonl").exists()
+
+
+def test_committed_terminal_publication_tolerates_mirror_write_failure(
+    tmp_path, valid_topic_spec, monkeypatch,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_manifest(
+        run["run_id"], {"artifacts": {}},
+        stage="verified", status="verified",
+    )
+    before = store.get(run["run_id"])
+
+    def mirror_unavailable(*_args, **_kwargs):
+        raise OSError("mirror unavailable")
+
+    monkeypatch.setattr(store, "_write_manifest_mirror", mirror_unavailable)
+
+    store.publish_terminal_artifacts(
+        run["run_id"],
+        expected_manifest_json=before["manifest_json"],
+        manifest={"artifacts": {}},
+        stage="verified",
+        status="verified",
+        files={"final_results.jsonl": b"published\n"},
+    )
+
+    current = store.get(run["run_id"])
+    manifest = json.loads(current["manifest_json"])
+    assert current["publication_json"] is None
+    assert manifest["artifacts"]["final_results.jsonl"] == hashlib.sha256(
+        b"published\n",
+    ).hexdigest()

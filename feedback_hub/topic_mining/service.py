@@ -22,7 +22,7 @@ from .config import TopicMiningConfig
 from .contracts import TopicSpec, validate_topic_spec
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
-from .run_store import TopicRunStore
+from .run_store import RunPublicationConflictError, TopicRunStore
 from .source import DataCoverageError, build_item_contexts, create_source_snapshot, fetch_scoped_items
 from .vector_client import HttpVectorSearchClient
 
@@ -120,7 +120,14 @@ def _run_pipeline(
         _ensure_worker_active(run_id, store)
         snapshot_workspace = _stage_workspace(store, artifact_dir, "snapshot")
         staged_snapshot_path = snapshot_workspace / snapshot_path.name
-        snapshot = create_source_snapshot(config.source_db_path, staged_snapshot_path)
+        persisted_watermark_ms = int(run["source_watermark_ms"])
+        snapshot = create_source_snapshot(
+            config.source_db_path,
+            staged_snapshot_path,
+            max_ts_ms=persisted_watermark_ms,
+        )
+        if snapshot.max_ts_ms != persisted_watermark_ms:
+            raise RunVerificationError("source_watermark_mismatch")
         _ensure_worker_active(run_id, store)
         snapshot_hashes = _promote_stage_files(
             run_id, store, artifact_dir, snapshot_workspace,
@@ -337,21 +344,35 @@ def submit_review_overrides(
     _require_review_decisions(
         _read_required_jsonl(review_queue_path, manifest), overrides,
     )
-    _write_jsonl(artifact_dir / "review_overrides.jsonl", [dict(row) for row in overrides])
-    _invalidate_export_artifacts(manifest, artifact_dir)
+    override_rows = [dict(row) for row in overrides]
+    override_bytes = _jsonl_bytes(override_rows)
+    proposed = json.loads(json.dumps(manifest))
+    _invalidate_export_artifacts(proposed)
+    pending_hashes = {
+        "review_overrides.jsonl": hashlib.sha256(override_bytes).hexdigest(),
+    }
     # Overrides are a declared output of review_queue. Re-checkpoint that
     # stage before review_ready so the full verification chain continues to
     # authenticate the latest approved reviewer decisions.
-    _checkpoint(
-        run_id,
-        store,
-        artifact_dir,
-        manifest,
-        "review_queue",
-        [artifact_dir / "review_queue.jsonl", artifact_dir / "review_overrides.jsonl"],
+    _prepare_checkpoint_manifest(
+        proposed, artifact_dir, "review_queue", pending_hashes,
     )
-    _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [artifact_dir / "review_overrides.jsonl"])
-    return [dict(row) for row in overrides]
+    _prepare_checkpoint_manifest(
+        proposed, artifact_dir, "review_ready", pending_hashes,
+    )
+    _publish_terminal_mutation(
+        run,
+        store,
+        proposed,
+        stage="review_ready",
+        status="review_ready",
+        files={"review_overrides.jsonl": override_bytes},
+        delete_names=(
+            "final_reviewed.jsonl", "final_results.jsonl",
+            "quality_report.json", "feedback_list.xlsx",
+        ),
+    )
+    return override_rows
 
 
 def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict[str, Any]:
@@ -423,11 +444,26 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         final_rows, spec, contexts=contexts, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,
     )
-    final_path = artifact_dir / "final_reviewed.jsonl"
-    _write_jsonl(final_path, final_rows)
-    manifest["verified"] = {"matched_count": len(final_rows), "verified_at_ms": int(time.time() * 1000)}
-    _checkpoint(run_id, store, artifact_dir, manifest, "verified", [final_path])
-    _set_status(run_id, store, "verified", stage="verified")
+    final_bytes = _jsonl_bytes(final_rows)
+    proposed = json.loads(json.dumps(manifest))
+    proposed["verified"] = {
+        "matched_count": len(final_rows),
+        "verified_at_ms": int(time.time() * 1000),
+    }
+    _prepare_checkpoint_manifest(
+        proposed,
+        artifact_dir,
+        "verified",
+        {"final_reviewed.jsonl": hashlib.sha256(final_bytes).hexdigest()},
+    )
+    _publish_terminal_mutation(
+        run,
+        store,
+        proposed,
+        stage="verified",
+        status="verified",
+        files={"final_reviewed.jsonl": final_bytes},
+    )
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
 
 
@@ -572,10 +608,13 @@ def _verify_manifest(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
     mirror = artifact_dir / "manifest.json"
     try:
         mirror_value = json.loads(mirror.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RunVerificationError("manifest_hash_reconciliation") from exc
+    except (OSError, json.JSONDecodeError):
+        mirror_value = None
     if mirror_value != manifest:
-        raise RunVerificationError("manifest_hash_reconciliation")
+        try:
+            _atomic_json(mirror, manifest)
+        except OSError as exc:
+            raise RunVerificationError("manifest_hash_reconciliation") from exc
     artifacts = manifest.get("artifacts", {})
     if not isinstance(artifacts, Mapping):
         raise RunVerificationError("manifest_hash_reconciliation")
@@ -670,6 +709,72 @@ def _checkpoint(
     manifest["stage"] = stage
     _write_manifest_mirror(run_id, store, artifact_dir, manifest)
     store.update_manifest(run_id, manifest, stage=stage)
+
+
+def _prepare_checkpoint_manifest(
+    manifest: dict[str, Any],
+    artifact_dir: Path,
+    stage: str,
+    pending_hashes: Mapping[str, str],
+) -> None:
+    """Update a manifest before its files are terminal-published."""
+    artifacts = manifest.setdefault("artifacts", {})
+    if not isinstance(artifacts, dict):
+        raise RunVerificationError("manifest_hash_reconciliation")
+    artifacts.update(pending_hashes)
+    if stage not in _STAGES:
+        manifest["stage"] = stage
+        return
+    input_names, output_names = _stage_contract_names(stage, artifact_dir)
+    inputs = _trusted_stage_input_hashes(
+        manifest,
+        artifact_dir,
+        input_names,
+        pending_hashes=pending_hashes,
+    ) if input_names else {}
+    outputs: dict[str, str] = {}
+    for name in output_names:
+        if name in pending_hashes:
+            outputs[name] = pending_hashes[name]
+        else:
+            path = artifact_dir / name
+            if not path.is_file():
+                raise RunVerificationError("manifest_stage_chain")
+            outputs[name] = _sha256(path)
+    output_count = _stage_output_count(stage, artifact_dir, manifest)
+    manifest.setdefault("stages", {})[stage] = {
+        "inputs": inputs,
+        "outputs": outputs,
+        "input_count": _stage_input_count(stage, artifact_dir),
+        "output_count": output_count,
+    }
+    manifest.setdefault("funnel", {})[stage + "_count"] = output_count
+    manifest["manifest_version"] = _MANIFEST_VERSION
+    manifest["stage"] = stage
+
+
+def _publish_terminal_mutation(
+    run: Mapping[str, Any],
+    store: TopicRunStore,
+    manifest: Mapping[str, Any],
+    *,
+    stage: str,
+    status: str | None,
+    files: Mapping[str, bytes],
+    delete_names: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    try:
+        return store.publish_terminal_artifacts(
+            str(run["run_id"]),
+            expected_manifest_json=str(run.get("manifest_json") or "{}"),
+            manifest=manifest,
+            stage=stage,
+            status=status,
+            files=files,
+            delete_names=delete_names,
+        )
+    except RunPublicationConflictError as exc:
+        raise RunVerificationError("run_changed_retry") from exc
 
 
 def _checkpoint_attempt(
@@ -815,6 +920,8 @@ def _trusted_stage_input_hashes(
     manifest: Mapping[str, Any],
     artifact_dir: Path,
     names: Sequence[str],
+    *,
+    pending_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Reuse prior stage hashes; never re-authenticate mutable canonical input."""
     stages = manifest.get("stages", {})
@@ -831,7 +938,11 @@ def _trusted_stage_input_hashes(
                 expected = value
                 break
         path = artifact_dir / name
-        if expected is None or not path.is_file() or _sha256(path) != expected:
+        pending = pending_hashes.get(name) if pending_hashes is not None else None
+        if expected is None or (
+            pending != expected
+            and (not path.is_file() or _sha256(path) != expected)
+        ):
             raise RunVerificationError("manifest_stage_chain")
         trusted[name] = expected
     return trusted
@@ -1132,10 +1243,9 @@ def _read_verified_bytes_from_path(path: Path) -> bytes:
         raise RunVerificationError("missing_artifact") from exc
 
 
-def _invalidate_export_artifacts(manifest: dict[str, Any], artifact_dir: Path) -> None:
+def _invalidate_export_artifacts(manifest: dict[str, Any]) -> None:
     artifacts = manifest.setdefault("artifacts", {})
     for name in ("final_reviewed.jsonl", "final_results.jsonl", "quality_report.json", "feedback_list.xlsx"):
-        (artifact_dir / name).unlink(missing_ok=True)
         artifacts.pop(name, None)
     manifest.pop("verified", None)
 
@@ -1218,8 +1328,15 @@ def _classification_from_dict(value: Mapping[str, Any]) -> ClassificationResult:
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text("".join(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+    temporary.write_bytes(_jsonl_bytes(rows))
     temporary.replace(path)
+
+
+def _jsonl_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
+    return "".join(
+        json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n"
+        for row in rows
+    ).encode("utf-8")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

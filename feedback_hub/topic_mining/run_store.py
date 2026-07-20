@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -34,6 +35,10 @@ class WorkerClaim:
 
 class WorkerClaimLostError(RuntimeError):
     """Raised when a worker tries to publish after losing its claim."""
+
+
+class RunPublicationConflictError(RuntimeError):
+    """Raised when a terminal mutation was based on stale run state."""
 
 
 class TopicRunStore:
@@ -72,6 +77,7 @@ class TopicRunStore:
                     worker_claim_token TEXT,
                     worker_claimed_at_ms INTEGER,
                     worker_lease_expires_at_ms INTEGER,
+                    publication_json TEXT,
                     UNIQUE(spec_hash, source_watermark_ms)
                 )"""
             )
@@ -83,6 +89,7 @@ class TopicRunStore:
                 ("worker_claim_token", "TEXT"),
                 ("worker_claimed_at_ms", "INTEGER"),
                 ("worker_lease_expires_at_ms", "INTEGER"),
+                ("publication_json", "TEXT"),
             ):
                 if name not in existing:
                     connection.execute(
@@ -114,6 +121,7 @@ class TopicRunStore:
             "worker_claim_token": None,
             "worker_claimed_at_ms": None,
             "worker_lease_expires_at_ms": None,
+            "publication_json": None,
         }
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -121,11 +129,13 @@ class TopicRunStore:
                 """INSERT INTO topic_run (
                     run_id, spec_hash, spec_json, source_watermark_ms, status, stage,
                     error_code, error_message, artifact_dir, created_at_ms, updated_at_ms, manifest_json,
-                    worker_claim_token, worker_claimed_at_ms, worker_lease_expires_at_ms
+                    worker_claim_token, worker_claimed_at_ms, worker_lease_expires_at_ms,
+                    publication_json
                 ) VALUES (
                     :run_id, :spec_hash, :spec_json, :source_watermark_ms, :status, :stage,
                     :error_code, :error_message, :artifact_dir, :created_at_ms, :updated_at_ms, :manifest_json,
-                    :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms
+                    :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms,
+                    :publication_json
                 ) ON CONFLICT(spec_hash, source_watermark_ms) DO NOTHING""",
                 record,
             )
@@ -295,7 +305,7 @@ class TopicRunStore:
                    WHERE run_id = ? AND (
                        (worker_claim_token IS NULL AND ? IS NULL)
                        OR (worker_claim_token = ? AND worker_lease_expires_at_ms > ?)
-                   )""",
+                   ) AND publication_json IS NULL""",
                 (
                     status, stage, now_ms, status, status, status, run_id,
                     worker_claim_token, worker_claim_token, now_ms,
@@ -304,11 +314,262 @@ class TopicRunStore:
         if cursor.rowcount != 1:
             self._raise_missing_or_lost(run_id)
 
-    def get(self, run_id: str) -> dict[str, Any] | None:
-        """Return the isolated run row without exposing source databases."""
+    def _get_raw(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM topic_run WHERE run_id = ?", (run_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        """Return a run after finishing any durable terminal publication."""
+        self.recover_terminal_publication(run_id)
+        return self._get_raw(run_id)
+
+    def publish_terminal_artifacts(
+        self,
+        run_id: str,
+        *,
+        expected_manifest_json: str,
+        manifest: Mapping[str, Any],
+        stage: str,
+        status: str | None,
+        files: Mapping[str, bytes],
+        delete_names: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Durably publish a review/verify/export mutation with manifest CAS."""
+        if status is not None and status not in RUN_STATES:
+            raise ValueError(f"unsupported topic run status: {status}")
+        if not isinstance(stage, str) or not stage:
+            raise ValueError("terminal publication stage is required")
+        self.recover_terminal_publication(run_id)
+        run = self._get_raw(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        artifact_dir = Path(str(run["artifact_dir"])).resolve()
+        normalized_files: dict[str, bytes] = {}
+        for name, raw in files.items():
+            if not self._terminal_name_safe(name):
+                raise ValueError("invalid terminal artifact name")
+            if not isinstance(raw, bytes):
+                raise TypeError("terminal artifact content must be bytes")
+            normalized_files[name] = raw
+        normalized_deletes = tuple(dict.fromkeys(delete_names))
+        if any(not self._terminal_name_safe(name) for name in normalized_deletes):
+            raise ValueError("invalid terminal artifact name")
+        if set(normalized_files) & set(normalized_deletes):
+            raise ValueError("terminal artifact cannot be published and deleted")
+
+        publication_id = secrets.token_hex(16)
+        publication_dir = artifact_dir / ".publications" / publication_id
+        publication_dir.mkdir(parents=True, exist_ok=False)
+        file_records: dict[str, dict[str, str]] = {}
+        try:
+            for name, raw in normalized_files.items():
+                staged = publication_dir / name
+                with staged.open("wb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                file_records[name] = {
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            self._fsync_directory(publication_dir)
+
+            proposed = json.loads(json.dumps(dict(manifest)))
+            artifacts = proposed.setdefault("artifacts", {})
+            if not isinstance(artifacts, dict):
+                raise ValueError("terminal manifest artifacts must be an object")
+            for name, record in file_records.items():
+                artifacts[name] = record["sha256"]
+            for name in normalized_deletes:
+                artifacts.pop(name, None)
+            proposed["stage"] = stage
+            publication = {
+                "publication_id": publication_id,
+                "manifest": proposed,
+                "stage": stage,
+                "status": status,
+                "files": file_records,
+                "delete_names": list(normalized_deletes),
+            }
+            publication_json = json.dumps(
+                publication, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """UPDATE topic_run SET publication_json = ?
+                       WHERE run_id = ? AND manifest_json = ?
+                         AND publication_json IS NULL
+                         AND worker_claim_token IS NULL
+                         AND status IN ('review_ready', 'verified')""",
+                    (publication_json, run_id, expected_manifest_json),
+                )
+            if cursor.rowcount != 1:
+                raise RunPublicationConflictError("run_publication_conflict")
+            self.recover_terminal_publication(run_id)
+            return proposed
+        except Exception:
+            current = self._get_raw(run_id)
+            keep_staging = False
+            if current is not None and current.get("publication_json"):
+                try:
+                    keep_staging = json.loads(
+                        str(current["publication_json"])
+                    ).get("publication_id") == publication_id
+                except (AttributeError, json.JSONDecodeError):
+                    keep_staging = False
+            if not keep_staging:
+                shutil.rmtree(publication_dir, ignore_errors=True)
+            raise
+
+    def recover_terminal_publication(self, run_id: str) -> bool:
+        """Idempotently finish a terminal publication recorded before a crash."""
+        publication_dir: Path | None = None
+        manifest: dict[str, Any] | None = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT artifact_dir, publication_json FROM topic_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None or row["publication_json"] is None:
+                return False
+            raw_publication = str(row["publication_json"])
+            try:
+                publication = json.loads(raw_publication)
+                publication_id = str(publication["publication_id"])
+                manifest = publication["manifest"]
+                files = publication["files"]
+                delete_names = publication["delete_names"]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RunPublicationConflictError("invalid_run_publication") from exc
+            if (
+                not isinstance(manifest, dict)
+                or not isinstance(files, dict)
+                or not isinstance(delete_names, list)
+                or not publication_id
+            ):
+                raise RunPublicationConflictError("invalid_run_publication")
+            artifact_dir = Path(str(row["artifact_dir"])).resolve()
+            publication_dir = (
+                artifact_dir / ".publications" / publication_id
+            ).resolve()
+            try:
+                publication_dir.relative_to(artifact_dir / ".publications")
+            except ValueError as exc:
+                raise RunPublicationConflictError("invalid_run_publication") from exc
+            for name, record in files.items():
+                if (
+                    not self._terminal_name_safe(name)
+                    or not isinstance(record, dict)
+                    or not isinstance(record.get("sha256"), str)
+                ):
+                    raise RunPublicationConflictError("invalid_run_publication")
+                staged = publication_dir / name
+                if not staged.is_file() or self._sha256(staged) != record["sha256"]:
+                    raise RunPublicationConflictError("invalid_run_publication")
+                target = artifact_dir / name
+                temporary = target.with_name(
+                    f".{target.name}.{publication_id}.tmp"
+                )
+                try:
+                    with staged.open("rb") as source, temporary.open("wb") as destination:
+                        while chunk := source.read(1024 * 1024):
+                            destination.write(chunk)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    os.replace(temporary, target)
+                    self._fsync_directory(target.parent)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            for name in delete_names:
+                if not self._terminal_name_safe(name):
+                    raise RunPublicationConflictError("invalid_run_publication")
+                (artifact_dir / name).unlink(missing_ok=True)
+            self._fsync_directory(artifact_dir)
+            self._finalize_terminal_publication(
+                connection, run_id, raw_publication, publication,
+            )
+
+        assert publication_dir is not None and manifest is not None
+        try:
+            self._write_manifest_mirror(Path(str(row["artifact_dir"])), manifest)
+        except OSError:
+            # The database is authoritative; verification repairs this cache.
+            pass
+        shutil.rmtree(publication_dir, ignore_errors=True)
+        return True
+
+    def _finalize_terminal_publication(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        raw_publication: str,
+        publication: Mapping[str, Any],
+    ) -> None:
+        manifest_json = json.dumps(
+            publication["manifest"], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        now_ms = int(time.time() * 1000)
+        cursor = connection.execute(
+            """UPDATE topic_run
+               SET stage = ?, status = COALESCE(?, status),
+                   error_code = NULL, error_message = NULL,
+                   manifest_json = ?, publication_json = NULL,
+                   updated_at_ms = ?
+               WHERE run_id = ? AND publication_json = ?""",
+            (
+                publication["stage"], publication.get("status"),
+                manifest_json, now_ms, run_id, raw_publication,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RunPublicationConflictError("run_publication_conflict")
+
+    @staticmethod
+    def _terminal_name_safe(name: Any) -> bool:
+        return (
+            isinstance(name, str)
+            and bool(name)
+            and name != "manifest.json"
+            and Path(name).name == name
+            and "/" not in name
+            and "\\" not in name
+        )
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _write_manifest_mirror(artifact_dir: Path, manifest: Mapping[str, Any]) -> None:
+        target = artifact_dir / "manifest.json"
+        temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    dict(manifest), ensure_ascii=False, sort_keys=True, indent=2,
+                ) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            TopicRunStore._fsync_directory(artifact_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def update_manifest(
         self,
@@ -337,7 +598,7 @@ class TopicRunStore:
                    WHERE run_id = ? AND (
                        (worker_claim_token IS NULL AND ? IS NULL)
                        OR (worker_claim_token = ? AND worker_lease_expires_at_ms > ?)
-                   )""",
+                   ) AND publication_json IS NULL""",
                 (
                     stage, status, error_code, error_message,
                     json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -468,8 +729,11 @@ class TopicRunStore:
                 temporary.unlink(missing_ok=True)
 
     def _raise_missing_or_lost(self, run_id: str) -> None:
-        if self.get(run_id) is None:
+        current = self._get_raw(run_id)
+        if current is None:
             raise KeyError(run_id)
+        if current.get("publication_json"):
+            raise RunPublicationConflictError("run_publication_conflict")
         raise WorkerClaimLostError("worker_claim_lost")
 
 

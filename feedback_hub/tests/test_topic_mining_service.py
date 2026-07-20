@@ -73,14 +73,21 @@ def test_verify_gate_rejects_pending_even_with_empty_artifacts(tmp_path):
         verify_topic_run(run["run_id"], store=store)
 
 
-def test_db_manifest_remains_trust_anchor_when_disk_mirror_is_tampered(tmp_path):
+def test_db_manifest_repairs_a_tampered_disk_mirror(tmp_path):
+    from feedback_hub.topic_mining.service import _load_manifest, _verify_manifest
+
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
     artifact_dir = tmp_path / "runs" / run["run_id"]
     (artifact_dir / "manifest.json").write_text('{"artifacts": {"final_reviewed.jsonl": "forged"}}', encoding="utf-8")
-    store.update_status(run["run_id"], "review_ready", stage="review_ready")
-    with pytest.raises(RunVerificationError, match="manifest_hash_reconciliation"):
-        verify_topic_run(run["run_id"], store=store)
+    persisted = store.get(run["run_id"])
+    manifest = _load_manifest(persisted, artifact_dir)
+
+    _verify_manifest(manifest, artifact_dir)
+
+    assert json.loads((artifact_dir / "manifest.json").read_text(
+        encoding="utf-8",
+    )) == manifest
 
 
 def test_stale_worker_cannot_replace_manifest_mirror_after_reclaim(tmp_path):
@@ -265,17 +272,17 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
     from feedback_hub.topic_mining.vector_client import VectorCapabilities, VectorHit, VectorSearchResult
 
     uncovered = tmp_path / "uncovered.db"
-    _write_source(uncovered, include_end=False)
+    uncovered_start, _ = _write_source(uncovered, include_end=False)
     config = TopicMiningConfig(source_db_path=uncovered, data_dir=tmp_path / "data-a", vector_api_url="https://vector.test")
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
-    run = store.create_or_get(_spec(), 123)
+    run = store.create_or_get(_spec(), uncovered_start + 1000)
     assert run_topic_job(run["run_id"], store=store, config=config)["error_code"] == "data_coverage_error"
 
     covered = tmp_path / "covered.db"
     _, end = _write_source(covered)
     stale_config = TopicMiningConfig(source_db_path=covered, data_dir=tmp_path / "data-b", vector_api_url="https://vector.test", vector_max_lag_seconds=1)
     stale_store = TopicRunStore(stale_config.data_dir / "runs.db", stale_config.data_dir / "runs")
-    stale_run = stale_store.create_or_get(_spec(), 123)
+    stale_run = stale_store.create_or_get(_spec(), end)
     class StaleVector:
         def capabilities(self): return VectorCapabilities("feedback-items-v1", 1, ("feedback",), 0)
         def search(self, *_args): return VectorSearchResult("feedback-items-v1", 0, (VectorHit("f1", "objective:0", .9, 1),))
@@ -323,7 +330,7 @@ def test_run_maps_classifier_quota_pause(tmp_path):
     _, end = _write_source(source)
     config = TopicMiningConfig(source_db_path=source, data_dir=tmp_path / "data", vector_api_url="https://vector.test", vector_max_lag_seconds=1_000_000, classifier_concurrency=1)
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
-    run = store.create_or_get(_spec(), 123)
+    run = store.create_or_get(_spec(), end)
     class Vector:
         def capabilities(self): return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
         def search(self, *_args): return VectorSearchResult("feedback-items-v1", end, (VectorHit("f1", "objective:0", .9, 1),))
@@ -409,7 +416,7 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     config = TopicMiningConfig(source_db_path=source, data_dir=tmp_path / "data", vector_api_url="https://vector.test", vector_max_lag_seconds=1_000_000, classifier_concurrency=1)
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
-    run = store.create_or_get(_spec(), 123)
+    run = store.create_or_get(_spec(), end)
 
     class FakeVector:
         def capabilities(self):

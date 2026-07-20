@@ -91,6 +91,22 @@ def test_snapshot_and_scope_do_not_modify_source(tmp_path, source_db, valid_topi
     assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
 
 
+def test_snapshot_can_be_frozen_at_the_run_watermark(tmp_path, source_db):
+    cutoff_ms = _ms(2)
+
+    snapshot = create_source_snapshot(
+        source_db, tmp_path / "bounded-snapshot.db",
+        max_ts_ms=cutoff_ms,
+    )
+
+    assert snapshot.max_ts_ms == cutoff_ms
+    assert snapshot.row_count == 8
+    with sqlite3.connect(snapshot.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM feedback WHERE ts_ms > ?", (cutoff_ms,),
+        ).fetchone()[0] == 0
+
+
 def test_feedback_scope_uses_half_open_time_bounds_and_stable_item_keys(source_db, valid_topic_spec):
     items = fetch_scoped_items(source_db, valid_topic_spec)
 

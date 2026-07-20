@@ -100,6 +100,15 @@ def _run_claimed_job(
                     lease_seconds=config.worker_lease_seconds,
                 )
             except Exception:
+                try:
+                    store.fail_worker_claim(
+                        run_id,
+                        claim_token,
+                        error_code="worker_heartbeat_lost",
+                        error_message="topic worker heartbeat was lost",
+                    )
+                except Exception:
+                    pass
                 heartbeat_failed.set()
                 claim_lost.set()
                 return
