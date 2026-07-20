@@ -128,6 +128,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("capabilities")
     create = subparsers.add_parser("create-run"); create.add_argument("--spec", required=True)
     get = subparsers.add_parser("get-run"); get.add_argument("run_id")
+    resume = subparsers.add_parser("resume"); resume.add_argument("run_id")
     review = subparsers.add_parser("review-queue"); review.add_argument("run_id"); review.add_argument("--output", required=True)
     overrides = subparsers.add_parser("apply-overrides"); overrides.add_argument("run_id"); overrides.add_argument("--file", required=True)
     verify = subparsers.add_parser("verify"); verify.add_argument("run_id")
@@ -149,6 +150,10 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
     if command == "get-run":
         run_id = _safe_path_segment(arguments.run_id, "run id")
         response, _ = _request(base_url, token, "GET", f"/runs/{run_id}")
+        return response
+    if command == "resume":
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/resume")
         return response
     if command == "review-queue":
         run_id = _safe_path_segment(arguments.run_id, "run id")

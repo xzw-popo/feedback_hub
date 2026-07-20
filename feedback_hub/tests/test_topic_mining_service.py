@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -54,6 +55,78 @@ def test_db_manifest_remains_trust_anchor_when_disk_mirror_is_tampered(tmp_path)
         verify_topic_run(run["run_id"], store=store)
 
 
+def test_stale_worker_cannot_replace_manifest_mirror_after_reclaim(tmp_path):
+    from feedback_hub.topic_mining.service import _write_manifest_mirror
+
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    first = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=10_000,
+    )
+    stale_store = store.for_worker_claim(first.claim_token)
+    manifest_path = Path(run["artifact_dir"]) / "manifest.json"
+    manifest_path.write_text('{"writer": "new"}\n', encoding="utf-8")
+    second = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=70_000,
+    )
+
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        _write_manifest_mirror(
+            run["run_id"], stale_store, Path(run["artifact_dir"]),
+            {"writer": "stale"},
+        )
+
+    assert second.claim_token != first.claim_token
+    assert manifest_path.read_text(encoding="utf-8") == '{"writer": "new"}\n'
+
+
+def test_claimed_classifier_checkpoint_is_incrementally_authenticated(tmp_path):
+    from feedback_hub.topic_mining.service import (
+        _classification_resume_safe,
+        _publish_classification_progress,
+    )
+
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 123)
+    artifact_dir = Path(run["artifact_dir"])
+    (artifact_dir / "recall_candidates.jsonl").write_text("{}\n", encoding="utf-8")
+    (artifact_dir / "recall_manifest.json").write_text("{}\n", encoding="utf-8")
+    (artifact_dir / "item_contexts.json").write_text("{}\n", encoding="utf-8")
+    first = store.claim_worker(run["run_id"], lease_seconds=60)
+    claimed = store.for_worker_claim(first.claim_token)
+    workspace = claimed.stage_artifact_dir(artifact_dir, "classify")
+    checkpoint = workspace / "classification_batches.jsonl.checkpoint.jsonl"
+    checkpoint.write_text('{"index":0,"key":"classification:00000","ok":true}\n', encoding="utf-8")
+    (workspace / "classification_batches.jsonl.run_state.json").write_text(
+        '{"run_status":"running","completed":1,"remaining":1}\n',
+        encoding="utf-8",
+    )
+    manifest: dict[str, object] = {}
+
+    _publish_classification_progress(
+        run["run_id"], claimed, artifact_dir, workspace, manifest,
+    )
+
+    persisted = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert _classification_resume_safe(persisted, artifact_dir) is True
+    assert checkpoint.is_file(), "publishing must not move a scheduler's open file"
+    canonical = artifact_dir / checkpoint.name
+    assert canonical.read_text(encoding="utf-8") == checkpoint.read_text(encoding="utf-8")
+
+    second = store.claim_worker(
+        run["run_id"], lease_seconds=60,
+        now_ms=first.lease_expires_at_ms,
+    )
+    checkpoint.write_text("stale overwrite\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        _publish_classification_progress(
+            run["run_id"], claimed, artifact_dir, workspace, manifest,
+        )
+
+    assert second.claim_token != first.claim_token
+    assert canonical.read_text(encoding="utf-8") != "stale overwrite\n"
+
+
 def test_verify_rejects_duplicate_and_missing_link(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 123)
@@ -99,9 +172,29 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
     outcome = run_topic_job(stale_run["run_id"], store=stale_store, config=stale_config, vector_client=StaleVector())
     assert outcome["error_code"] == "vector_index_stale"
 
+    from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
+    class FreshVector:
+        def capabilities(self): return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
+        def search(self, *_args): return VectorSearchResult("feedback-items-v1", end, (VectorHit("f1", "objective:0", .9, 1),))
+    route = ModelRoute("test", "openai_compatible", "https://model.test", "not-a-secret", "test")
+    def classify(prompt, **_kwargs):
+        item_ids = sorted(row["item_id"] for row in json.loads(prompt)["candidates"])
+        return ModelReply(json.dumps({"results": [{"item_id": item_id, "label": "matched", "confidence": .9, "evidence": ["工具栏一直显示"], "reason": "符合", "needs_review": False} for item_id in item_ids]}), "test", "openai_compatible", "test", 1, 1, ())
+
+    recovered = run_topic_job(
+        stale_run["run_id"], store=stale_store, config=stale_config,
+        vector_client=FreshVector(), classifier_routes=[route],
+        classifier_call_fn=classify,
+    )
+
+    assert recovered["status"] == "review_ready"
+    recovered_manifest = json.loads(recovered["manifest_json"])
+    assert recovered_manifest["unresolved_vector_items"] == 0
+    assert verify_topic_run(stale_run["run_id"], store=stale_store)["status"] == "verified"
+
 
 def test_run_maps_classifier_quota_pause(tmp_path):
-    from feedback_hub.topic_discovery.model_routes import ModelRoute, QuotaExhaustedError
+    from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute, QuotaExhaustedError
     from feedback_hub.topic_mining.config import TopicMiningConfig
     from feedback_hub.topic_mining.service import run_topic_job
     from feedback_hub.topic_mining.vector_client import VectorCapabilities, VectorHit, VectorSearchResult
@@ -116,7 +209,12 @@ def test_run_maps_classifier_quota_pause(tmp_path):
         def search(self, *_args): return VectorSearchResult("feedback-items-v1", end, (VectorHit("f1", "objective:0", .9, 1),))
     route = ModelRoute("test", "openai_compatible", "https://model.test", "not-a-secret", "test")
     def exhausted(_prompt, *, route, **_kwargs): raise QuotaExhaustedError(route.name, 429, "quota")
-    outcome = run_topic_job(run["run_id"], store=store, config=config, vector_client=Vector(), classifier_routes=[route], classifier_call_fn=exhausted)
+    first_claim = store.claim_worker(run["run_id"], lease_seconds=60)
+    outcome = run_topic_job(
+        run["run_id"], store=store.for_worker_claim(first_claim.claim_token),
+        config=config, vector_client=Vector(), classifier_routes=[route],
+        classifier_call_fn=exhausted,
+    )
     assert outcome["status"] == "paused_quota_exhausted"
     attempt = json.loads(store.get(run["run_id"])["manifest_json"])["stage_attempts"]["classify"]
     assert {
@@ -125,6 +223,42 @@ def test_run_maps_classifier_quota_pause(tmp_path):
         "classification_batches.jsonl.failures.jsonl",
         "classification_audit.jsonl",
     } <= set(attempt["outputs"])
+
+    artifact_dir = Path(run["artifact_dir"])
+    snapshot_before = hashlib.sha256(
+        (artifact_dir / "source_snapshot.sqlite").read_bytes()
+    ).hexdigest()
+    # Audit history is independently durable. Even when the scheduler
+    # checkpoint is missing and cannot be reused, the quota attempt must be
+    # retained and the retry must advance to a new audit generation.
+    (artifact_dir / "classification_batches.jsonl.checkpoint.jsonl").unlink()
+
+    def recovered_call(prompt, **_kwargs):
+        item_ids = sorted(row["item_id"] for row in json.loads(prompt)["candidates"])
+        return ModelReply(json.dumps({"results": [{
+            "item_id": item_id, "label": "matched", "confidence": .9,
+            "evidence": ["工具栏一直显示"], "reason": "符合",
+            "needs_review": False,
+        } for item_id in item_ids]}), "test", "openai_compatible", "test", 1, 1, ())
+
+    second_claim = store.claim_worker(run["run_id"], lease_seconds=60)
+    resumed = run_topic_job(
+        run["run_id"], store=store.for_worker_claim(second_claim.claim_token),
+        config=config, vector_client=Vector(),
+        classifier_routes=[route], classifier_call_fn=recovered_call,
+    )
+
+    assert resumed["status"] == "review_ready"
+    audit_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "classification_audit.jsonl").read_text(
+            encoding="utf-8",
+        ).splitlines()
+    ]
+    assert [row["audit_generation"] for row in audit_rows] == [1, 2]
+    assert hashlib.sha256(
+        (artifact_dir / "source_snapshot.sqlite").read_bytes()
+    ).hexdigest() == snapshot_before
 
 
 def test_read_jsonl_normalizes_malformed_json(tmp_path):

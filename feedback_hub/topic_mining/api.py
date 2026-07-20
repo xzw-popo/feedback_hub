@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -16,14 +17,13 @@ from fastapi.responses import Response
 
 from .config import TopicMiningConfig
 from .contracts import validate_topic_spec
-from .run_store import TopicRunStore
+from .run_store import TopicRunStore, WorkerClaimLostError
 from .service import (
     RunVerificationError, _artifact_valid, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
 
-_RUN_CONTEXTS: dict[str, tuple[TopicRunStore, TopicMiningConfig]] = {}
 _FINAL_DELIVERABLES = frozenset({
     "final_results.jsonl",
     "quality_report.json",
@@ -31,13 +31,124 @@ _FINAL_DELIVERABLES = frozenset({
 })
 
 
-def start_run_async(run_id: str, *, store: TopicRunStore | None = None, config: TopicMiningConfig | None = None) -> None:
-    if store is None or config is None:
-        stored = _RUN_CONTEXTS.get(run_id)
-        if stored is not None:
-            store, config = stored
-    thread = threading.Thread(target=run_topic_job, kwargs={"run_id": run_id, "store": store, "config": config}, daemon=True)
-    thread.start()
+@dataclass(frozen=True)
+class WorkerStart:
+    scheduled: bool
+    reason: str
+
+
+def start_run_async(
+    run_id: str,
+    *,
+    store: TopicRunStore | None = None,
+    config: TopicMiningConfig | None = None,
+) -> WorkerStart:
+    """Persistently claim a run before launching its background worker."""
+    config = config or TopicMiningConfig()
+    store = store or default_store(config)
+    claim = store.claim_worker(
+        run_id, lease_seconds=config.worker_lease_seconds,
+    )
+    if not claim.claimed or not claim.claim_token:
+        return WorkerStart(False, claim.reason)
+    try:
+        thread = threading.Thread(
+            target=_run_claimed_job,
+            kwargs={
+                "run_id": run_id,
+                "store": store,
+                "config": config,
+                "claim_token": claim.claim_token,
+            },
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        # This process knows no worker started, so persist a diagnosable,
+        # immediately recoverable failure. Process crashes retain their lease
+        # and follow the backend stale-worker policy instead.
+        store.fail_worker_claim(
+            run_id,
+            claim.claim_token,
+            error_code="worker_start_failed",
+            error_message="topic worker could not start",
+        )
+        return WorkerStart(False, "worker_start_failed")
+    return WorkerStart(True, "scheduled")
+
+
+def _run_claimed_job(
+    *,
+    run_id: str,
+    store: TopicRunStore,
+    config: TopicMiningConfig,
+    claim_token: str,
+) -> None:
+    stop_heartbeat = threading.Event()
+    claim_lost = threading.Event()
+    heartbeat_failed = threading.Event()
+    heartbeat_interval = max(0.25, config.worker_lease_seconds / 3)
+    heartbeat_thread: threading.Thread | None = None
+    heartbeat_started = False
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(heartbeat_interval):
+            try:
+                renewed = store.renew_worker_claim(
+                    run_id,
+                    claim_token,
+                    lease_seconds=config.worker_lease_seconds,
+                )
+            except Exception:
+                heartbeat_failed.set()
+                claim_lost.set()
+                return
+            if not renewed:
+                claim_lost.set()
+                return
+
+    try:
+        try:
+            heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+            heartbeat_thread.start()
+            heartbeat_started = True
+        except Exception:
+            store.fail_worker_claim(
+                run_id,
+                claim_token,
+                error_code="worker_heartbeat_start_failed",
+                error_message="topic worker heartbeat could not start",
+            )
+            return
+        claimed_store = store.for_worker_claim(
+            claim_token, cancellation_event=claim_lost,
+        )
+        try:
+            run_topic_job(run_id, store=claimed_store, config=config)
+            if claim_lost.is_set():
+                raise WorkerClaimLostError("worker_claim_lost")
+        except WorkerClaimLostError:
+            if heartbeat_failed.is_set():
+                store.fail_worker_claim(
+                    run_id,
+                    claim_token,
+                    error_code="worker_heartbeat_lost",
+                    error_message="topic worker heartbeat was lost",
+                )
+        except Exception:
+            store.fail_worker_claim(
+                run_id,
+                claim_token,
+                error_code="topic_run_error",
+                error_message="topic worker failed",
+            )
+    finally:
+        stop_heartbeat.set()
+        try:
+            if heartbeat_started and heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1)
+        finally:
+            store.release_worker_claim(run_id, claim_token)
 
 
 def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore | None = None) -> APIRouter:
@@ -68,12 +179,14 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             spec = validate_topic_spec(payload)
             watermark = _source_watermark(config.source_db_path, spec)
             run = store.create_or_get(spec, watermark)
-            result = _public_run(run)
+            scheduled = False
             if run["created"]:
-                # Only the transaction that inserted a pending run starts work.
-                # Keep the one positional call shape patchable in unit tests.
-                _RUN_CONTEXTS[run["run_id"]] = (store, config)
-                start_run_async(run["run_id"])
+                start = start_run_async(run["run_id"], store=store, config=config)
+                scheduled = start.scheduled
+            current = store.get(run["run_id"]) or run
+            current["created"] = run["created"]
+            result = _public_run(current)
+            result["scheduled"] = scheduled
             return result
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
@@ -84,6 +197,18 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         if run is None:
             raise HTTPException(status_code=404, detail="topic run not found")
         return _public_run(run)
+
+    @router.post("/runs/{run_id}/resume", dependencies=[Depends(require_token)])
+    def resume_run(run_id: str) -> dict[str, Any]:
+        _get_or_404(run_id, store)
+        start = start_run_async(run_id, store=store, config=config)
+        if not start.scheduled:
+            status_code = 503 if start.reason == "worker_start_failed" else 409
+            raise HTTPException(status_code=status_code, detail=start.reason)
+        run = _get_or_404(run_id, store)
+        result = _public_run(run)
+        result["scheduled"] = True
+        return result
 
     @router.get("/runs/{run_id}/review-queue", dependencies=[Depends(require_token)])
     def review_queue(run_id: str) -> dict[str, Any]:

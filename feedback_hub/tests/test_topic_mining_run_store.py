@@ -1,5 +1,7 @@
 import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -98,3 +100,236 @@ def test_existing_run_repairs_missing_artifact_directory(tmp_path, valid_topic_s
 
     assert repaired["created"] is False
     assert artifact_dir.is_dir()
+
+
+def test_existing_run_database_is_migrated_with_worker_lease_columns(tmp_path):
+    db_path = tmp_path / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE topic_run (
+                run_id TEXT PRIMARY KEY,
+                spec_hash TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                source_watermark_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                error_code TEXT,
+                error_message TEXT,
+                artifact_dir TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                manifest_json TEXT NOT NULL,
+                UNIQUE(spec_hash, source_watermark_ms)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO topic_run VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-running", "legacy-spec", "{}", 123, "running", "classify",
+                None, None, str(tmp_path / "runs" / "legacy-running"), 1, 1, "{}",
+            ),
+        )
+
+    store = TopicRunStore(db_path, tmp_path / "runs")
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(topic_run)")
+        }
+    assert {
+        "worker_claim_token", "worker_claimed_at_ms", "worker_lease_expires_at_ms",
+    } <= columns
+    # A legacy running row has no live lease and is therefore an orphan that
+    # can be reclaimed after the schema upgrade.
+    claim = store.claim_worker("legacy-running", lease_seconds=60, now_ms=10_000)
+    assert claim.claimed is True
+
+
+def test_pending_worker_claim_is_atomic_under_concurrency(tmp_path, valid_topic_spec):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+
+    def claim_once(_index):
+        return store.claim_worker(run["run_id"], lease_seconds=60, now_ms=10_000)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        claims = list(executor.map(claim_once, range(8)))
+
+    assert sum(claim.claimed for claim in claims) == 1
+    assert {claim.reason for claim in claims if not claim.claimed} == {
+        "worker_already_claimed",
+    }
+
+
+@pytest.mark.parametrize("status", ["paused_quota_exhausted", "failed"])
+def test_explicit_claim_recovers_paused_or_failed_run(
+    tmp_path, valid_topic_spec, status,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_status(run["run_id"], status, stage="classify")
+
+    claim = store.claim_worker(run["run_id"], lease_seconds=60, now_ms=10_000)
+
+    assert claim.claimed is True
+    assert claim.claim_token
+    current = store.get(run["run_id"])
+    assert current["status"] == "running"
+    assert current["error_code"] is None
+    assert current["error_message"] is None
+
+
+def test_running_claim_is_rejected_until_backend_lease_is_stale(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    first = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=10_000,
+    )
+
+    fresh = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=69_999,
+    )
+    stale = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=70_000,
+    )
+
+    assert first.claimed is True
+    assert fresh.claimed is False
+    assert fresh.reason == "worker_already_claimed"
+    assert stale.claimed is True
+    assert stale.claim_token != first.claim_token
+
+
+def test_only_current_worker_token_can_renew_the_backend_lease(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=10_000,
+    )
+
+    assert store.renew_worker_claim(
+        run["run_id"], "wrong-token", lease_seconds=60, now_ms=60_000,
+    ) is False
+    assert store.renew_worker_claim(
+        run["run_id"], claim.claim_token, lease_seconds=60, now_ms=60_000,
+    ) is True
+    assert store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=70_000,
+    ).reason == "worker_already_claimed"
+    assert store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=120_000,
+    ).claimed is True
+
+
+def test_expired_worker_cannot_renew_or_publish(tmp_path, valid_topic_spec):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=1, now_ms=1_000,
+    )
+
+    assert store.renew_worker_claim(
+        run["run_id"], claim.claim_token,
+        lease_seconds=1, now_ms=2_000,
+    ) is False
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        store.assert_worker_claim(
+            run["run_id"], claim.claim_token, now_ms=2_000,
+        )
+
+
+def test_stale_generation_cannot_promote_over_new_worker_artifact(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    first = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=10_000,
+    )
+    canonical = Path(run["artifact_dir"]) / "classified.jsonl"
+    canonical.write_text("new-worker-sentinel\n", encoding="utf-8")
+    staged = tmp_path / "stale-classified.jsonl"
+    staged.write_text("stale-worker-output\n", encoding="utf-8")
+    second = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=70_000,
+    )
+
+    assert hasattr(store, "publish_worker_files")
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        store.publish_worker_files(
+            run["run_id"], first.claim_token, [(staged, canonical)],
+            now_ms=70_001,
+        )
+
+    assert first.claim_token != second.claim_token
+    assert canonical.read_text(encoding="utf-8") == "new-worker-sentinel\n"
+    assert store.get(run["run_id"])["worker_claim_token"] == second.claim_token
+
+
+def test_active_worker_publishes_snapshot_without_moving_open_staging_file(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    claim = store.claim_worker(run["run_id"], lease_seconds=60)
+    claimed = store.for_worker_claim(claim.claim_token)
+    artifact_dir = Path(run["artifact_dir"])
+    workspace = claimed.stage_artifact_dir(artifact_dir, "classify")
+    source = workspace / "classification_partial_audit" / "g1_batch.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"generation": 1}\n', encoding="utf-8")
+    target = artifact_dir / "classification_partial_audit" / source.name
+
+    claimed.publish_worker_files(run["run_id"], [(source, target)])
+
+    assert source.read_text(encoding="utf-8") == '{"generation": 1}\n'
+    assert target.read_text(encoding="utf-8") == '{"generation": 1}\n'
+
+
+def test_unfenced_stale_worker_cannot_publish_over_new_claim(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    first = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=10_000,
+    )
+    stale_worker_store = store.for_worker_claim(first.claim_token)
+    second = store.claim_worker(
+        run["run_id"], lease_seconds=60, now_ms=70_000,
+    )
+
+    # This is the old service call shape: without a matching worker token it
+    # must not publish or clear the newer owner.
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        store.update_manifest(
+            run["run_id"], {"writer": "stale-first"},
+            stage="review_ready", status="review_ready",
+        )
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        stale_worker_store.update_manifest(
+            run["run_id"], {"writer": "tokened-stale-first"},
+            stage="review_ready", status="review_ready",
+        )
+
+    current = store.get(run["run_id"])
+    assert first.claim_token != second.claim_token
+    assert current["status"] == "running"
+    assert current["worker_claim_token"] == second.claim_token
+    assert current["manifest_json"] == "{}"
+
+
+@pytest.mark.parametrize("status", ["review_ready", "verified"])
+def test_terminal_run_cannot_be_claimed(tmp_path, valid_topic_spec, status):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(valid_topic_spec, 1234)
+    store.update_status(run["run_id"], status, stage=status)
+
+    claim = store.claim_worker(run["run_id"], lease_seconds=60, now_ms=10_000)
+
+    assert claim.claimed is False
+    assert claim.reason == "run_not_recoverable"

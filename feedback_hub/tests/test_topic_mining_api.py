@@ -5,8 +5,11 @@ from fastapi.testclient import TestClient
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,12 +57,262 @@ def _artifact_client(tmp_path, *, status: str, artifacts: dict[str, bytes]):
 def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatch):
     import feedback_hub.topic_mining.api as api
     started = []
-    monkeypatch.setattr(api, "start_run_async", started.append)
+    def start(run_id, **_kwargs):
+        started.append(run_id)
+        return SimpleNamespace(scheduled=True, reason="scheduled")
+    monkeypatch.setattr(api, "start_run_async", start)
     client = _client(tmp_path)
     first = client.post("/api/topic-mining/runs", json=_spec()).json()
     second = client.post("/api/topic-mining/runs", json=_spec()).json()
     assert first["run_id"] == second["run_id"]
+    assert first["scheduled"] is True
+    assert second["scheduled"] is False
     assert started == [first["run_id"]]
+
+
+def _resume_client(tmp_path, monkeypatch, *, status="pending", claim_now_ms=None):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(
+        data_dir=tmp_path / "data", worker_lease_seconds=60,
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    if status != "pending":
+        store.update_status(run["run_id"], status, stage=status)
+    if claim_now_ms is not None:
+        store.claim_worker(
+            run["run_id"], lease_seconds=config.worker_lease_seconds,
+            now_ms=claim_now_ms,
+        )
+    started = []
+
+    class DeferredThread:
+        def __init__(self, *, target, kwargs, daemon):
+            self.target = target
+            self.kwargs = kwargs
+            self.daemon = daemon
+
+        def start(self):
+            started.append(self.kwargs["run_id"])
+
+    monkeypatch.setattr(api.threading, "Thread", DeferredThread)
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+    return TestClient(app), store, run, started
+
+
+@pytest.mark.parametrize("status", ["pending", "paused_quota_exhausted", "failed"])
+def test_resume_claims_recoverable_run_and_schedules_once(
+    tmp_path, monkeypatch, status,
+):
+    client, store, run, started = _resume_client(
+        tmp_path, monkeypatch, status=status,
+    )
+
+    first = client.post(f"/api/topic-mining/runs/{run['run_id']}/resume")
+    second = client.post(f"/api/topic-mining/runs/{run['run_id']}/resume")
+
+    assert first.status_code == 200
+    assert first.json()["scheduled"] is True
+    assert second.status_code == 409
+    assert second.json()["detail"] == "worker_already_claimed"
+    assert started == [run["run_id"]]
+    assert store.get(run["run_id"])["status"] == "running"
+
+
+def test_resume_rejects_fresh_running_and_recovers_stale_running(
+    tmp_path, monkeypatch,
+):
+    fresh_client, _, fresh_run, fresh_started = _resume_client(
+        tmp_path / "fresh", monkeypatch, claim_now_ms=int(time.time() * 1000),
+    )
+    fresh = fresh_client.post(
+        f"/api/topic-mining/runs/{fresh_run['run_id']}/resume",
+    )
+    assert fresh.status_code == 409
+    assert fresh.json()["detail"] == "worker_already_claimed"
+    assert fresh_started == []
+
+    stale_client, _, stale_run, stale_started = _resume_client(
+        tmp_path / "stale", monkeypatch, claim_now_ms=1,
+    )
+    stale = stale_client.post(
+        f"/api/topic-mining/runs/{stale_run['run_id']}/resume",
+    )
+    assert stale.status_code == 200
+    assert stale.json()["scheduled"] is True
+    assert stale_started == [stale_run["run_id"]]
+
+
+def test_thread_start_failure_releases_claim_for_immediate_recovery(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=60)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    starts = []
+
+    class FailingThenDeferredThread:
+        def __init__(self, *, target, kwargs, daemon):
+            self.kwargs = kwargs
+
+        def start(self):
+            starts.append(self.kwargs["run_id"])
+            if len(starts) == 1:
+                raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(api.threading, "Thread", FailingThenDeferredThread)
+
+    first = api.start_run_async(run["run_id"], store=store, config=config)
+    failed = store.get(run["run_id"])
+    second = api.start_run_async(run["run_id"], store=store, config=config)
+
+    assert first.scheduled is False
+    assert first.reason == "worker_start_failed"
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_start_failed"
+    assert failed["error_message"] == "topic worker could not start"
+    assert failed["worker_claim_token"] is None
+    assert second.scheduled is True
+    assert starts == [run["run_id"], run["run_id"]]
+
+
+def test_create_reports_persisted_worker_start_failure(tmp_path, monkeypatch):
+    import feedback_hub.topic_mining.api as api
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(api.threading, "Thread", FailingThread)
+
+    response = _client(tmp_path).post("/api/topic-mining/runs", json=_spec())
+
+    assert response.status_code == 200
+    assert response.json()["scheduled"] is False
+    assert response.json()["status"] == "failed"
+    assert response.json()["error_code"] == "worker_start_failed"
+    assert response.json()["error_message"] == "topic worker could not start"
+
+
+def test_thread_construction_failure_is_persisted_and_recoverable(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=60)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+
+    class ConstructionFailure:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("cannot construct worker")
+
+    monkeypatch.setattr(api.threading, "Thread", ConstructionFailure)
+
+    result = api.start_run_async(run["run_id"], store=store, config=config)
+
+    failed = store.get(run["run_id"])
+    assert result.scheduled is False
+    assert result.reason == "worker_start_failed"
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_start_failed"
+    assert failed["worker_claim_token"] is None
+
+
+def test_heartbeat_start_failure_persists_failure_and_releases_claim(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=60)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=config.worker_lease_seconds,
+    )
+    ran_job = []
+
+    class FailingHeartbeatThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("heartbeat unavailable")
+
+    monkeypatch.setattr(api.threading, "Thread", FailingHeartbeatThread)
+    monkeypatch.setattr(api, "run_topic_job", lambda *_args, **_kwargs: ran_job.append(True))
+
+    api._run_claimed_job(
+        run_id=run["run_id"], store=store, config=config,
+        claim_token=claim.claim_token,
+    )
+
+    failed = store.get(run["run_id"])
+    assert ran_job == []
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_heartbeat_start_failed"
+    assert failed["error_message"] == "topic worker heartbeat could not start"
+    assert failed["worker_claim_token"] is None
+
+
+def test_heartbeat_renewal_failure_cancels_stale_pipeline_publication(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data", worker_lease_seconds=1)
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(validate_topic_spec(_spec()), 123)
+    claim = store.claim_worker(
+        run["run_id"], lease_seconds=config.worker_lease_seconds,
+    )
+
+    def renew_failure(*_args, **_kwargs):
+        raise sqlite3.OperationalError("temporary renewal failure")
+
+    def delayed_stale_publish(run_id, *, store, config):
+        del config
+        time.sleep(0.45)
+        store.update_manifest(
+            run_id, {"writer": "stale-worker"},
+            stage="review_ready", status="review_ready",
+        )
+
+    monkeypatch.setattr(store, "renew_worker_claim", renew_failure)
+    monkeypatch.setattr(api, "run_topic_job", delayed_stale_publish)
+
+    api._run_claimed_job(
+        run_id=run["run_id"], store=store, config=config,
+        claim_token=claim.claim_token,
+    )
+
+    failed = store.get(run["run_id"])
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "worker_heartbeat_lost"
+    assert failed["worker_claim_token"] is None
+    assert failed["manifest_json"] == "{}"
+
+
+@pytest.mark.parametrize("status", ["review_ready", "verified"])
+def test_resume_rejects_nonrecoverable_run_with_conflict(
+    tmp_path, monkeypatch, status,
+):
+    client, _, run, started = _resume_client(
+        tmp_path, monkeypatch, status=status,
+    )
+
+    response = client.post(f"/api/topic-mining/runs/{run['run_id']}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "run_not_recoverable"
+    assert started == []
 
 
 def test_api_token_is_required_when_configured(tmp_path):
@@ -76,7 +329,7 @@ def test_artifact_name_is_allowlisted(tmp_path):
 
 def test_all_routes_require_configured_token_and_missing_run_is_404(tmp_path):
     client = _client(tmp_path, token="top-secret")
-    for method, path in [("get", "/api/topic-mining/capabilities"), ("post", "/api/topic-mining/runs"), ("get", "/api/topic-mining/runs/nope"), ("get", "/api/topic-mining/runs/nope/review-queue"), ("post", "/api/topic-mining/runs/nope/overrides"), ("post", "/api/topic-mining/runs/nope/verify"), ("post", "/api/topic-mining/runs/nope/export"), ("get", "/api/topic-mining/runs/nope/artifacts/safe.jsonl")]:
+    for method, path in [("get", "/api/topic-mining/capabilities"), ("post", "/api/topic-mining/runs"), ("get", "/api/topic-mining/runs/nope"), ("post", "/api/topic-mining/runs/nope/resume"), ("get", "/api/topic-mining/runs/nope/review-queue"), ("post", "/api/topic-mining/runs/nope/overrides"), ("post", "/api/topic-mining/runs/nope/verify"), ("post", "/api/topic-mining/runs/nope/export"), ("get", "/api/topic-mining/runs/nope/artifacts/safe.jsonl")]:
         response = getattr(client, method)(path, **({"json": {}} if method == "post" else {}))
         assert response.status_code == 401
     assert client.get("/api/topic-mining/runs/nope", headers={"Authorization": "Bearer top-secret"}).status_code == 404

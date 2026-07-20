@@ -276,6 +276,7 @@ def run_pauseable_model_jobs(
     output_path: str | Path,
     concurrency_per_route: int = 4,
     resume: bool = False,
+    progress_callback: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not routes:
         raise ValueError("at least one model route is required")
@@ -309,6 +310,8 @@ def run_pauseable_model_jobs(
         "completed": len(records),
         "remaining": len(jobs) - len(records),
     })
+    if progress_callback is not None:
+        progress_callback()
 
     max_workers = len(routes) * concurrency_per_route
     with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
@@ -356,6 +359,11 @@ def run_pauseable_model_jobs(
                     checkpoint.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                     checkpoint.flush()
                     os.fsync(checkpoint.fileno())
+                if batch_results and progress_callback is not None:
+                    # Publish the fsync'd checkpoint before scheduling more
+                    # work. A lost worker claim therefore cannot spend model
+                    # quota beyond its last durably fenced batch.
+                    progress_callback()
                 submit_available()
 
     ordered_records = [records[index] for index, _key, _payload in jobs if index in records]
@@ -392,6 +400,8 @@ def run_pauseable_model_jobs(
             "quota_response_excerpt": _redact_secrets(quota_error.response_excerpt, secrets),
         })
     _write_json_atomic(state_path, stats)
+    if progress_callback is not None:
+        progress_callback()
     return rows, stats
 
 

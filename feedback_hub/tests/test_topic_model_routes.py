@@ -172,6 +172,48 @@ def test_pauseable_scheduler_resume_skips_validated_checkpoint_rows(tmp_path) ->
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 3
 
 
+def test_pauseable_scheduler_publishes_each_safe_checkpoint_before_more_work(tmp_path) -> None:
+    jobs = [(index, f"j{index}", {"value": index}) for index in range(3)]
+    output_path = tmp_path / "rows.jsonl"
+    calls: list[str] = []
+
+    def worker(index, key, payload, route):
+        calls.append(key)
+        return {"key": key, "value": payload["value"]}, None
+
+    def stop_after_first_checkpoint() -> None:
+        checkpoint = output_path.with_suffix(
+            output_path.suffix + ".checkpoint.jsonl"
+        )
+        if checkpoint.exists() and len(checkpoint.read_text(encoding="utf-8").splitlines()) == 1:
+            raise RuntimeError("simulated_worker_loss")
+
+    with pytest.raises(RuntimeError, match="simulated_worker_loss"):
+        run_pauseable_model_jobs(
+            jobs,
+            worker,
+            routes=[_route()],
+            output_path=output_path,
+            concurrency_per_route=1,
+            progress_callback=stop_after_first_checkpoint,
+        )
+
+    assert calls == ["j0"]
+    calls.clear()
+    rows, stats = run_pauseable_model_jobs(
+        jobs,
+        worker,
+        routes=[_route()],
+        output_path=output_path,
+        concurrency_per_route=1,
+        resume=True,
+    )
+
+    assert calls == ["j1", "j2"]
+    assert [row["key"] for row in rows] == ["j0", "j1", "j2"]
+    assert stats["resumed"] == 1
+
+
 def test_pauseable_scheduler_redacts_route_credentials_from_rows(tmp_path) -> None:
     route = _route()
 

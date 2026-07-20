@@ -230,3 +230,40 @@ def test_missing_route_credentials_fails_before_scheduling(tmp_path, valid_topic
     route = ModelRoute("classifier", "openai_compatible", "", "", "")
     with pytest.raises(ValueError, match="api_url"):
         classify_candidates(valid_topic_spec, [recall("a")], artifact_dir=tmp_path, routes=[route], config=TopicMiningConfig())
+
+
+def test_claim_cancellation_stops_new_model_calls_and_final_artifact_write(
+    tmp_path, valid_topic_spec,
+):
+    calls = []
+    cancelled = False
+
+    def cancel_check():
+        if cancelled:
+            raise RuntimeError("worker_claim_lost")
+
+    def first_call_then_cancel(_prompt, *, route, **_kwargs):
+        nonlocal cancelled
+        calls.append(route.name)
+        cancelled = True
+        return json.dumps({"results": [{
+            "item_id": "a", "label": "matched", "confidence": 0.9,
+            "evidence": ["工具栏一直显示"], "reason": "符合",
+            "needs_review": False,
+        }]})
+
+    with pytest.raises(RuntimeError, match="worker_claim_lost"):
+        classify_candidates(
+            valid_topic_spec,
+            [recall("a"), recall("b", "全屏时工具栏仍然显示")],
+            artifact_dir=tmp_path,
+            routes=[_route()],
+            config=TopicMiningConfig(
+                classifier_batch_size=1, classifier_concurrency=1,
+            ),
+            call_fn=first_call_then_cancel,
+            cancel_check=cancel_check,
+        )
+
+    assert calls == ["classifier"]
+    assert not (tmp_path / "classified.jsonl").exists()

@@ -222,6 +222,7 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
         "validate_topic_spec.py",
         "`create-run --spec file`",
         "`get-run run_id`",
+        "`resume run_id`",
         "`review-queue run_id --output file`",
         "`apply-overrides run_id --file file`",
         "`verify run_id`",
@@ -250,6 +251,7 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
         "python3 scripts/validate_topic_spec.py TOPIC_SPEC_PATH",
         "python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH",
         "python3 scripts/topic_backend_client.py get-run RUN_ID",
+        "python3 scripts/topic_backend_client.py resume RUN_ID",
         "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PATH",
         "python3 scripts/topic_backend_client.py apply-overrides RUN_ID --file OVERRIDES_PATH",
         "python3 scripts/topic_backend_client.py verify RUN_ID",
@@ -258,6 +260,35 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
     )
     positions = [text.index(command) for command in commands]
     assert positions == sorted(positions)
+
+
+def test_skill_requires_repair_then_resume_of_the_original_recoverable_run():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8").lower()
+
+    for text in (skill, contract):
+        assert "paused_quota_exhausted" in text
+        assert "failed" in text
+        assert "resume run_id" in text
+        assert "original run" in text
+        assert "do not create a replacement run" in text
+
+
+def test_backend_contract_keeps_internal_artifacts_out_of_download_contract():
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "backend-internal" in contract
+    assert "never available through artifact download" in contract
+    assert "only verified final deliverables" in contract
+    for name in (
+        "final_results.jsonl", "quality_report.json", "feedback_list.xlsx",
+    ):
+        assert name in contract
+    assert "the run may expose `source_snapshot.sqlite`" not in contract
 
 
 def test_client_download_uses_atomic_replace(tmp_path, monkeypatch):
@@ -421,6 +452,40 @@ def test_client_rejects_unsafe_run_ids_before_building_a_url(monkeypatch, unsafe
     assert not requested
 
 
+def test_client_resume_uses_token_post_route_and_redacts_http_error(monkeypatch):
+    token = "resume-secret"
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", token)
+    module = _load_client_module()
+    requested = []
+
+    def raising_urlopen(request, *, timeout):
+        requested.append(
+            (request.get_method(), request.full_url, request.get_header("Authorization"), timeout)
+        )
+        raise module.urllib.error.HTTPError(
+            request.full_url,
+            409,
+            "conflict",
+            {},
+            io.BytesIO(f'{{"detail":"failed {token}"}}'.encode()),
+        )
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", raising_urlopen)
+    code, _, stderr = _run_client(
+        module, ["--base-url", "https://topic.internal", "resume", "run-1"],
+    )
+
+    assert code == 3
+    assert requested == [(
+        "POST",
+        "https://topic.internal/api/topic-mining/runs/run-1/resume",
+        f"Bearer {token}",
+        30,
+    )]
+    assert token not in stderr
+    assert "[REDACTED]" in stderr
+
+
 @pytest.mark.parametrize("unsafe", ["..", "a/b", r"a\\b", "file?x", "file#x", "%2F", "file\x1f.xlsx"])
 def test_client_rejects_unsafe_artifact_names_before_building_a_url(tmp_path, monkeypatch, unsafe):
     module = _load_client_module()
@@ -535,6 +600,7 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ["capabilities"],
         ["create-run", "--spec", str(spec_path)],
         ["get-run", "run-1"],
+        ["resume", "run-1"],
         ["review-queue", "run-1", "--output", str(review_output)],
         ["apply-overrides", "run-1", "--file", str(overrides_path)],
         ["verify", "run-1"],
@@ -549,6 +615,7 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs", json.dumps(valid_spec(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/resume", None, 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1/review-queue", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/overrides", b"[]", 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/verify", None, 30),

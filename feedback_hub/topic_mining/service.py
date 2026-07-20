@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from urllib.parse import urlparse
 from dataclasses import asdict
@@ -35,6 +36,14 @@ _MANIFEST_VERSION = 2
 _UNRESOLVED_KEYS = (
     "unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids",
     "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items",
+)
+_CLASSIFICATION_WORK_FILES = (
+    "classification_batches.jsonl",
+    "classification_batches.jsonl.checkpoint.jsonl",
+    "classification_batches.jsonl.failures.jsonl",
+    "classification_batches.jsonl.run_state.json",
+    "classification_audit.jsonl",
+    "classified.jsonl",
 )
 
 
@@ -108,9 +117,17 @@ def _run_pipeline(
 
     snapshot_path = artifact_dir / "source_snapshot.sqlite"
     if not _stage_valid(manifest, "snapshot", artifact_dir):
-        snapshot = create_source_snapshot(config.source_db_path, snapshot_path)
+        _ensure_worker_active(run_id, store)
+        snapshot_workspace = _stage_workspace(store, artifact_dir, "snapshot")
+        staged_snapshot_path = snapshot_workspace / snapshot_path.name
+        snapshot = create_source_snapshot(config.source_db_path, staged_snapshot_path)
+        _ensure_worker_active(run_id, store)
+        _promote_stage_files(
+            run_id, store, artifact_dir, snapshot_workspace,
+            [snapshot_path.name],
+        )
         snapshot_data = asdict(snapshot)
-        snapshot_data["path"] = str(snapshot.path)
+        snapshot_data["path"] = str(snapshot_path)
         manifest.update({
             "source_snapshot": snapshot_data,
             "source_watermark_ms": snapshot.max_ts_ms,
@@ -123,11 +140,21 @@ def _run_pipeline(
     scoped_path = artifact_dir / "scoped_items.jsonl"
     contexts_path = artifact_dir / "item_contexts.json"
     if not _stage_valid(manifest, "hard_scope", artifact_dir):
+        _ensure_worker_active(run_id, store)
         items = fetch_scoped_items(snapshot_path, spec)
         contexts = build_item_contexts(items, spec.unit, window_ms=1_800_000)
-        _write_jsonl(scoped_path, items)
-        _atomic_json(contexts_path, contexts)
+        _ensure_worker_active(run_id, store)
+        scope_workspace = _stage_workspace(store, artifact_dir, "hard_scope")
+        _write_jsonl(scope_workspace / scoped_path.name, items)
+        _atomic_json(scope_workspace / contexts_path.name, contexts)
+        _promote_stage_files(
+            run_id, store, artifact_dir, scope_workspace,
+            [scoped_path.name, contexts_path.name],
+        )
         manifest["hard_scope"] = {"item_count": len(items), "unit": spec.unit}
+        # Clear only the failure owned by this stage after the repaired stage
+        # has produced valid outputs. Other unresolved failures remain intact.
+        manifest["unresolved_coverage_items"] = 0
         _checkpoint(run_id, store, artifact_dir, manifest, "hard_scope", [scoped_path, contexts_path])
     items = _read_jsonl(scoped_path)
     contexts = _read_json(contexts_path, {})
@@ -135,20 +162,29 @@ def _run_pipeline(
     recall_path = artifact_dir / "recall_candidates.jsonl"
     recall_manifest_path = artifact_dir / "recall_manifest.json"
     if not _stage_valid(manifest, "hybrid_recall", artifact_dir):
+        _ensure_worker_active(run_id, store)
         client = vector_client or HttpVectorSearchClient(config)
         capabilities = client.capabilities()
         if spec.unit not in capabilities.supported_units:
             raise ValueError("vector_index_unsupported_unit")
         result = client.search(build_semantic_queries(spec), build_vector_filters(spec), config.vector_top_k)
+        _ensure_worker_active(run_id, store)
+        recall_workspace = _stage_workspace(store, artifact_dir, "hybrid_recall")
         plan = hybrid_recall(
-            items, spec, vector_hits=result.hits, config=config, artifact_dir=artifact_dir,
+            items, spec, vector_hits=result.hits, config=config, artifact_dir=recall_workspace,
             source_watermark_ms=source_watermark_ms, vector_watermark_ms=result.watermark_ts_ms,
+        )
+        _ensure_worker_active(run_id, store)
+        _promote_stage_files(
+            run_id, store, artifact_dir, recall_workspace,
+            [recall_path.name, recall_manifest_path.name],
         )
         manifest.update({
             "vector_watermark_ms": result.watermark_ts_ms,
             "vector_index": result.index,
             "hybrid_recall": {"candidate_count": len(plan.candidates), "rejected_out_of_scope_ids": list(plan.rejected_out_of_scope_ids)},
             "retrieval_config": _safe_config(config),
+            "unresolved_vector_items": 0,
         })
         _checkpoint(run_id, store, artifact_dir, manifest, "hybrid_recall", [recall_path, recall_manifest_path])
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
@@ -157,12 +193,37 @@ def _run_pipeline(
     audit_path = artifact_dir / "classification_audit.jsonl"
     classifications_rebuilt = False
     if not _stage_valid(manifest, "classify", artifact_dir):
+        _ensure_worker_active(run_id, store)
         resume_classification = _classification_resume_safe(manifest, artifact_dir)
+        classify_workspace = _stage_workspace(store, artifact_dir, "classify")
         if not resume_classification:
-            _purge_classification_checkpoints(artifact_dir)
+            _purge_classification_checkpoints(classify_workspace)
+        _seed_classification_workspace(
+            artifact_dir,
+            classify_workspace,
+            resume=resume_classification,
+            preserve_audit=_classification_output_safe(
+                manifest, artifact_dir, "classification_audit.jsonl",
+            ),
+            partial_audits=_authenticated_classification_partials(
+                manifest, artifact_dir,
+            ),
+        )
         results, stats = classify_candidates(
-            spec, recalls, artifact_dir=artifact_dir, contexts=contexts, routes=classifier_routes,
+            spec, recalls, artifact_dir=classify_workspace, contexts=contexts, routes=classifier_routes,
             config=config, resume=resume_classification, call_fn=classifier_call_fn,
+            cancel_check=lambda: _ensure_worker_active(run_id, store),
+            progress_callback=lambda: _publish_classification_progress(
+                run_id, store, artifact_dir, classify_workspace, manifest,
+            ),
+        )
+        _ensure_worker_active(run_id, store)
+        _promote_stage_files(
+            run_id, store, artifact_dir, classify_workspace,
+            [
+                name for name in _CLASSIFICATION_WORK_FILES
+                if (classify_workspace / name).is_file()
+            ],
         )
         manifest["classifier"] = _safe_json(stats)
         manifest["classifier"].update(_classification_quality(audit_path))
@@ -183,11 +244,18 @@ def _run_pipeline(
 
     queue_path = artifact_dir / "review_queue.jsonl"
     overrides_path = artifact_dir / "review_overrides.jsonl"
-    if not overrides_path.exists():
-        _write_jsonl(overrides_path, [])
     if classifications_rebuilt or not _stage_valid(manifest, "review_queue", artifact_dir):
+        _ensure_worker_active(run_id, store)
         queue = build_review_queue(run_id, classifications, {row.item_id: row for row in recalls})
-        persist_review_artifacts(artifact_dir, queue, _read_jsonl(overrides_path))
+        review_workspace = _stage_workspace(store, artifact_dir, "review_queue")
+        persist_review_artifacts(
+            review_workspace, queue,
+            _read_jsonl(overrides_path) if overrides_path.exists() else [],
+        )
+        _promote_stage_files(
+            run_id, store, artifact_dir, review_workspace,
+            [queue_path.name, overrides_path.name],
+        )
         manifest["review_queue"] = {"item_count": len(queue)}
         _checkpoint(run_id, store, artifact_dir, manifest, "review_queue", [queue_path, overrides_path])
 
@@ -197,7 +265,14 @@ def _run_pipeline(
     manifest.setdefault("unresolved_parser_items", 0)
     for key in _UNRESOLVED_KEYS:
         manifest.setdefault(key, 0)
-    _atomic_json(artifact_dir / "review_ready.json", {"classification_count": len(classifications), "queue_count": len(_read_jsonl(queue_path))})
+    _ensure_worker_active(run_id, store)
+    review_ready_path = artifact_dir / "review_ready.json"
+    ready_workspace = _stage_workspace(store, artifact_dir, "review_ready")
+    _atomic_json(ready_workspace / review_ready_path.name, {"classification_count": len(classifications), "queue_count": len(_read_jsonl(queue_path))})
+    _promote_stage_files(
+        run_id, store, artifact_dir, ready_workspace,
+        [review_ready_path.name],
+    )
     _checkpoint(run_id, store, artifact_dir, manifest, "review_ready", [queue_path, overrides_path])
     _set_status(run_id, store, "review_ready", stage="review_ready")
 
@@ -485,7 +560,7 @@ def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest:
         artifacts[path.name] = _sha256(path)
     if stage not in _STAGES:
         manifest["stage"] = stage
-        _atomic_json(artifact_dir / "manifest.json", manifest)
+        _write_manifest_mirror(run_id, store, artifact_dir, manifest)
         store.update_manifest(run_id, manifest, stage=stage)
         return
     input_names, output_names = _stage_contract_names(stage, artifact_dir)
@@ -504,7 +579,7 @@ def _checkpoint(run_id: str, store: TopicRunStore, artifact_dir: Path, manifest:
     funnel[stage + "_count"] = output_count
     manifest["manifest_version"] = _MANIFEST_VERSION
     manifest["stage"] = stage
-    _atomic_json(artifact_dir / "manifest.json", manifest)
+    _write_manifest_mirror(run_id, store, artifact_dir, manifest)
     store.update_manifest(run_id, manifest, stage=stage)
 
 
@@ -516,9 +591,13 @@ def _checkpoint_attempt(run_id: str, store: TopicRunStore, artifact_dir: Path, m
     inputs, _ = _stage_contract_names(stage, artifact_dir)
     names = ("classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl", "classification_batches.jsonl.run_state.json", "classification_batches.jsonl.failures.jsonl", "classification_audit.jsonl", "classified.jsonl")
     outputs = {name: _sha256(artifact_dir / name) for name in names if (artifact_dir / name).is_file()}
+    partial_dir = artifact_dir / "classification_partial_audit"
+    if partial_dir.is_dir():
+        for path in sorted(partial_dir.glob("*.json")):
+            outputs[str(path.relative_to(artifact_dir))] = _sha256(path)
     manifest.setdefault("stage_attempts", {})[stage] = {"inputs": {name: _sha256(artifact_dir / name) for name in inputs}, "outputs": outputs, "input_count": _stage_input_count(stage, artifact_dir), "complete": False}
     manifest["stage"] = stage
-    _atomic_json(artifact_dir / "manifest.json", manifest)
+    _write_manifest_mirror(run_id, store, artifact_dir, manifest)
     store.update_manifest(run_id, manifest, stage=stage)
 
 
@@ -565,9 +644,7 @@ def _stage_valid(manifest: Mapping[str, Any], stage: str, artifact_dir: Path) ->
 
 def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path) -> bool:
     """Only reuse scheduler checkpoints when the exact classifier inputs match."""
-    attempts = manifest.get("stage_attempts", {}) if isinstance(manifest.get("stage_attempts"), Mapping) else {}
-    attempt_record = attempts.get("classify")
-    record = attempt_record or (manifest.get("stages", {}).get("classify") if isinstance(manifest.get("stages"), Mapping) else None)
+    attempt_record, record = _classification_records(manifest)
     if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
         return False
     required_inputs = {"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}
@@ -579,21 +656,79 @@ def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path)
             return False
     # classified can be absent: scheduler checkpoint may safely reconstruct it.
     for name, expected in record["outputs"].items():
-        if name == "classified.jsonl":
+        normalized_name = str(name)
+        if normalized_name == "classified.jsonl":
             continue
-        path = artifact_dir / name
-        if not path.is_file() or _sha256(path) != expected:
+        if not _classification_output_name_safe(normalized_name):
+            return False
+        path = artifact_dir / normalized_name
+        if not isinstance(expected, str) or not path.is_file() or _sha256(path) != expected:
             return False
     if attempt_record is not None:
         required_attempt_outputs = {
             "classification_batches.jsonl.checkpoint.jsonl",
             "classification_batches.jsonl.run_state.json",
-            "classification_batches.jsonl.failures.jsonl",
-            "classification_audit.jsonl",
         }
         if attempt_record.get("complete") is not False or not required_attempt_outputs <= set(record["outputs"]):
             return False
     return True
+
+
+def _classification_records(
+    manifest: Mapping[str, Any],
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    attempts = manifest.get("stage_attempts", {}) if isinstance(manifest.get("stage_attempts"), Mapping) else {}
+    attempt = attempts.get("classify")
+    stages = manifest.get("stages", {}) if isinstance(manifest.get("stages"), Mapping) else {}
+    stage = stages.get("classify")
+    return (
+        attempt if isinstance(attempt, Mapping) else None,
+        attempt if isinstance(attempt, Mapping) else stage if isinstance(stage, Mapping) else None,
+    )
+
+
+def _classification_output_name_safe(name: str) -> bool:
+    if name in _CLASSIFICATION_WORK_FILES:
+        return True
+    parts = Path(name).parts
+    return (
+        len(parts) == 2
+        and parts[0] == "classification_partial_audit"
+        and parts[1].endswith(".json")
+        and parts[1] not in {".json", "..json"}
+    )
+
+
+def _classification_output_safe(
+    manifest: Mapping[str, Any],
+    artifact_dir: Path,
+    name: str,
+) -> bool:
+    _attempt, record = _classification_records(manifest)
+    outputs = record.get("outputs") if isinstance(record, Mapping) else None
+    expected = outputs.get(name) if isinstance(outputs, Mapping) else None
+    path = artifact_dir / name
+    return (
+        _classification_output_name_safe(name)
+        and isinstance(expected, str)
+        and path.is_file()
+        and _sha256(path) == expected
+    )
+
+
+def _authenticated_classification_partials(
+    manifest: Mapping[str, Any],
+    artifact_dir: Path,
+) -> tuple[str, ...]:
+    _attempt, record = _classification_records(manifest)
+    outputs = record.get("outputs") if isinstance(record, Mapping) else None
+    if not isinstance(outputs, Mapping):
+        return ()
+    return tuple(
+        name for name in sorted(str(value) for value in outputs)
+        if name.startswith("classification_partial_audit/")
+        and _classification_output_safe(manifest, artifact_dir, name)
+    )
 
 
 def _purge_classification_checkpoints(artifact_dir: Path) -> None:
@@ -608,6 +743,115 @@ def _purge_classification_checkpoints(artifact_dir: Path) -> None:
         for child in partial.iterdir():
             child.unlink(missing_ok=True)
         partial.rmdir()
+
+
+def _stage_workspace(store: Any, artifact_dir: Path, stage: str) -> Path:
+    """Return a claim-private workspace when the caller is a leased worker."""
+    factory = getattr(store, "stage_artifact_dir", None)
+    if factory is None:
+        return artifact_dir
+    return Path(factory(artifact_dir, stage))
+
+
+def _promote_stage_files(
+    run_id: str,
+    store: Any,
+    artifact_dir: Path,
+    workspace: Path,
+    names: Sequence[str],
+) -> None:
+    """Publish one worker generation only while its claim remains current."""
+    if workspace == artifact_dir:
+        return
+    _ensure_worker_active(run_id, store)
+    publisher = getattr(store, "publish_worker_files", None)
+    if publisher is None:  # pragma: no cover - paired with _stage_workspace
+        raise RuntimeError("worker artifact publisher unavailable")
+    publisher(
+        run_id,
+        [(workspace / name, artifact_dir / name) for name in names],
+    )
+    shutil.rmtree(workspace, ignore_errors=True)
+
+
+def _publish_classification_progress(
+    run_id: str,
+    store: Any,
+    artifact_dir: Path,
+    workspace: Path,
+    manifest: dict[str, Any],
+) -> None:
+    """Fence each fsync'd model checkpoint without exposing a live file handle."""
+    if workspace == artifact_dir:
+        return
+    _ensure_worker_active(run_id, store)
+    publisher = getattr(store, "publish_worker_files", None)
+    if publisher is None:  # pragma: no cover - paired with _stage_workspace
+        raise RuntimeError("worker artifact publisher unavailable")
+    pairs = [
+        (workspace / name, artifact_dir / name)
+        for name in _CLASSIFICATION_WORK_FILES
+        if (workspace / name).is_file()
+    ]
+    partial_dir = workspace / "classification_partial_audit"
+    if partial_dir.is_dir():
+        pairs.extend(
+            (path, artifact_dir / partial_dir.name / path.name)
+            for path in sorted(partial_dir.glob("*.json"))
+            if path.is_file()
+        )
+    if pairs:
+        publisher(run_id, pairs)
+    # Authenticate each published scheduler checkpoint in the database-backed
+    # manifest. A replacement worker may reuse only this fenced generation.
+    _checkpoint_attempt(
+        run_id, store, artifact_dir, manifest, "classify", (),
+    )
+
+
+def _seed_classification_workspace(
+    artifact_dir: Path,
+    workspace: Path,
+    *,
+    resume: bool,
+    preserve_audit: bool,
+    partial_audits: Sequence[str],
+) -> None:
+    """Copy authenticated audit history and any safely reusable scheduler state."""
+    if workspace == artifact_dir:
+        return
+    # Audit history is append-only evidence and remains valid even when a
+    # missing or mismatched scheduler checkpoint makes batch reuse unsafe.
+    audit_source = artifact_dir / "classification_audit.jsonl"
+    if preserve_audit:
+        shutil.copy2(audit_source, workspace / audit_source.name)
+    for name in partial_audits:
+        source = artifact_dir / name
+        target = workspace / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    if not resume:
+        return
+    for name in _CLASSIFICATION_WORK_FILES:
+        if name == "classification_audit.jsonl":
+            continue
+        source = artifact_dir / name
+        if source.is_file():
+            shutil.copy2(source, workspace / name)
+
+
+def _write_manifest_mirror(
+    run_id: str,
+    store: Any,
+    artifact_dir: Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    """Fence the on-disk manifest mirror with the same claim as the DB row."""
+    workspace = _stage_workspace(store, artifact_dir, "manifest")
+    _atomic_json(workspace / "manifest.json", manifest)
+    _promote_stage_files(
+        run_id, store, artifact_dir, workspace, ["manifest.json"],
+    )
 
 
 def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set[str]]:
@@ -738,7 +982,9 @@ def _record_failure(run_id: str, store: TopicRunStore, exc: Exception, config: T
         manifest["unresolved_coverage_items"] = 1
     if code == "vector_index_stale":
         manifest["unresolved_vector_items"] = 1
-    _atomic_json(Path(run["artifact_dir"]) / "manifest.json", manifest)
+    _write_manifest_mirror(
+        run_id, store, Path(run["artifact_dir"]), manifest,
+    )
     store.update_manifest(run_id, manifest, stage=run["stage"])
     _set_status(run_id, store, "failed", error_code=code, error_message=_redact_message(str(exc), config))
 
@@ -750,6 +996,12 @@ def _set_status(run_id: str, store: TopicRunStore, status: str, *, stage: str | 
         run_id, manifest, stage=stage or run["stage"], status=status,
         error_code=error_code, error_message=error_message,
     )
+
+
+def _ensure_worker_active(run_id: str, store: Any) -> None:
+    checker = getattr(store, "ensure_worker_claim", None)
+    if checker is not None:
+        checker(run_id)
 
 
 def _require_run(run_id: str, store: TopicRunStore) -> dict[str, Any]:

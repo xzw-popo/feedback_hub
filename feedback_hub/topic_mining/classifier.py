@@ -187,10 +187,13 @@ def classify_candidates(
     config: TopicMiningConfig | None = None,
     resume: bool = False,
     call_fn: Callable[..., Any] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    progress_callback: Callable[[], None] | None = None,
     max_retries: int = 4,
     request_timeout: int = 300,
 ) -> tuple[list[ClassificationResult], dict[str, Any]]:
     """Classify recall candidates; only complete validated batches are published."""
+    _check_cancel(cancel_check)
     config = config or TopicMiningConfig()
     if config.classifier_batch_size < 1 or config.classifier_batch_size > 20:
         raise ValueError("classifier_batch_size must be between 1 and 20")
@@ -214,6 +217,7 @@ def classify_candidates(
     route_secrets = tuple(route.credential for route in selected_routes if route.credential)
 
     def worker(_index: int, key: str, payload: dict[str, Any], route: ModelRoute) -> tuple[dict[str, Any], str | None]:
+        _check_cancel(cancel_check)
         batch = payload["candidates"]
         expected_ids = {row["item_id"] for row in batch}
         candidates_by_id = {row["item_id"]: row for row in batch}
@@ -225,10 +229,12 @@ def classify_candidates(
         results: list[ClassificationResult] = []
         call_error: str | None = None
         for attempt in range(2):
+            _check_cancel(cancel_check)
             prompt = build_classification_prompt(spec, batch, contexts=contexts, repair_error=parser_errors[-1] if parser_errors else None)
             try:
                 reply = invoke_model_route(prompt, route=route, call_fn=openai_call, max_retries=max_retries, timeout=request_timeout)
             except QuotaExhaustedError:
+                _check_cancel(cancel_check)
                 # The shared scheduler intentionally does not retain a future
                 # that raises quota. Persist this already-safe partial record
                 # by batch key before re-raising so the main thread can merge
@@ -261,6 +267,7 @@ def classify_candidates(
                     raise
                 call_error = f"{type(exc).__name__}: {exc}"
                 break
+            _check_cancel(cancel_check)
             raw_replies.append(_redact(reply.content, route_secrets))
             attempts += reply.attempts
             elapsed_ms += reply.elapsed_ms
@@ -286,12 +293,15 @@ def classify_candidates(
             audit_id=f"g{audit_generation}:{key}:final:{len(raw_replies)}",
             audit_generation=audit_generation,
         )
+        _check_cancel(cancel_check)
         return row, error
 
     rows, scheduler_stats = run_pauseable_model_jobs(
         jobs, worker, routes=selected_routes, output_path=batches_path,
         concurrency_per_route=config.classifier_concurrency, resume=resume,
+        progress_callback=progress_callback,
     )
+    _check_cancel(cancel_check)
     partial_rows = _read_partial_audit(partial_audit_dir)
     # Audit history is append-only across both new and resumed attempts. A new
     # scheduling attempt may reset checkpoints, but must not erase evidence of
@@ -325,6 +335,11 @@ def _normalize_candidates(candidates: Sequence[RecallHit]) -> list[dict[str, Any
         seen.add(item_id)
         normalized.append({"item_id": item_id, "text": _required_text(item.get("text"), f"candidate {item_id} text")})
     return sorted(normalized, key=lambda row: row["item_id"])
+
+
+def _check_cancel(cancel_check: Callable[[], None] | None) -> None:
+    if cancel_check is not None:
+        cancel_check()
 
 
 def _classification_audit_row(
