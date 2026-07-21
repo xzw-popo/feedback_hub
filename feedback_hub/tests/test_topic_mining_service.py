@@ -370,6 +370,10 @@ def test_claimed_classifier_checkpoint_is_incrementally_authenticated(
     )
 
     persisted = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert set(persisted["stage_attempts"]["classify"]["inputs"]) == {
+        "recall_candidates.jsonl", "recall_manifest.json",
+        "item_contexts.json",
+    }
     assert _classification_resume_safe(persisted, artifact_dir) is True
     assert checkpoint.is_file(), "publishing must not move a scheduler's open file"
     canonical = artifact_dir / checkpoint.name
@@ -691,6 +695,100 @@ def test_run_maps_classifier_quota_pause(tmp_path):
     assert hashlib.sha256(
         (artifact_dir / "source_snapshot.sqlite").read_bytes()
     ).hexdigest() == snapshot_before
+
+
+def test_frozen_selection_quota_recovery_reuses_authenticated_checkpoint(tmp_path):
+    from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute, QuotaExhaustedError
+    from feedback_hub.topic_mining.config import TopicMiningConfig
+    from feedback_hub.topic_mining.service import _classification_resume_safe, run_topic_job
+    from feedback_hub.topic_mining.vector_client import VectorCapabilities, VectorHit, VectorSearchResult
+
+    source = tmp_path / "source.db"
+    _, end = _write_source(source)
+    config = TopicMiningConfig(
+        source_db_path=source,
+        data_dir=tmp_path / "data",
+        vector_api_url="https://vector.test",
+        vector_max_lag_seconds=1_000_000,
+        classifier_batch_size=1,
+        classifier_concurrency=1,
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(_spec(), end)
+
+    class Vector:
+        def capabilities(self): return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
+        def search(self, *_args): return VectorSearchResult(
+            "feedback-items-v1", end,
+            (
+                VectorHit("f1", "objective:0", .9, 1),
+                VectorHit("boundary-a", "objective:0", .8, 2),
+            ),
+        )
+
+    route = ModelRoute("test", "openai_compatible", "https://model.test", "not-a-secret", "test")
+    first_attempt_batches: list[tuple[str, ...]] = []
+
+    def reply_for(item_ids):
+        return ModelReply(json.dumps({"results": [
+            {
+                "item_id": item_id,
+                "label": "matched" if item_id == "f1" else "not_matched",
+                "confidence": .9,
+                "evidence": ["工具栏一直显示"] if item_id == "f1" else [],
+                "reason": "符合" if item_id == "f1" else "不符合",
+                "needs_review": False,
+            }
+            for item_id in item_ids
+        ]}), "test", "openai_compatible", "test", 1, 1, ())
+
+    def quota_after_first(prompt, *, route, **_kwargs):
+        item_ids = tuple(row["item_id"] for row in json.loads(prompt)["candidates"])
+        first_attempt_batches.append(item_ids)
+        if len(first_attempt_batches) == 1:
+            return reply_for(item_ids)
+        raise QuotaExhaustedError(route.name, 429, "quota")
+
+    first_claim = store.claim_worker(run["run_id"], lease_seconds=60)
+    paused = run_topic_job(
+        run["run_id"], store=store.for_worker_claim(first_claim.claim_token),
+        config=config, vector_client=Vector(), classifier_routes=[route],
+        classifier_call_fn=quota_after_first,
+    )
+
+    assert paused["status"] == "paused_quota_exhausted"
+    artifact_dir = Path(run["artifact_dir"])
+    paused_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    attempt = paused_manifest["stage_attempts"]["classify"]
+    assert set(attempt["inputs"]) == {
+        "recall_candidates.jsonl", "recall_manifest.json",
+        "selected_candidates.jsonl", "item_contexts.json",
+    }
+    assert _classification_resume_safe(paused_manifest, artifact_dir) is True
+    audit_before = (artifact_dir / "classification_audit.jsonl").read_text(
+        encoding="utf-8",
+    ).splitlines()
+    completed_ids = set(first_attempt_batches[0])
+    recovery_batches: list[tuple[str, ...]] = []
+
+    def recover_remaining(prompt, **_kwargs):
+        item_ids = tuple(row["item_id"] for row in json.loads(prompt)["candidates"])
+        recovery_batches.append(item_ids)
+        return reply_for(item_ids)
+
+    second_claim = store.claim_worker(run["run_id"], lease_seconds=60)
+    resumed = run_topic_job(
+        run["run_id"], store=store.for_worker_claim(second_claim.claim_token),
+        config=config, vector_client=Vector(), classifier_routes=[route],
+        classifier_call_fn=recover_remaining,
+    )
+
+    assert resumed["status"] == "review_ready"
+    assert completed_ids.isdisjoint({item_id for batch in recovery_batches for item_id in batch})
+    audit_after = (artifact_dir / "classification_audit.jsonl").read_text(
+        encoding="utf-8",
+    ).splitlines()
+    assert set(audit_before) <= set(audit_after)
 
 
 def test_read_jsonl_normalizes_malformed_json(tmp_path):

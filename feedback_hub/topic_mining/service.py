@@ -1158,7 +1158,9 @@ def _classification_resume_safe(manifest: Mapping[str, Any], artifact_dir: Path)
     attempt_record, record = _classification_records(manifest)
     if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
         return False
-    required_inputs = {"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}
+    required_inputs, _required_outputs = _stage_contract_names(
+        "classify", artifact_dir,
+    )
     if set(record["inputs"]) != required_inputs:
         return False
     for name, expected in record["inputs"].items():
