@@ -124,6 +124,17 @@ class ShardStore:
         try:
             with temporary.open("wb") as handle:
                 np.save(handle, vectors.astype(np.float32, copy=False), allow_pickle=False)
+                # The primary NPY member remains the matrix readers memory-map.
+                # A second, ignored NPY member salts the immutable byte payload
+                # with the exact feedback-ID sequence.  Without it, two chunks
+                # containing identical vectors would have the same checksum and
+                # could not represent distinct row offsets in SQLite.
+                identity = (self.model_version + "\0" + "\0".join(feedback_ids)).encode("utf-8")
+                np.save(
+                    handle,
+                    np.frombuffer(hashlib.sha256(identity).digest(), dtype=np.uint8),
+                    allow_pickle=False,
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             checksum = sha256_file(temporary)
