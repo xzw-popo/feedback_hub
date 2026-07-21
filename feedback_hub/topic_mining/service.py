@@ -202,6 +202,7 @@ def _run_pipeline(
 
     recall_path = artifact_dir / "recall_candidates.jsonl"
     recall_manifest_path = artifact_dir / "recall_manifest.json"
+    selected_path = artifact_dir / "selected_candidates.jsonl"
     if not _stage_valid(manifest, "hybrid_recall", artifact_dir):
         _ensure_worker_active(run_id, store)
         client = vector_client or HttpVectorSearchClient(config)
@@ -216,10 +217,18 @@ def _run_pipeline(
             items, spec, vector_hits=result.hits, config=config, artifact_dir=recall_workspace,
             source_watermark_ms=source_watermark_ms, vector_watermark_ms=result.watermark_ts_ms,
         )
+        selected_plan = select_diverse_candidates(
+            plan.candidates,
+            limit=_classification_candidate_limit(spec, config),
+        )
+        _write_jsonl(
+            recall_workspace / selected_path.name,
+            [candidate.to_dict() for candidate in selected_plan],
+        )
         _ensure_worker_active(run_id, store)
         recall_hashes = _promote_stage_files(
             run_id, store, artifact_dir, recall_workspace,
-            [recall_path.name, recall_manifest_path.name],
+            [recall_path.name, recall_manifest_path.name, selected_path.name],
         )
         manifest.update({
             "vector_watermark_ms": result.watermark_ts_ms,
@@ -232,20 +241,21 @@ def _run_pipeline(
             },
             "retrieved_candidate_count": plan.retrieved_candidate_count,
             "recall_pool_count": len(plan.candidates),
+            "selected_candidate_count": len(selected_plan),
             "retrieval_config": _safe_config(config),
             "unresolved_vector_items": 0,
         })
+        manifest.setdefault("funnel", {}).update({
+            "retrieved_candidate_count": plan.retrieved_candidate_count,
+            "recall_pool_count": len(plan.candidates),
+            "selected_candidate_count": len(selected_plan),
+        })
         _checkpoint(
             run_id, store, artifact_dir, manifest, "hybrid_recall",
-            [recall_path, recall_manifest_path], output_hashes=recall_hashes,
+            [recall_path, recall_manifest_path, selected_path], output_hashes=recall_hashes,
         )
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
-    candidate_limit = (
-        config.standard_candidate_limit
-        if spec.mode == "standard"
-        else config.exhaustive_candidate_limit
-    )
-    selected_recalls = select_diverse_candidates(recalls, limit=candidate_limit)
+    selected_recalls = _classification_candidates(manifest, artifact_dir, recalls)
 
     classified_path = artifact_dir / "classified.jsonl"
     audit_path = artifact_dir / "classification_audit.jsonl"
@@ -383,6 +393,11 @@ def submit_review_overrides(
     _require_artifact(manifest, artifact_dir / "item_contexts.json")
     classifications = [_classification_from_dict(row) for row in _read_required_jsonl(artifact_dir / "classified.jsonl", manifest)]
     recalls = [_recall_from_dict(row) for row in _read_required_jsonl(artifact_dir / "recall_candidates.jsonl", manifest)]
+    selected_recalls = _classification_candidates(manifest, artifact_dir, recalls)
+    _require_classification_coverage(classifications, selected_recalls)
+    _require_frozen_candidate_counts(
+        manifest, artifact_dir, recalls, selected_recalls, classifications,
+    )
     contexts = _read_required_json(artifact_dir / "item_contexts.json", manifest)
     spec = validate_topic_spec(json.loads(run["spec_json"]))
     evidence_sources = _authoritative_evidence_sources(recalls, contexts)
@@ -453,12 +468,11 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     recalls = [_recall_from_dict(row) for row in _read_required_jsonl(recall_path, manifest)]
     classifications = [_classification_from_dict(row) for row in _read_required_jsonl(classified_path, manifest)]
     contexts = _read_required_json(contexts_path, manifest)
-    expected = {hit.item_id for hit in recalls}
-    actual = [row.item_id for row in classifications]
-    if len(actual) != len(set(actual)):
-        raise RunVerificationError("duplicate_item_id")
-    if set(actual) != expected:
-        raise RunVerificationError("classification_coverage")
+    selected_recalls = _classification_candidates(manifest, artifact_dir, recalls)
+    _require_classification_coverage(classifications, selected_recalls)
+    _require_frozen_candidate_counts(
+        manifest, artifact_dir, recalls, selected_recalls, classifications,
+    )
     allowed = {row["id"] for row in spec.classification_labels}
     if any(row.label not in allowed for row in classifications):
         raise RunVerificationError("invalid_label")
@@ -536,6 +550,95 @@ def _final_row(
         "source_item": dict(item), "context_texts": list(context_texts), "evidence_source": evidence_source,
         "run_id": run_id, "data_cutoff_ms": data_cutoff_ms,
     }
+
+
+def _classification_candidate_limit(
+    spec: TopicSpec, config: TopicMiningConfig,
+) -> int:
+    return (
+        config.standard_candidate_limit
+        if spec.mode == "standard"
+        else config.exhaustive_candidate_limit
+    )
+
+
+def _classification_candidates(
+    manifest: Mapping[str, Any],
+    artifact_dir: Path,
+    recalls: Sequence[RecallHit],
+) -> list[RecallHit]:
+    """Load the frozen classification boundary, or preserve legacy full recall."""
+    selected_path = artifact_dir / "selected_candidates.jsonl"
+    if not selected_path.is_file():
+        return list(recalls)
+    _require_artifact(manifest, selected_path)
+    selected = [
+        _recall_from_dict(row)
+        for row in _read_required_jsonl(selected_path, manifest)
+    ]
+    recall_by_id = {hit.item_id: hit for hit in recalls}
+    if len(recall_by_id) != len(recalls):
+        raise RunVerificationError("duplicate_item_id")
+    selected_ids = [hit.item_id for hit in selected]
+    if len(selected_ids) != len(set(selected_ids)):
+        raise RunVerificationError("duplicate_item_id")
+    if not set(selected_ids) <= set(recall_by_id):
+        raise RunVerificationError("selected_candidate_not_in_recall_pool")
+    if any(hit != recall_by_id[hit.item_id] for hit in selected):
+        raise RunVerificationError("selected_candidate_mismatch")
+    _require_manifest_count(manifest, "recall_pool_count", len(recalls))
+    _require_manifest_count(manifest, "selected_candidate_count", len(selected))
+    funnel = manifest.get("funnel")
+    if not isinstance(funnel, Mapping):
+        raise RunVerificationError("selected_candidate_count_mismatch")
+    _require_manifest_count(funnel, "recall_pool_count", len(recalls))
+    _require_manifest_count(funnel, "selected_candidate_count", len(selected))
+    return selected
+
+
+def _require_manifest_count(
+    manifest: Mapping[str, Any], key: str, expected: int,
+) -> None:
+    value = manifest.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise RunVerificationError(f"{key}_mismatch")
+
+
+def _require_classification_coverage(
+    classifications: Sequence[ClassificationResult],
+    candidates: Sequence[RecallHit],
+) -> None:
+    expected = {hit.item_id for hit in candidates}
+    actual = [row.item_id for row in classifications]
+    if len(actual) != len(set(actual)):
+        raise RunVerificationError("duplicate_item_id")
+    if set(actual) != expected:
+        raise RunVerificationError("classification_coverage")
+
+
+def _require_frozen_candidate_counts(
+    manifest: Mapping[str, Any],
+    artifact_dir: Path,
+    recalls: Sequence[RecallHit],
+    selected: Sequence[RecallHit],
+    classifications: Sequence[ClassificationResult],
+) -> None:
+    """Require every persisted budget count to agree for frozen selections."""
+    if not (artifact_dir / "selected_candidates.jsonl").is_file():
+        return
+    for values in (manifest, manifest.get("funnel")):
+        if not isinstance(values, Mapping):
+            raise RunVerificationError("classified_count_mismatch")
+        _require_manifest_count(values, "recall_pool_count", len(recalls))
+        _require_manifest_count(values, "selected_candidate_count", len(selected))
+        _require_manifest_count(values, "classified_count", len(classifications))
+        retrieved = values.get("retrieved_candidate_count")
+        if (
+            isinstance(retrieved, bool)
+            or not isinstance(retrieved, int)
+            or retrieved < len(recalls)
+        ):
+            raise RunVerificationError("retrieved_candidate_count_mismatch")
 
 
 def _validate_final_rows(
@@ -1331,6 +1434,12 @@ def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set
         "review_ready": ({"review_queue.jsonl", "review_overrides.jsonl"}, {"review_ready.json"}),
     }
     inputs, outputs = contracts[stage]
+    selected_path = artifact_dir / "selected_candidates.jsonl"
+    if selected_path.is_file():
+        if stage == "hybrid_recall":
+            outputs.add(selected_path.name)
+        elif stage == "classify":
+            inputs.add(selected_path.name)
     if stage == "classify":
         for name in ("classification_batches.jsonl", "classification_batches.jsonl.checkpoint.jsonl", "classification_batches.jsonl.failures.jsonl", "classification_batches.jsonl.run_state.json"):
             if (artifact_dir / name).is_file():
@@ -1359,6 +1468,8 @@ def _stage_input_count(stage: str, artifact_dir: Path) -> int:
         return 0
     if stage == "hard_scope":
         return _snapshot_row_count(artifact_dir)
+    if stage == "classify" and (artifact_dir / "selected_candidates.jsonl").is_file():
+        return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
     previous = _STAGES[_STAGES.index(stage) - 1]
     return _stage_output_count(previous, artifact_dir, {})
 

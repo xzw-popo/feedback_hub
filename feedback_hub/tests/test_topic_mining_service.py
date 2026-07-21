@@ -524,6 +524,7 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
 def test_standard_service_classifies_at_most_five_hundred(tmp_path):
     from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
     from feedback_hub.topic_mining.config import TopicMiningConfig
+    from feedback_hub.topic_mining.export import export_topic_run
     from feedback_hub.topic_mining.service import run_topic_job
     from feedback_hub.topic_mining.vector_client import VectorCapabilities, VectorHit, VectorSearchResult
 
@@ -581,6 +582,47 @@ def test_standard_service_classifies_at_most_five_hundred(tmp_path):
     assert manifest["recall_pool_count"] == 800
     assert manifest["classified_count"] == 500
     assert manifest["selected_candidate_count"] == 500
+    _review_every_queue_item(outcome, store)
+
+    valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    tampered_manifest = json.loads(json.dumps(valid_manifest))
+    tampered_manifest["classified_count"] = 499
+    tampered_manifest["funnel"]["classified_count"] = 499
+    store.update_manifest(run["run_id"], tampered_manifest, stage="review_ready")
+    artifact_dir = Path(run["artifact_dir"])
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(tampered_manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(RunVerificationError, match="classified_count_mismatch"):
+        verify_topic_run(run["run_id"], store=store)
+    store.update_manifest(run["run_id"], valid_manifest, stage="review_ready")
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(valid_manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    assert verify_topic_run(run["run_id"], store=store)["status"] == "verified"
+    assert export_topic_run(run["run_id"], "jsonl", store=store).is_file()
+
+    recall_ids = {
+        json.loads(line)["item_id"]
+        for line in (artifact_dir / "recall_candidates.jsonl").read_text(
+            encoding="utf-8",
+        ).splitlines()
+        if line.strip()
+    }
+    selected_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "selected_candidates.jsonl").read_text(
+            encoding="utf-8",
+        ).splitlines()
+        if line.strip()
+    ]
+    selected_ids = [row["item_id"] for row in selected_rows]
+    assert len(selected_ids) == manifest["selected_candidate_count"]
+    assert len(selected_ids) == len(set(selected_ids))
+    assert set(selected_ids) <= recall_ids
 
 
 def test_run_maps_classifier_quota_pause(tmp_path):
