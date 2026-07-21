@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.service import (
     RunVerificationError,
+    _validate_run_identity,
     submit_review_overrides,
     verify_topic_run,
 )
@@ -66,6 +68,119 @@ def _review_every_queue_item(run: dict, store: TopicRunStore) -> None:
         ],
         store=store,
     )
+
+
+def _pre_mode_identity(spec, source_watermark_ms: int) -> tuple[str, str, str]:
+    raw = spec.to_dict()
+    raw.pop("mode")
+    spec_json = json.dumps(
+        raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    spec_hash = hashlib.sha256(spec_json.encode("utf-8")).hexdigest()
+    run_id = hashlib.sha256(
+        f"{spec_hash}:{source_watermark_ms}".encode("utf-8"),
+    ).hexdigest()[:16]
+    return run_id, spec_hash, spec_json
+
+
+def _replace_persisted_identity(
+    store: TopicRunStore,
+    run: dict,
+    *,
+    run_id: str,
+    spec_hash: str,
+    spec_json: str,
+) -> dict:
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """UPDATE topic_run
+               SET run_id = ?, spec_hash = ?, spec_json = ?
+               WHERE run_id = ?""",
+            (run_id, spec_hash, spec_json, run["run_id"]),
+        )
+    persisted = store.get(run_id)
+    assert persisted is not None
+    return persisted
+
+
+def test_identity_accepts_historic_persisted_mode_less_run(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    source_watermark_ms = 123
+    run = store.create_or_get(_spec(), source_watermark_ms)
+    legacy_run_id, legacy_spec_hash, legacy_spec_json = _pre_mode_identity(
+        _spec(), source_watermark_ms,
+    )
+    persisted = _replace_persisted_identity(
+        store,
+        run,
+        run_id=legacy_run_id,
+        spec_hash=legacy_spec_hash,
+        spec_json=legacy_spec_json,
+    )
+
+    reloaded = validate_topic_spec(json.loads(persisted["spec_json"]))
+
+    assert reloaded.mode == "standard"
+    _validate_run_identity(persisted, reloaded, source_watermark_ms)
+
+
+def test_identity_rejects_explicit_mode_with_historic_hash(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    source_watermark_ms = 123
+    spec = _spec()
+    run = store.create_or_get(spec, source_watermark_ms)
+    legacy_run_id, legacy_spec_hash, _ = _pre_mode_identity(
+        spec, source_watermark_ms,
+    )
+    persisted = _replace_persisted_identity(
+        store,
+        run,
+        run_id=legacy_run_id,
+        spec_hash=legacy_spec_hash,
+        spec_json=json.dumps(
+            spec.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ),
+    )
+
+    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        _validate_run_identity(persisted, spec, source_watermark_ms)
+
+
+def test_identity_rejects_mode_less_run_with_wrong_historic_hash(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    source_watermark_ms = 123
+    spec = _spec()
+    run = store.create_or_get(spec, source_watermark_ms)
+    legacy_run_id, _, legacy_spec_json = _pre_mode_identity(
+        spec, source_watermark_ms,
+    )
+    persisted = _replace_persisted_identity(
+        store,
+        run,
+        run_id=legacy_run_id,
+        spec_hash="forged",
+        spec_json=legacy_spec_json,
+    )
+
+    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        _validate_run_identity(persisted, spec, source_watermark_ms)
+
+
+def test_identity_rejects_new_run_with_forged_hash(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    source_watermark_ms = 123
+    spec = _spec()
+    run = store.create_or_get(spec, source_watermark_ms)
+    persisted = _replace_persisted_identity(
+        store,
+        run,
+        run_id=run["run_id"],
+        spec_hash="forged",
+        spec_json=run["spec_json"],
+    )
+
+    with pytest.raises(RunVerificationError, match="run_identity_mismatch"):
+        _validate_run_identity(persisted, spec, source_watermark_ms)
 
 
 def test_verify_blocks_unresolved_classifier_failure(tmp_path):

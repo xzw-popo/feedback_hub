@@ -657,10 +657,38 @@ def _validate_run_identity(
         f"{expected_hash}:{source_watermark_ms}".encode("utf-8"),
     ).hexdigest()[:16]
     if (
-        persisted_hash != expected_hash
-        or run.get("run_id") != expected_run_id
+        persisted_hash == expected_hash
+        and run.get("run_id") == expected_run_id
     ):
-        raise RunVerificationError("run_identity_mismatch")
+        return
+    if _is_pre_mode_run_identity(run, spec, source_watermark_ms):
+        return
+    raise RunVerificationError("run_identity_mismatch")
+
+
+def _is_pre_mode_run_identity(
+    run: Mapping[str, Any],
+    spec: TopicSpec,
+    source_watermark_ms: int,
+) -> bool:
+    """Accept the exact identity used by canonical specs persisted before mode."""
+    try:
+        raw_spec = json.loads(run["spec_json"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw_spec, Mapping) or "mode" in raw_spec:
+        return False
+    old_canonical = spec.to_dict()
+    old_canonical.pop("mode")
+    old_hash = hashlib.sha256(
+        json.dumps(
+            old_canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8"),
+    ).hexdigest()
+    old_run_id = hashlib.sha256(
+        f"{old_hash}:{source_watermark_ms}".encode("utf-8"),
+    ).hexdigest()[:16]
+    return run.get("spec_hash") == old_hash and run.get("run_id") == old_run_id
 
 
 def _require_review_decisions(
