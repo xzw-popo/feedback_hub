@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,13 @@ case "${1:-}" in
     ;;
   *)
     if [[ "${FAKE_INSTALL_FAIL:-0}" == 1 ]]; then exit 42; fi
+    if [[ -n "${FAKE_ACTIVE_LOCK:-}" ]]; then
+      if ! mkdir "$FAKE_ACTIVE_LOCK" 2>/dev/null; then : > "${FAKE_OVERLAP_MARKER:?}"; fi
+    fi
+    if [[ -n "${FAKE_INSTALL_READY:-}" ]]; then : > "$FAKE_INSTALL_READY"; fi
+    if [[ -n "${FAKE_INSTALL_DELAY:-}" ]]; then sleep "$FAKE_INSTALL_DELAY"; fi
     cp -- "$1" "$state"
+    [[ -z "${FAKE_ACTIVE_LOCK:-}" ]] || rmdir "$FAKE_ACTIVE_LOCK" 2>/dev/null || true
     if [[ "${FAKE_CORRUPT_ONCE:-0}" == 1 && ! -e "${FAKE_CORRUPT_MARKER:?}" ]]; then
       : > "$FAKE_CORRUPT_MARKER"
       printf 'corrupt\\n' > "$state"
@@ -69,6 +77,7 @@ def test_installer_replaces_only_legacy_entry_and_preserves_unrelated_lines(tmp_
         "\n"
         "0 */2 * * * cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 150m --no-sync\n"
         "0 1 * * * cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 30m\n"
+        "# feedback-hub: managed incremental sync\n"
         "*/20 * * * * cd /old && PYTHON_BIN=./.venv/bin/python scripts/feedback_incremental_sync.sh\n"
         "15 4 * * * /opt/other.sh\n"
     )
@@ -80,6 +89,7 @@ def test_installer_replaces_only_legacy_entry_and_preserves_unrelated_lines(tmp_
         f"*/20 * * * * cd '{project.resolve()}' && PYTHON_BIN=./.venv/bin/python scripts/feedback_incremental_sync.sh"
     )
     assert installed.count("feedback_incremental_sync.sh") == 2  # command plus preserved comment
+    assert installed.count("# feedback-hub: managed incremental sync") == 1
     assert installed.count(expected) == 1
     assert "feedback_daily_sync.sh --last 150m --no-sync" not in installed
     assert "feedback_daily_sync.sh --last 30m" in installed
@@ -126,7 +136,10 @@ def test_installer_rolls_back_when_readback_verification_fails(tmp_path):
     assert state.read_text(encoding="utf-8") == existing
 
 
-@pytest.mark.parametrize(("name", "reason"), [("bad'project", "single quote"), ("bad\nproject", "control characters")])
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [("bad'project", "single quote"), ("bad\nproject", "control characters"), ("bad%project", "percent")],
+)
 def test_installer_rejects_single_quote_and_control_characters_in_project_path(tmp_path, name, reason):
     project = tmp_path / name
     (project / "feedback_hub" / "data").mkdir(parents=True)
@@ -162,3 +175,128 @@ def test_installer_is_idempotent_under_two_concurrent_invocations(tmp_path):
     installed = state.read_text(encoding="utf-8")
     assert installed.count("scripts/feedback_incremental_sync.sh") == 1
     assert installed.count("/opt/other.sh") == 1
+
+
+def test_installer_removes_only_exact_managed_and_legacy_jobs(tmp_path):
+    existing = (
+        "# feedback-hub: managed incremental sync\n"
+        "*/20 * * * * cd /old && PYTHON_BIN=./.venv/bin/python scripts/feedback_incremental_sync.sh\n"
+        "0 */2 * * * cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 150m --no-sync\n"
+        "0 */2 * * * cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 150m --no-sync.disabled\n"
+        "0 */2 * * * echo scripts/feedback_daily_sync.sh --last 150m --no-sync\n"
+        "0 */2 * * * cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 150m --no-sync --audit\n"
+        "MAILTO=feedback_incremental_sync.sh\n"
+        "# scripts/feedback_incremental_sync.sh is mentioned here\n"
+    )
+    completed, _project, state = run_installer(tmp_path, existing)
+
+    assert completed.returncode == 0, completed.stderr
+    installed = state.read_text(encoding="utf-8")
+    assert "cd /old && PYTHON_BIN=./.venv/bin/python scripts/feedback_incremental_sync.sh" not in installed
+    assert "cd /opt/feedback_hub && scripts/feedback_daily_sync.sh --last 150m --no-sync\n" not in installed
+    assert "--no-sync.disabled" in installed
+    assert "echo scripts/feedback_daily_sync.sh --last 150m --no-sync" in installed
+    assert "--no-sync --audit" in installed
+    assert "MAILTO=feedback_incremental_sync.sh" in installed
+    assert "# scripts/feedback_incremental_sync.sh is mentioned here" in installed
+
+
+def test_installer_documents_byte_exact_production_entry():
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "*/20 * * * * cd /opt/feedback_hub && "
+        "PYTHON_BIN=./.venv/bin/python scripts/feedback_incremental_sync.sh"
+    ) in body
+
+
+def test_installer_uses_one_global_lock_for_two_projects(tmp_path):
+    projects = [tmp_path / "one", tmp_path / "two"]
+    for project in projects:
+        (project / "feedback_hub" / "data").mkdir(parents=True)
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    active_lock = tmp_path / "fake-active"
+    overlap = tmp_path / "fake-overlap"
+    env = {
+        **os.environ,
+        "TMPDIR": str(tmp_path),
+        "CRONTAB_BIN": str(fake),
+        "FAKE_CRONTAB_STATE": str(state),
+        "FAKE_ACTIVE_LOCK": str(active_lock),
+        "FAKE_OVERLAP_MARKER": str(overlap),
+        "FAKE_INSTALL_DELAY": "0.2",
+    }
+    runs = [
+        subprocess.Popen([str(SCRIPT), "--project-dir", str(project)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        for project in projects
+    ]
+    output = [run.communicate(timeout=10) for run in runs]
+
+    assert [run.returncode for run in runs] == [0, 0], output
+    assert not overlap.exists()
+    installed = state.read_text(encoding="utf-8")
+    assert installed.count("scripts/feedback_incremental_sync.sh") == 1
+    assert installed.count("/opt/other.sh") == 1
+
+
+def test_foreign_global_lock_is_never_removed_or_bypassed(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    lock = tmp_path / f"feedback-incremental-crontab-{os.getuid()}.lock"
+    lock.mkdir(mode=0o700)
+    (lock / "owner").write_text("foreign-owner\n", encoding="utf-8")
+    completed = subprocess.run(
+        [str(SCRIPT), "--project-dir", str(project)],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "TMPDIR": str(tmp_path),
+            "CRONTAB_BIN": str(fake),
+            "FAKE_CRONTAB_STATE": str(state),
+            "LOCK_RETRY_ATTEMPTS": "1",
+            "LOCK_RETRY_DELAY": "0",
+        },
+    )
+
+    assert completed.returncode != 0
+    assert state.read_text(encoding="utf-8") == "15 4 * * * /opt/other.sh\n"
+    assert (lock / "owner").read_text(encoding="utf-8") == "foreign-owner\n"
+
+
+def test_term_releases_only_its_owned_global_lock(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    ready = tmp_path / "install-ready"
+    env = {
+        **os.environ,
+        "TMPDIR": str(tmp_path),
+        "CRONTAB_BIN": str(fake),
+        "FAKE_CRONTAB_STATE": str(state),
+        "FAKE_INSTALL_READY": str(ready),
+        "FAKE_INSTALL_DELAY": "10",
+    }
+    run = subprocess.Popen(
+        [str(SCRIPT), "--project-dir", str(project)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()
+    os.killpg(run.pid, signal.SIGTERM)
+    stdout, stderr = run.communicate(timeout=5)
+
+    assert run.returncode != 0, (stdout, stderr)
+    assert not (tmp_path / f"feedback-incremental-crontab-{os.getuid()}.lock").exists()
