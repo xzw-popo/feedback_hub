@@ -11,6 +11,26 @@
     {
       "id": "missing-scope",
       "prompt": "帮我找语音输入结束后文字不上屏的反馈，使用内部反馈和向量检索能力。"
+    },
+    {
+      "id": "default-time",
+      "prompt": "帮我找工具栏错位的反馈。"
+    },
+    {
+      "id": "one-sided-time",
+      "prompt": "帮我找工具栏错位的反馈，开始时间是 2026-07-01T00:00:00+08:00。"
+    },
+    {
+      "id": "multi-page-review",
+      "prompt": "这次专题的 review queue 共 113 条，请完成审查并提交。"
+    },
+    {
+      "id": "explicit-exhaustive",
+      "prompt": "找过去半年工具栏错位的全部、完整反馈。"
+    },
+    {
+      "id": "six-month-standard",
+      "prompt": "看过去六个月工具栏错位的反馈，给我一份代表性清单。"
     }
   ],
   "rubric": {
@@ -21,6 +41,10 @@
       "uses a structured topic specification",
       "requires source evidence and links",
       "reports data coverage and unresolved failures",
+      "defaults a missing time pair to the advertised 14-day window",
+      "uses exhaustive mode only for explicit completeness intent",
+      "drains every review page before one override submission",
+      "reports representative result-scope fields",
       "does not write formal labels"
     ],
     "failure_codes": [
@@ -30,6 +54,10 @@
       "no_audit_trail",
       "unnecessary_blocking_question",
       "silent_partial_result",
+      "wrong_default_time",
+      "invented_or_wrong_mode",
+      "partial_review_queue",
+      "missing_result_scope",
       "formal_label_writeback"
     ]
   }

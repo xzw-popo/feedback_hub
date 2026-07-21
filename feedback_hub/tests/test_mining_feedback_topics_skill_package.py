@@ -239,7 +239,7 @@ def test_skill_guidance_shapes_blocked_pre_run_responses():
     assert "a blocked pre-run response contains four slots" in body
     for slot in ("proposed inclusion", "proposed exclusion", "one material scope question", "service or configuration blocker"):
         assert slot in body
-    assert "if start or end time is missing, ask the single time-range question" in body
+    assert "when exactly one boundary is supplied or timezone is unknowable" in body
     assert "never default to all history" in body
 
 
@@ -262,7 +262,7 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
         "`create-run --spec file`",
         "`get-run run_id`",
         "`resume run_id`",
-        "`review-queue run_id --output file`",
+        "`review-queue run_id --output file --offset offset --limit 50`",
         "`apply-overrides run_id --file file`",
         "`verify run_id`",
         "`export run_id --format xlsx|jsonl`",
@@ -272,9 +272,51 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
     assert positions == sorted(positions)
 
 
-def test_skill_guidance_asks_for_missing_time_as_a_direct_question():
+def test_skill_guidance_asks_for_one_sided_or_timezone_missing_time_as_a_direct_question():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "what start time, end time, and timezone should this run use?" in body
+
+
+def test_skill_defaults_missing_time_to_backend_advertised_two_weeks():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "default to the most recent 14 days" in body
+    assert "ask the single time-range question" not in body
+
+
+def test_skill_uses_exhaustive_only_for_explicit_completeness_intent():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "all, complete, or exhaustive" in body
+    assert "mode: exhaustive" in body
+    assert "mode: standard" in body
+
+
+def test_skill_exhausts_review_pagination_before_submitting_one_override_set():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "limit 50" in body
+    assert "until `next_offset` is null" in body
+    assert "merge all page decisions" in body
+    assert body.index("until `next_offset` is null") < body.index("`apply-overrides run_id --file file`")
+
+
+def test_skill_discloses_representative_scope():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "result_scope" in body
+    assert "returned_feedback" in body
+    assert "possibly_more_matches" in body
+    assert "representative" in body
+
+
+def test_skill_uses_only_backend_returned_result_scope_values():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "result_scope=reviewed" in body
+    assert "never invent a result_scope value" in body
+
+
+def test_skill_current_internal_deployment_requires_only_url():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2]
+    assert "FEEDBACK_TOPIC_API_URL" in body
+    assert "FEEDBACK_TOPIC_API_TOKEN" in body
+    assert "unused for the current internal deployment" in body
 
 
 def test_skill_guidance_resolves_explicit_relative_time_without_questioning():
@@ -287,11 +329,11 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
     text = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
     commands = (
         "python3 scripts/topic_backend_client.py capabilities",
-        "python3 scripts/validate_topic_spec.py TOPIC_SPEC_PATH",
+        "python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 TOPIC_SPEC_PATH",
         "python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH",
         "python3 scripts/topic_backend_client.py get-run RUN_ID",
         "python3 scripts/topic_backend_client.py resume RUN_ID",
-        "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PATH",
+        "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PAGE_PATH --offset OFFSET --limit 50",
         "python3 scripts/topic_backend_client.py apply-overrides RUN_ID --file OVERRIDES_PATH",
         "python3 scripts/topic_backend_client.py verify RUN_ID",
         "python3 scripts/topic_backend_client.py export RUN_ID --format xlsx",
@@ -299,6 +341,22 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
     )
     positions = [text.index(command) for command in commands]
     assert positions == sorted(positions)
+
+
+def test_skill_references_define_default_mode_paging_and_delivery_policy():
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(encoding="utf-8")
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    review = (SKILL_ROOT / "references" / "review-policy.md").read_text(encoding="utf-8")
+
+    assert "`mode: standard`" in topic_spec
+    assert "`mode: exhaustive`" in topic_spec
+    assert "--default-now NOW --default-days 14" in topic_spec
+    for value in ("500 candidates", "100 confirmed rows", "result_scope=representative", "possibly_more_matches=true"):
+        assert value in backend
+    assert "authentication=internal_network_boundary" in backend
+    assert "follow the returned `next_offset` and stop only when it is null" in backend
+    assert "including queues of 51 or more items" in review
+    assert "call `apply-overrides` only once" in review
 
 
 def test_review_contract_requires_complete_context_grounded_decisions():

@@ -2,6 +2,28 @@
 
 All agents received the Skill by absolute path in a fresh context. They were not given the rubric, baseline failures, or expected answer. No topic service URL was configured, so forward tests could not mutate a live service.
 
+## Phase 3 policy baseline (before new guidance)
+
+A fresh-context agent received only the backend command names, the `limit <= 50` paging contract, and five user requests; it did not read this Skill or workspace files. The pressure scenarios are recorded in `scenarios.json` as `default-time`, `one-sided-time`, `multi-page-review`, `explicit-exhaustive`, and `six-month-standard`.
+
+Observed choices and rationalizations:
+
+| Scenario | Baseline behavior | Failure or useful control |
+| --- | --- | --- |
+| No time | Asked a question or proposed an invented 30-day default: “若允许默认执行…最近 30 天”. | Failed the advertised 14-day default. |
+| One boundary | Filled the missing end with current time because it was “最贴近‘从某时起到现在’”. | Failed closed-boundary handling; it should ask one direct time question. |
+| 113 review items | Followed `next_offset` through offsets 0, 50, and 100, then proposed one combined override submission. | Useful control: pagination was understood when the API limit was explicit. |
+| Explicit all/complete | Invented `comprehensive/full` because it assumed the backend had “面向完整召回的模式”. | Failed the canonical `mode: exhaustive` contract. |
+| Six-month representative request | Escalated to invented full mode or split runs to avoid truncation. | Failed standard-mode cost bounding and representative-scope semantics. |
+
+The baseline shows that mode naming, the 14-day default, one-sided-time behavior, and representative delivery require positive structural guidance. Pagination still needs an explicit loop in the Skill because the correct baseline depended on the API constraint being supplied in the prompt; the distributable Skill must carry that constraint itself.
+
+### Phase 3 minimal-context forward test
+
+A fresh agent then received the revised Skill by absolute path and the same five planning-only scenarios. It made no service calls. It correctly used the 14-day default, blocked on one-sided time, chose canonical `standard`/`exhaustive`, followed all three expected pages for 113 items, merged before one override submission, and disclosed all scope fields. One new loophole appeared: for a successful exhaustive run it invented `result_scope=complete`, although the backend only returns `reviewed` or `representative`. A package test was added and observed failing; delivery guidance and the backend contract now require copying one of the backend-returned values and forbid invented scope values.
+
+A second fresh-context exhaustive-only rerun closed that loophole: it selected `mode=exhaustive`, followed `next_offset` with `limit=50` through null, submitted one merged decision set, and stated that `result_scope` must be the returned `reviewed` or `representative` value—explicitly rejecting invented `complete`. It also preserved coverage, evidence, link, no-direct-database, and no-formal-label constraints. This forward test remained planning-only and did not touch production.
+
 ## Micro-test control
 
 Exact prompt:
