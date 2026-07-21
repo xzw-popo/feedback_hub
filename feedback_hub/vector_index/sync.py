@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 from .config import VectorIndexConfig
 from .encoder import EmbeddingEncoder, QwenEmbeddingEncoder
@@ -28,6 +29,9 @@ class SyncResult:
     watermark_ts_ms: int
 
 
+PROMOTION_SCHEMA_VERSION = 1
+
+
 @contextmanager
 def process_lock(path: Path) -> Iterator[None]:
     """Serialize writers across processes for this index root."""
@@ -38,6 +42,17 @@ def process_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def source_ingestion_lock(config: VectorIndexConfig) -> Iterator[None]:
+    """Lock the final source snapshot against compliant feedback ingestion.
+
+    Producers must hold this lock while committing ``feedback`` and
+    ``feedback_source_coverage`` together.  The upcoming pull pipeline can
+    import this public context manager; SQLite's immediate transaction remains
+    a second line of defence for any normal SQLite writer.
+    """
+    return process_lock(config.data_dir / ".source-ingestion.lock")
 
 
 def _current_manifest(store: ShardStore) -> ShardManifest | None:
@@ -139,23 +154,131 @@ def _publish_watermark_if_needed(
     )
 
 
+def _atomic_json_replace(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    with temporary.open("wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("invalid active-generation metadata") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid active-generation metadata")
+    return payload
+
+
+def _pointer_paths(config: VectorIndexConfig) -> tuple[Path, Path]:
+    return (
+        config.data_dir / "active-generation.json",
+        config.data_dir / "generation-promotion-journal.json",
+    )
+
+
+def _pointer_payload(base_config: VectorIndexConfig, target_config: VectorIndexConfig) -> dict[str, object]:
+    try:
+        relative = target_config.data_dir.resolve().relative_to(base_config.data_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("rebuild generation escapes active index root") from exc
+    return {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "model_version": target_config.model_version,
+        "data_dir": relative.as_posix(),
+    }
+
+
+def _config_from_pointer(base_config: VectorIndexConfig, payload: dict[str, object]) -> VectorIndexConfig:
+    if payload.get("schema_version") != PROMOTION_SCHEMA_VERSION:
+        raise ValueError("unknown active-generation schema version")
+    model_version, raw_path = payload.get("model_version"), payload.get("data_dir")
+    if not isinstance(model_version, str) or not isinstance(raw_path, str) or Path(raw_path).is_absolute():
+        raise ValueError("invalid active-generation metadata")
+    candidate = (base_config.data_dir / raw_path).resolve()
+    try:
+        candidate.relative_to(base_config.data_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("active generation escapes index root") from exc
+    return replace(base_config, model_version=model_version, data_dir=candidate)
+
+
+def _recover_active_generation(base_config: VectorIndexConfig) -> None:
+    pointer_path, journal_path = _pointer_paths(base_config)
+    if not journal_path.exists():
+        return
+    journal = _read_json(journal_path)
+    target = journal.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("invalid generation promotion journal")
+    target_config = _config_from_pointer(base_config, target)
+    target_store = ShardStore.from_config(target_config)
+    target_store.load_manifest()
+    _atomic_json_replace(pointer_path, target)
+    journal_path.unlink(missing_ok=True)
+
+
+def active_index_config(config: VectorIndexConfig) -> VectorIndexConfig:
+    """Resolve the crash-safe active-generation pointer, or the root legacy index."""
+    _recover_active_generation(config)
+    pointer_path, _ = _pointer_paths(config)
+    if not pointer_path.exists():
+        return config
+    return _config_from_pointer(config, _read_json(pointer_path))
+
+
+def _promote_generation(
+    base_config: VectorIndexConfig, target_config: VectorIndexConfig,
+    repository: VectorRepository, store: ShardStore, *, pending_count: int,
+) -> None:
+    if pending_count != 0:
+        raise ValueError("cannot promote an incomplete rebuild")
+    # Re-check the exact model while the source-ingestion lock is still held.
+    pending, _ = repository.pending_and_coverage_snapshot(target_config.model_version)
+    if pending != 0:
+        raise ValueError("cannot promote a rebuild with pending feedback")
+    store.load_manifest()
+    pointer_path, journal_path = _pointer_paths(base_config)
+    target = _pointer_payload(base_config, target_config)
+    _atomic_json_replace(
+        journal_path,
+        {"schema_version": PROMOTION_SCHEMA_VERSION, "target": target},
+    )
+    _atomic_json_replace(pointer_path, target)
+    journal_path.unlink(missing_ok=True)
+
+
 def _sync(
     config: VectorIndexConfig,
     *,
     run_type: str,
     encoder: EmbeddingEncoder | None,
     max_items: int | None,
+    lock_path: Path | None = None,
+    source_lock_config: VectorIndexConfig | None = None,
+    on_complete: Callable[[VectorRepository, ShardStore, int], None] | None = None,
 ) -> SyncResult:
     if max_items is not None and max_items <= 0:
         raise ValueError("max_items must be positive when supplied")
-    with process_lock(config.data_dir / ".sync.lock"):
+    with process_lock(lock_path or config.data_dir / ".sync.lock"):
         repository = VectorRepository(config)
         run_id = ""
         vectorized_count = 0
         try:
             repository.init_schema()
-            store = ShardStore.from_config(config)
             run_id = repository.begin_run(run_type=run_type, model_version=config.model_version)
+            # A run exists before opening/recovering the durable generation, so
+            # corrupt journals/manifests are audited as failed runs.
+            store = ShardStore.from_config(config)
             active_encoder = encoder
             remaining_budget = max_items
             manifest = _current_manifest(store)
@@ -174,18 +297,24 @@ def _sync(
                 vectorized_count += len(rows)
                 if remaining_budget is not None:
                     remaining_budget -= len(rows)
-                if len(manifest.shards) >= config.compact_after_shards:
-                    manifest = compact_active_shards(repository, store)
-
-            pending_count = repository.pending_count(config.model_version)
-            if pending_count == 0:
-                manifest = _publish_watermark_if_needed(
-                    repository, store, watermark_ts_ms=repository.source_watermark_ms()
+            with source_ingestion_lock(source_lock_config or config):
+                pending_count, coverage_watermark = repository.pending_and_coverage_snapshot(
+                    config.model_version
                 )
-            elif manifest is None:
-                # A partial run with no completed rows has no reader-visible index.
-                # Its result reports the conservative zero watermark.
-                manifest = ShardManifest(1, 0, config.model_version, config.dimension, 0, ())
+                if pending_count == 0:
+                    manifest = _publish_watermark_if_needed(
+                        repository, store, watermark_ts_ms=coverage_watermark
+                    )
+                elif manifest is None:
+                    # A partial run with no completed rows has no reader-visible index.
+                    # Its result reports the conservative zero watermark.
+                    manifest = ShardManifest(1, 0, config.model_version, config.dimension, 0, ())
+                # Retrying an empty/resume run must still compact stranded small
+                # shards from a prior interrupted process.
+                if manifest is not None and len(manifest.shards) >= config.compact_after_shards:
+                    manifest = compact_active_shards(repository, store)
+                if on_complete is not None:
+                    on_complete(repository, store, pending_count)
             status = "succeeded" if pending_count == 0 else "partial"
             repository.finish_run(run_id, status=status, vectorized_count=vectorized_count)
             return SyncResult(run_id, vectorized_count, pending_count, manifest.watermark_ts_ms)
@@ -200,40 +329,69 @@ def _sync(
             repository.close()
 
 
+def _record_preopen_failure(
+    config: VectorIndexConfig, *, run_type: str, model_version: str, error: Exception
+) -> None:
+    """Audit failures while resolving an active-generation pointer before open."""
+    repository = VectorRepository(config)
+    try:
+        repository.init_schema()
+        run_id = repository.begin_run(run_type=run_type, model_version=model_version)
+        repository.finish_run(
+            run_id, status="failed", vectorized_count=0, error_code=type(error).__name__,
+        )
+    finally:
+        repository.close()
+
+
 def sync_pending(
     config: VectorIndexConfig, *, encoder: EmbeddingEncoder | None = None,
     max_items: int | None = None,
 ) -> SyncResult:
     """Embed missing exact feedback IDs in shard-sized, restartable chunks."""
-    return _sync(config, run_type="incremental", encoder=encoder, max_items=max_items)
+    try:
+        active = active_index_config(config)
+    except Exception as exc:
+        _record_preopen_failure(
+            config, run_type="incremental", model_version=config.model_version, error=exc
+        )
+        raise
+    return _sync(
+        active, run_type="incremental", encoder=encoder, max_items=max_items,
+        lock_path=config.data_dir / ".sync.lock", source_lock_config=config,
+    )
 
 
-def _rebuild_generation_config(config: VectorIndexConfig) -> VectorIndexConfig:
-    model_version = config.model_version.strip()
+def _rebuild_generation_config(config: VectorIndexConfig, target_model_version: str) -> VectorIndexConfig:
+    model_version = target_model_version.strip()
     if not model_version or Path(model_version).name != model_version or model_version in {".", ".."}:
         raise ValueError("rebuild requires an explicit safe model_version")
-    active_manifest_path = config.data_dir / "manifest.json"
-    if active_manifest_path.exists():
-        try:
-            active_model_version = json.loads(active_manifest_path.read_text(encoding="utf-8"))["model_version"]
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise ValueError("active manifest is invalid; cannot safely rebuild") from exc
-        if active_model_version == model_version:
-            raise ValueError("rebuild requires a model_version distinct from the active index")
-    return replace(config, data_dir=config.data_dir / "generations" / model_version)
+    if active_index_config(config).model_version == model_version:
+        raise ValueError("rebuild requires a model_version distinct from the active index")
+    return replace(config, model_version=model_version, data_dir=config.data_dir / "generations" / model_version)
 
 
 def rebuild_index(
-    config: VectorIndexConfig, *, encoder: EmbeddingEncoder | None = None,
+    config: VectorIndexConfig, *, target_model_version: str,
+    encoder: EmbeddingEncoder | None = None,
 ) -> SyncResult:
-    """Build a model-versioned generation without disturbing the active index.
+    """Rebuild and atomically promote an explicit, distinct target model.
 
-    Each chunk uses the same coordinated journaled publication as incremental
-    sync, but the manifest lives below ``generations/<model_version>``.  The
-    configured active root is consequently untouched until a later explicit
-    promotion operation chooses this completed generation.
+    Chunks checkpoint under ``generations/<target_model_version>`` while the
+    root index remains readable.  Only a fully covered generation is promoted
+    through the crash-recoverable active-generation pointer.
     """
+    try:
+        target = _rebuild_generation_config(config, target_model_version)
+    except Exception as exc:
+        _record_preopen_failure(
+            config, run_type="rebuild", model_version=target_model_version, error=exc
+        )
+        raise
     return _sync(
-        _rebuild_generation_config(config), run_type="rebuild", encoder=encoder,
-        max_items=None,
+        target, run_type="rebuild", encoder=encoder, max_items=None,
+        lock_path=config.data_dir / ".sync.lock", source_lock_config=config,
+        on_complete=lambda repository, store, pending: _promote_generation(
+            config, target, repository, store, pending_count=pending
+        ),
     )

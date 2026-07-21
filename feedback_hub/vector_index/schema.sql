@@ -40,3 +40,14 @@ CREATE TABLE IF NOT EXISTS embedding_sync_run (
     failed_count INTEGER NOT NULL DEFAULT 0,
     error_code TEXT NOT NULL DEFAULT ''
 );
+
+-- This is the durable commit witness for a cross-store publication.  A journal
+-- alone is only intent: recovery must see this row at the exact target
+-- generation/watermark before it can roll a manifest forward.
+CREATE TABLE IF NOT EXISTS embedding_publication_marker (
+    publication_key TEXT PRIMARY KEY,
+    model_version TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    watermark_ts_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);

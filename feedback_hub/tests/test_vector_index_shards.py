@@ -305,6 +305,18 @@ def test_recovery_requires_complete_mapping_even_when_journal_remap_is_empty(vec
     assert recovered.load_manifest().generation == old.generation
 
 
+def test_recovery_rolls_back_watermark_journal_written_before_database_commit(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    new = store.manifest_for(old.shards, watermark_ts_ms=old.watermark_ts_ms + 10)
+    store.write_publication_journal(old, new, [], _manifest_mappings(repo, old.shards))
+
+    recovered = ShardStore.open(vector_fixture.config)
+
+    assert recovered.load_manifest() == old
+    assert not recovered.publication_journal_path.exists()
+
+
 def test_stale_journal_cannot_regress_a_newer_live_generation(vector_fixture):
     store, repo = vector_fixture.store, vector_fixture.repo
     old = store.load_manifest()

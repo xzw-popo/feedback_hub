@@ -10,7 +10,8 @@ from feedback_hub import db
 from feedback_hub.vector_index.config import VectorIndexConfig
 from feedback_hub.vector_index.repository import VectorRepository
 from feedback_hub.vector_index.shards import ShardStore
-from feedback_hub.vector_index.sync import rebuild_index, sync_pending
+from feedback_hub.vector_index import sync as sync_module
+from feedback_hub.vector_index.sync import active_index_config, rebuild_index, sync_pending
 
 
 def _feedback(feedback_id: str, text: str, ts_ms: int) -> dict[str, object]:
@@ -130,6 +131,53 @@ def test_sync_compacts_after_configured_shard_threshold(sync_fixture):
     assert sync_fixture.repo.status().active_shards == 1
 
 
+def test_empty_resume_retries_pending_compaction_before_success(sync_fixture):
+    uncompact = replace(sync_fixture.config, shard_size=1, compact_after_shards=99)
+    sync_pending(uncompact, encoder=DeterministicEncoder())
+    assert sync_fixture.repo.status().active_shards == 5
+
+    resumed = sync_pending(
+        replace(uncompact, compact_after_shards=2), encoder=DeterministicEncoder()
+    )
+
+    assert resumed.pending_count == 0
+    assert sync_fixture.repo.status().active_shards == 1
+
+
+def test_final_snapshot_sees_feedback_and_coverage_committed_after_last_chunk(sync_fixture, monkeypatch):
+    original = VectorRepository.pending_and_coverage_snapshot
+
+    def inject_new_source_data(repository, model_version):
+        assert db.upsert_feedback(repository.connection, _feedback("late", "late text", 6))
+        repository.connection.execute(
+            "INSERT INTO feedback_source_coverage (channel, start_ts_ms, end_ts_ms, completed_at_ms) "
+            "VALUES ('wetype', 5, 6, 60)"
+        )
+        repository.connection.commit()
+        return original(repository, model_version)
+
+    monkeypatch.setattr(VectorRepository, "pending_and_coverage_snapshot", inject_new_source_data)
+
+    result = sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+
+    assert result.pending_count == 1
+    assert sync_fixture.shards.load_manifest().watermark_ts_ms == 0
+
+
+def test_store_recovery_failure_is_recorded_as_a_failed_run(sync_fixture, monkeypatch):
+    monkeypatch.setattr(
+        ShardStore, "from_config", classmethod(lambda cls, config: (_ for _ in ()).throw(ValueError("bad manifest")))
+    )
+
+    with pytest.raises(ValueError, match="bad manifest"):
+        sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+
+    row = sync_fixture.repo.connection.execute(
+        "SELECT status, error_code FROM embedding_sync_run ORDER BY started_at_ms DESC LIMIT 1"
+    ).fetchone()
+    assert tuple(row) == ("failed", "ValueError")
+
+
 def test_manifest_crash_after_database_commit_is_recovered_without_reembedding(sync_fixture, monkeypatch):
     original = ShardStore._replace_manifest
     crashed = False
@@ -159,20 +207,55 @@ def test_manifest_crash_after_database_commit_is_recovered_without_reembedding(s
 def test_rebuild_uses_a_separate_generation_without_clearing_active_index(sync_fixture):
     sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
     old_manifest = sync_fixture.shards.load_manifest()
-    rebuilt_config = replace(sync_fixture.config, model_version="m2")
 
-    result = rebuild_index(rebuilt_config, encoder=DeterministicEncoder())
+    result = rebuild_index(
+        sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder()
+    )
 
     rebuilt_store = ShardStore.from_config(
-        replace(rebuilt_config, data_dir=sync_fixture.config.data_dir / "generations" / "m2")
+        replace(sync_fixture.config, model_version="m2", data_dir=sync_fixture.config.data_dir / "generations" / "m2")
     )
     assert result.pending_count == 0
     assert sync_fixture.shards.load_manifest() == old_manifest
     assert rebuilt_store.load_manifest().model_version == "m2"
+    assert active_index_config(sync_fixture.config).model_version == "m2"
 
 
 def test_rebuild_requires_a_model_version_distinct_from_the_active_index(sync_fixture):
     sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
 
     with pytest.raises(ValueError, match="distinct"):
-        rebuild_index(sync_fixture.config, encoder=DeterministicEncoder())
+        rebuild_index(
+            sync_fixture.config, target_model_version="m1", encoder=DeterministicEncoder()
+        )
+
+
+def test_failed_rebuild_leaves_the_prior_active_generation_selected(sync_fixture):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+
+    with pytest.raises(RuntimeError, match="encoder failed"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", encoder=FailOnceEncoder()
+        )
+
+    assert active_index_config(sync_fixture.config).model_version == "m1"
+
+
+def test_promotion_crash_recovers_the_completed_target_generation(sync_fixture, monkeypatch):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+    original = sync_module._atomic_json_replace
+
+    def crash_before_pointer(path, payload):
+        if path.name == "active-generation.json":
+            raise RuntimeError("promotion crash")
+        return original(path, payload)
+
+    monkeypatch.setattr(sync_module, "_atomic_json_replace", crash_before_pointer)
+    with pytest.raises(RuntimeError, match="promotion crash"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder()
+        )
+    monkeypatch.setattr(sync_module, "_atomic_json_replace", original)
+
+    assert active_index_config(sync_fixture.config).model_version == "m2"
+    assert not (sync_fixture.config.data_dir / "generation-promotion-journal.json").exists()

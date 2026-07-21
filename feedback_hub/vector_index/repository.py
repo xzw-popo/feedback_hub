@@ -77,6 +77,53 @@ class VectorRepository:
         ).fetchone()
         return int(row[0])
 
+    def pending_and_coverage_snapshot(self, model_version: str) -> tuple[int, int]:
+        """Read pending work and source coverage in one SQLite write snapshot.
+
+        Ingestion must commit feedback rows and ``feedback_source_coverage`` in
+        its own SQLite transaction.  ``BEGIN IMMEDIATE`` serializes this final
+        read with that writer, preventing a pending/coverage TOCTOU decision.
+        """
+        if self.connection.in_transaction:
+            raise RuntimeError("source snapshot requires no caller-owned transaction")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            pending = self.pending_count(model_version)
+            coverage = self.source_watermark_ms()
+            self.connection.commit()
+            return pending, coverage
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_publication(
+        self, *, publication_key: str, model_version: str, generation: int,
+        watermark_ts_ms: int,
+    ) -> None:
+        """Write the SQLite commit witness inside a coordinated publication."""
+        self.connection.execute(
+            """INSERT INTO embedding_publication_marker
+               (publication_key, model_version, generation, watermark_ts_ms, updated_at_ms)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(publication_key) DO UPDATE SET
+                 model_version = excluded.model_version,
+                 generation = excluded.generation,
+                 watermark_ts_ms = excluded.watermark_ts_ms,
+                 updated_at_ms = excluded.updated_at_ms""",
+            (publication_key, model_version, generation, watermark_ts_ms, now_ms()),
+        )
+
+    def publication_matches(
+        self, *, publication_key: str, model_version: str, generation: int,
+        watermark_ts_ms: int,
+    ) -> bool:
+        row = self.connection.execute(
+            """SELECT model_version, generation, watermark_ts_ms
+               FROM embedding_publication_marker WHERE publication_key = ?""",
+            (publication_key,),
+        ).fetchone()
+        return row is not None and tuple(row) == (model_version, generation, watermark_ts_ms)
+
     def begin_run(self, *, run_type: str, model_version: str) -> str:
         run_id = uuid.uuid4().hex
         self.connection.execute(

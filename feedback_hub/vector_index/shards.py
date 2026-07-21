@@ -224,6 +224,13 @@ class ShardStore:
                 database_mutation()
                 if not self._database_matches_journal(repository, new_manifest, row_remap):
                     raise ValueError("database state does not match publication journal")
+                repository.mark_publication(
+                    publication_key=str(self.root), model_version=self.model_version,
+                    generation=new_manifest.generation,
+                    watermark_ts_ms=new_manifest.watermark_ts_ms,
+                )
+                if not self._publication_marker_matches(repository, new_manifest):
+                    raise ValueError("database publication marker does not match journal")
                 repository.connection.commit()
             except Exception:
                 repository.connection.rollback()
@@ -273,6 +280,7 @@ class ShardStore:
             "new_manifest": self._manifest_payload(new_manifest),
             "new_shards": [self._shard_payload(item) for item in new_shards],
             "row_remap": [dict(item) for item in row_remap],
+            "publication_marker": self._publication_marker_payload(new_manifest),
         }
         self._atomic_json_replace(self.publication_journal_path, payload)
 
@@ -312,7 +320,11 @@ class ShardStore:
             # of a stale journal over it.
             self._remove_journal()
             return True
-        if self._database_matches_journal(repository, new_manifest, remap):
+        marker = payload.get("publication_marker")
+        if marker != self._publication_marker_payload(new_manifest):
+            raise ValueError("invalid publication journal marker")
+        if (self._publication_marker_matches(repository, new_manifest)
+                and self._database_matches_journal(repository, new_manifest, remap)):
             self._validate_manifest_for_publication(new_manifest)
             if not self._same_manifest(live, new_manifest):
                 self._replace_manifest(new_manifest, expected_previous=old_manifest)
@@ -512,6 +524,17 @@ class ShardStore:
             if sorted(offsets) != list(range(shard.row_count)):
                 return False
         return True
+
+    def _publication_marker_payload(self, manifest: ShardManifest) -> dict[str, Any]:
+        return {
+            "publication_key": str(self.root), "model_version": self.model_version,
+            "generation": manifest.generation, "watermark_ts_ms": manifest.watermark_ts_ms,
+        }
+
+    def _publication_marker_matches(
+        self, repository: VectorRepository, manifest: ShardManifest
+    ) -> bool:
+        return repository.publication_matches(**self._publication_marker_payload(manifest))
 
     def _validate_remap(self, manifest: ShardManifest, remap: Sequence[Any]) -> None:
         expected_rows = sum(shard.row_count for shard in manifest.shards)
