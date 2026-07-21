@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 _TOP_LEVEL_FIELDS = frozenset(
@@ -19,6 +19,7 @@ _TOP_LEVEL_FIELDS = frozenset(
         "objective",
         "scope",
         "unit",
+        "mode",
         "inclusion_criteria",
         "exclusion_criteria",
         "positive_examples",
@@ -28,6 +29,7 @@ _TOP_LEVEL_FIELDS = frozenset(
         "output",
     }
 )
+_REQUIRED_TOP_LEVEL_FIELDS = _TOP_LEVEL_FIELDS - {"mode"}
 _SCOPE_FIELDS = frozenset(
     {"start_time", "end_time", "platforms", "products", "channels", "versions"}
 )
@@ -60,6 +62,7 @@ class TopicSpec:
     objective: str
     scope: TopicScope
     unit: str
+    mode: Literal["standard", "exhaustive"]
     inclusion_criteria: tuple[str, ...]
     exclusion_criteria: tuple[str, ...]
     positive_examples: tuple[str, ...]
@@ -82,6 +85,7 @@ class TopicSpec:
                 "versions": list(self.scope.versions),
             },
             "unit": self.unit,
+            "mode": self.mode,
             "inclusion_criteria": list(self.inclusion_criteria),
             "exclusion_criteria": list(self.exclusion_criteria),
             "positive_examples": list(self.positive_examples),
@@ -149,7 +153,7 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     """Validate untrusted input and return its normalized canonical representation."""
     raw = _require_mapping(raw, "topic_spec")
     _reject_unknown(raw, _TOP_LEVEL_FIELDS, "topic_spec")
-    missing = _TOP_LEVEL_FIELDS - set(raw)
+    missing = _REQUIRED_TOP_LEVEL_FIELDS - set(raw)
     if missing:
         raise ValueError(f"topic_spec is missing required fields: {', '.join(sorted(missing))}")
 
@@ -178,6 +182,9 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     unit = _required_string(raw["unit"], "unit")
     if unit not in {"feedback", "conversation"}:
         raise ValueError("unit must be 'feedback' or 'conversation'")
+    mode = raw.get("mode", "standard")
+    if mode not in {"standard", "exhaustive"}:
+        raise ValueError("mode must be standard or exhaustive")
 
     lexical_raw = _require_mapping(raw["lexical_hints"], "lexical_hints")
     _reject_unknown(lexical_raw, _LEXICAL_HINT_FIELDS, "lexical_hints")
@@ -231,6 +238,7 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
         objective=_required_string(raw["objective"], "objective"),
         scope=scope,
         unit=unit,
+        mode=mode,
         inclusion_criteria=_string_list(raw["inclusion_criteria"], "inclusion_criteria", required=True),
         exclusion_criteria=_string_list(raw["exclusion_criteria"], "exclusion_criteria", required=True),
         positive_examples=_string_list(raw["positive_examples"], "positive_examples"),
@@ -254,7 +262,7 @@ def topic_spec_json_schema() -> dict[str, Any]:
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
-        "required": sorted(_TOP_LEVEL_FIELDS),
+        "required": sorted(_REQUIRED_TOP_LEVEL_FIELDS),
         "properties": {
             "schema_version": {"const": 1},
             "topic_name": {"type": "string", "minLength": 1},
@@ -273,6 +281,7 @@ def topic_spec_json_schema() -> dict[str, Any]:
                 },
             },
             "unit": {"enum": ["feedback", "conversation"]},
+            "mode": {"enum": ["standard", "exhaustive"]},
             "inclusion_criteria": {**string_array, "minItems": 1},
             "exclusion_criteria": {**string_array, "minItems": 1},
             "positive_examples": string_array,

@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -165,14 +166,38 @@ def _validate_scope_time_order(value: Any) -> None:
         raise _error("$.scope.end_time", "must be after $.scope.start_time")
 
 
+def _prepare_default_scope_times(
+    value: Any,
+    default_now: str | None,
+    default_days: int | None,
+) -> None:
+    if not isinstance(value, dict):
+        return
+    scope = value.get("scope")
+    if not isinstance(scope, dict):
+        return
+    has_start_time = "start_time" in scope
+    has_end_time = "end_time" in scope
+    if has_start_time != has_end_time:
+        raise _error("$.scope", "both start_time and end_time must be provided together")
+    if has_start_time or default_now is None or default_days is None:
+        return
+    end_time = _parse_rfc3339(default_now, "--default-now")
+    scope["end_time"] = default_now
+    scope["start_time"] = (end_time - timedelta(days=default_days)).isoformat()
+
+
 def main(argv: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 1:
-        print("usage: validate_topic_spec.py TOPIC_SPEC_PATH", file=sys.stderr)
-        raise SystemExit(2)
-    path = Path(arguments[0])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--default-now", metavar="RFC3339")
+    parser.add_argument("--default-days", type=int, metavar="DAYS")
+    parser.add_argument("topic_spec_path", metavar="TOPIC_SPEC_PATH")
+    args = parser.parse_args(arguments)
+    path = Path(args.topic_spec_path)
     try:
         value = _load_input(path)
+        _prepare_default_scope_times(value, args.default_now, args.default_days)
         _validate(value, _load_schema(), "$")
         _validate_scope_time_order(value)
     except ValueError as error:

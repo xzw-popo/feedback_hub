@@ -23,9 +23,9 @@ VALIDATOR = SKILL_ROOT / "scripts" / "validate_topic_spec.py"
 CLIENT = SKILL_ROOT / "scripts" / "topic_backend_client.py"
 
 
-def _run_validator(path: Path) -> subprocess.CompletedProcess[str]:
+def _run_validator(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(VALIDATOR), str(path)],
+        [sys.executable, str(VALIDATOR), *arguments, str(path)],
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -99,6 +99,45 @@ def test_validator_accepts_yaml_and_requires_timezone(tmp_path):
 
     assert result.returncode == 2
     assert "$.scope.start_time: timezone is required" in result.stderr
+
+
+def test_skill_validator_fills_missing_time_pair_from_fixed_now(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        path,
+        "--default-now",
+        "2026-07-21T12:00:00+08:00",
+        "--default-days",
+        "14",
+    )
+
+    assert result.returncode == 0, result.stderr
+    normalized = json.loads(result.stdout)
+    assert normalized["scope"]["start_time"] == "2026-07-07T12:00:00+08:00"
+    assert normalized["scope"]["end_time"] == "2026-07-21T12:00:00+08:00"
+
+
+def test_skill_validator_rejects_only_one_time_boundary(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        path,
+        "--default-now",
+        "2026-07-21T12:00:00+08:00",
+        "--default-days",
+        "14",
+    )
+
+    assert result.returncode == 2
+    assert "both start_time and end_time" in result.stderr
 
 
 def test_client_uses_environment_url_and_redacts_token(monkeypatch):

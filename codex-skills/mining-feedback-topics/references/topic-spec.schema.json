@@ -83,6 +83,12 @@
       },
       "type": "object"
     },
+    "mode": {
+      "enum": [
+        "standard",
+        "exhaustive"
+      ]
+    },
     "negative_examples": {
       "items": {
         "minLength": 1,

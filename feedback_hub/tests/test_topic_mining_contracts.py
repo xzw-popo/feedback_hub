@@ -45,6 +45,13 @@ def test_validate_topic_spec_normalizes_timezone_and_deduplicates_terms():
     assert spec.lexical_hints["contexts"] == ("全屏", "游戏")
 
 
+def test_topic_spec_defaults_mode_to_standard():
+    raw = valid_spec()
+    raw.pop("mode", None)
+
+    assert validate_topic_spec(raw).mode == "standard"
+
+
 def test_schema_allows_duplicate_list_values_that_normalizer_deduplicates():
     raw = valid_spec()
     raw["scope"]["platforms"].append("Win")
