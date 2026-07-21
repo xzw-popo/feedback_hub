@@ -656,7 +656,10 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ["create-run", "--spec", str(spec_path)],
         ["get-run", "run-1"],
         ["resume", "run-1"],
-        ["review-queue", "run-1", "--output", str(review_output)],
+        [
+            "review-queue", "run-1", "--output", str(review_output),
+            "--offset", "7", "--limit", "20",
+        ],
         ["apply-overrides", "run-1", "--file", str(overrides_path)],
         ["verify", "run-1"],
         ["export", "run-1", "--format", "xlsx"],
@@ -671,7 +674,7 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ("POST", "https://topic.internal/api/topic-mining/runs", json.dumps(valid_spec(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/resume", None, 30),
-        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/review-queue", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/review-queue?offset=7&limit=20", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/overrides", b"[]", 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/verify", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/export", b'{"format":"xlsx"}', 30),
@@ -679,3 +682,35 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
     ]
     assert json.loads(review_output.read_text(encoding="utf-8")) == {"ok": True}
     assert download_output.read_bytes() == b"binary-xlsx"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["--offset", "-1"],
+        ["--limit", "0"],
+        ["--limit", "51"],
+        ["--offset", "not-an-integer"],
+    ),
+)
+def test_client_rejects_invalid_review_page_arguments_before_request(
+    tmp_path, monkeypatch, arguments,
+):
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(
+        module.urllib.request, "urlopen",
+        lambda *args, **kwargs: requested.append(args),
+    )
+
+    code, _, stderr = _run_client(
+        module,
+        [
+            "--base-url", "https://topic.internal", "review-queue", "run-1",
+            "--output", str(tmp_path / "page.json"), *arguments,
+        ],
+    )
+
+    assert code == 2
+    assert "review" in stderr
+    assert not requested

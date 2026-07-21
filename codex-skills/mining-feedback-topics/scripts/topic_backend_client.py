@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
 TIMEOUT_SECONDS = 30
@@ -121,6 +121,26 @@ def _safe_path_segment(value: str, label: str) -> str:
     return value
 
 
+def _review_offset(value: str) -> int:
+    try:
+        offset = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("review offset must be an integer") from error
+    if offset < 0:
+        raise argparse.ArgumentTypeError("review offset must be at least 0")
+    return offset
+
+
+def _review_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("review limit must be an integer") from error
+    if not 1 <= limit <= 50:
+        raise argparse.ArgumentTypeError("review limit must be between 1 and 50")
+    return limit
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _ClientArgumentParser(description=__doc__)
     parser.add_argument("--base-url", help="Override FEEDBACK_TOPIC_API_URL")
@@ -129,7 +149,7 @@ def _parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create-run"); create.add_argument("--spec", required=True)
     get = subparsers.add_parser("get-run"); get.add_argument("run_id")
     resume = subparsers.add_parser("resume"); resume.add_argument("run_id")
-    review = subparsers.add_parser("review-queue"); review.add_argument("run_id"); review.add_argument("--output", required=True)
+    review = subparsers.add_parser("review-queue"); review.add_argument("run_id"); review.add_argument("--output", required=True); review.add_argument("--offset", type=_review_offset, default=0); review.add_argument("--limit", type=_review_limit, default=50)
     overrides = subparsers.add_parser("apply-overrides"); overrides.add_argument("run_id"); overrides.add_argument("--file", required=True)
     verify = subparsers.add_parser("verify"); verify.add_argument("run_id")
     export = subparsers.add_parser("export"); export.add_argument("run_id"); export.add_argument("--format", choices=("xlsx", "jsonl"), required=True)
@@ -157,7 +177,10 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         return response
     if command == "review-queue":
         run_id = _safe_path_segment(arguments.run_id, "run id")
-        response, raw = _request(base_url, token, "GET", f"/runs/{run_id}/review-queue")
+        query = urlencode({"offset": arguments.offset, "limit": arguments.limit})
+        response, raw = _request(
+            base_url, token, "GET", f"/runs/{run_id}/review-queue?{query}",
+        )
         _write_atomic(arguments.output, raw)
         return response
     if command == "apply-overrides":

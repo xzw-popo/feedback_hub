@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from .config import TopicMiningConfig
@@ -192,6 +192,18 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             "schema_versions": [1], "preferred_formats": ["xlsx", "jsonl"],
             "run_statuses": ["pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted"],
             "read_only_source": True, "formal_label_writeback": False,
+            "default_time_days": 14,
+            "run_modes": {
+                "standard": {
+                    "candidate_limit": config.standard_candidate_limit,
+                    "result_limit": config.standard_result_limit,
+                },
+                "exhaustive": {
+                    "candidate_limit": config.exhaustive_candidate_limit,
+                    "result_limit": None,
+                },
+            },
+            "authentication": "internal_network_boundary",
         }
 
     @router.post("/runs", dependencies=[Depends(require_token)])
@@ -286,13 +298,24 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         return result
 
     @router.get("/runs/{run_id}/review-queue", dependencies=[Depends(require_token)])
-    def review_queue(run_id: str) -> dict[str, Any]:
+    def review_queue(
+        run_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=50),
+    ) -> dict[str, Any]:
         run = _get_or_404(run_id, store)
         path = Path(run["artifact_dir"]) / "review_queue.jsonl"
         try:
             manifest = _manifest(run); _verify_manifest(manifest, Path(run["artifact_dir"]))
             raw = read_verified_artifact_bytes(manifest, path)
-            return {"run_id": run_id, "items": _parse_jsonl_bytes(raw)}
+            items = _parse_jsonl_bytes(raw)
+            next_offset = offset + limit if offset + limit < len(items) else None
+            return {
+                "run_id": run_id,
+                "items": items[offset:offset + limit],
+                "total": len(items),
+                "next_offset": next_offset,
+            }
         except (ValueError, RunVerificationError) as exc:
             raise HTTPException(status_code=409, detail=_redact(str(exc), config)) from None
 

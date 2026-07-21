@@ -61,6 +61,74 @@ def _artifact_client(tmp_path, *, status: str, artifacts: dict[str, bytes]):
     return TestClient(app), run, artifact_dir
 
 
+def _review_queue_rows(count: int) -> bytes:
+    return b"".join(
+        json.dumps({"item_id": f"review-{index}"}).encode("utf-8") + b"\n"
+        for index in range(count)
+    )
+
+
+def test_capabilities_advertise_backend_owned_policy(tmp_path):
+    client = _client(tmp_path)
+
+    payload = client.get("/api/topic-mining/capabilities").json()
+
+    assert payload["default_time_days"] == 14
+    assert payload["run_modes"] == {
+        "standard": {"candidate_limit": 500, "result_limit": 100},
+        "exhaustive": {"candidate_limit": 5000, "result_limit": None},
+    }
+    assert payload["authentication"] == "internal_network_boundary"
+
+
+def test_review_queue_pages_at_most_fifty_rows_and_reports_continuation(tmp_path):
+    client, run, _ = _artifact_client(
+        tmp_path,
+        status="review_ready",
+        artifacts={"review_queue.jsonl": _review_queue_rows(80)},
+    )
+
+    invalid = client.get(
+        f"/api/topic-mining/runs/{run['run_id']}/review-queue?offset=0&limit=80",
+    )
+    first = client.get(
+        f"/api/topic-mining/runs/{run['run_id']}/review-queue?offset=0&limit=50",
+    )
+    second = client.get(
+        f"/api/topic-mining/runs/{run['run_id']}/review-queue?offset=50&limit=50",
+    )
+
+    assert invalid.status_code == 422
+    assert first.status_code == 200
+    assert first.json() == {
+        "run_id": run["run_id"],
+        "items": [{"item_id": f"review-{index}"} for index in range(50)],
+        "total": 80,
+        "next_offset": 50,
+    }
+    assert second.status_code == 200
+    assert second.json()["items"] == [
+        {"item_id": f"review-{index}"} for index in range(50, 80)
+    ]
+    assert second.json()["total"] == 80
+    assert second.json()["next_offset"] is None
+
+
+@pytest.mark.parametrize("query", ("offset=-1&limit=1", "offset=0&limit=0"))
+def test_review_queue_rejects_negative_offset_and_non_positive_limit(tmp_path, query):
+    client, run, _ = _artifact_client(
+        tmp_path,
+        status="review_ready",
+        artifacts={"review_queue.jsonl": _review_queue_rows(1)},
+    )
+
+    response = client.get(
+        f"/api/topic-mining/runs/{run['run_id']}/review-queue?{query}",
+    )
+
+    assert response.status_code == 422
+
+
 def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatch):
     import feedback_hub.topic_mining.api as api
     started = []
