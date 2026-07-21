@@ -97,11 +97,32 @@ wait_for_health() {
   return 1
 }
 
+wait_for_process() {
+  local pid="$1"
+  local deadline=$(( $(date +%s) + ${VECTOR_BOOTSTRAP_START_GRACE_SECONDS:-2} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! pid_is_vector_service "$pid"; then
+      echo "[vector-runtime] Vector process exited during bootstrap; see ${LOG_FILE}" >&2
+      rm -f "$PID_FILE"
+      return 1
+    fi
+    sleep 1
+  done
+  if ! pid_is_vector_service "$pid"; then
+    echo "[vector-runtime] Vector process exited during bootstrap; see ${LOG_FILE}" >&2
+    rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
 start_app() {
   if [ -f "$PID_FILE" ]; then
     local old_pid
     old_pid="$(tr -d '[:space:]' < "$PID_FILE")"
     if pid_is_vector_service "$old_pid"; then
+      if [ "${VECTOR_ALLOW_EMPTY_INDEX:-0}" != "1" ]; then
+        wait_for_health "$old_pid"
+      fi
       echo "[vector-runtime] already running pid=${old_pid} port=${VECTOR_PORT}"
       return 0
     fi
@@ -127,6 +148,8 @@ start_app() {
   echo "$!" > "$PID_FILE"
   if [ "${VECTOR_ALLOW_EMPTY_INDEX:-0}" != "1" ]; then
     wait_for_health "$(cat "$PID_FILE")"
+  else
+    wait_for_process "$(cat "$PID_FILE")"
   fi
   echo "[vector-runtime] PID $(cat "$PID_FILE")"
 }

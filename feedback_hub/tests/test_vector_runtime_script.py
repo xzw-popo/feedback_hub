@@ -28,3 +28,9 @@ def test_vector_runtime_waits_for_a_healthy_loopback_service_before_success():
     assert "wait_for_health" in body
     assert "http://127.0.0.1:${VECTOR_PORT}/health" in body
     assert "curl -fsS" in body
+
+
+def test_vector_runtime_checks_bootstrap_survival_and_existing_service_health():
+    body = VECTOR_RUNTIME.read_text(encoding="utf-8")
+    assert "wait_for_process" in body
+    assert "wait_for_health \"$old_pid\"" in body
