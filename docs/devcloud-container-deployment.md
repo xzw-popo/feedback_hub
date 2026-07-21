@@ -245,10 +245,12 @@ ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
   NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild &&
   mkdir -p feedback_hub/data/vector_index/backups &&
   if [ -e "$ACTIVE_POINTER" ]; then
-    ./.venv/bin/python -c "import json, sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$ACTIVE_POINTER"
+    ./.venv/bin/python -m json.tool "$ACTIVE_POINTER" >/dev/null
+    rm -f -- "$NO_PRIOR_POINTER_MARKER"
     cp -- "$ACTIVE_POINTER" "$ACTIVE_POINTER_BACKUP"
     test -s "$ACTIVE_POINTER_BACKUP"
   else
+    rm -f -- "$ACTIVE_POINTER_BACKUP"
     : > "$NO_PRIOR_POINTER_MARKER"
   fi
   ./.venv/bin/python -m feedback_hub.cli ingest backfill --last 14d --chunk 6h &&

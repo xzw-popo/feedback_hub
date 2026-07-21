@@ -601,6 +601,40 @@ def test_vector_deploy_runbook_documents_bootstrap_start_health_and_bounded_roll
         assert value in body
 
 
+@pytest.mark.parametrize("has_pointer", [True, False])
+def test_bootstrap_runbook_payload_is_shell_valid_and_keeps_pointer_evidence_mutually_exclusive(tmp_path, has_pointer):
+    docs = RUNBOOK.read_text(encoding="utf-8")
+    section = docs.split("首次 bootstrap 默认不启动向量服务", 1)[1].split("`--last 14d`", 1)[0]
+    block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    payload = block.split("root@charvelxia-any2.devcloud.woa.com '\n", 1)[1].rsplit("\n'", 1)[0]
+    app = tmp_path / "feedback_hub"
+    backup_dir = app / "feedback_hub" / "data" / "vector_index" / "backups"
+    backup_dir.mkdir(parents=True)
+    pointer = app / "feedback_hub" / "data" / "vector_index" / "active-generation.json"
+    backup = backup_dir / "active-generation.json.pre-rebuild"
+    marker = backup_dir / "no-prior-active-generation.pre-rebuild"
+    if has_pointer:
+        pointer.write_text("{}", encoding="utf-8")
+        marker.write_text("stale", encoding="utf-8")
+    else:
+        backup.write_text("stale", encoding="utf-8")
+    _write_executable(
+        app / ".venv" / "bin" / "python",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -m ] && [ \"$2\" = json.tool ]; then exec python3 \"$@\"; fi\n"
+        "exit 0\n",
+    )
+    _write_executable(app / "scripts" / "vector_runtime.sh", "#!/bin/sh\nexit 0\n")
+    runnable = payload.replace("cd /opt/feedback_hub", f"cd {app}", 1)
+
+    syntax = subprocess.run(["bash", "-n"], input=runnable, text=True, capture_output=True)
+    result = subprocess.run(["bash", "-c", runnable], text=True, capture_output=True)
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (backup.exists(), marker.exists()) == (has_pointer, not has_pointer)
+
+
 def test_vector_deploy_scripts_parse_without_contacting_remote_hosts():
     for script in (VECTOR_DEPLOY, REGULAR_DEPLOY, RUNTIME):
         result = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
