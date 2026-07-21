@@ -10,11 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -53,6 +53,8 @@ def validate_vectors(
     """Reject data that cannot safely be published as a cosine-search shard."""
     if not isinstance(vectors, np.ndarray) or vectors.ndim != 2:
         raise ValueError("vectors must be a two-dimensional NumPy array")
+    if vectors.dtype != np.float32:
+        raise ValueError("vectors must have dtype float32")
     if vectors.shape[0] != expected_rows:
         raise ValueError("vector count does not match feedback IDs")
     if expected_rows <= 0:
@@ -77,6 +79,7 @@ class ShardStore:
         self.tmp_dir = self.root / "tmp"
         self.manifest_path = self.root / "manifest.json"
         self.publication_journal_path = self.root / "publication-journal.json"
+        self.publication_lock_path = self.root / ".publication.lock"
         self._highest_watermark = 0
         self.root.mkdir(parents=True, exist_ok=True)
         self.shards_dir.mkdir(exist_ok=True)
@@ -84,19 +87,20 @@ class ShardStore:
 
     @classmethod
     def from_config(cls, config: VectorIndexConfig) -> "ShardStore":
-        return cls(config.data_dir, dimension=config.dimension, model_version=config.model_version)
+        store = cls(config.data_dir, dimension=config.dimension, model_version=config.model_version)
+        repository = VectorRepository(config)
+        try:
+            repository.init_schema()
+            with store._publication_lock():
+                store.recover_publication(repository)
+        finally:
+            repository.close()
+        return store
 
     @classmethod
     def open(cls, config: VectorIndexConfig) -> "ShardStore":
         """Open a store only after resolving an interrupted DB/file publication."""
-        store = cls.from_config(config)
-        repository = VectorRepository(config)
-        try:
-            repository.init_schema()
-            store.recover_publication(repository)
-        finally:
-            repository.close()
-        return store
+        return cls.from_config(config)
 
     def shard_path(self, shard: ShardMetadata) -> Path:
         path = Path(shard.path)
@@ -159,37 +163,59 @@ class ShardStore:
     def publish_manifest(
         self, shards: Sequence[ShardMetadata], *, watermark_ts_ms: int
     ) -> ShardManifest:
-        for shard in shards:
-            self.verify_shard(shard)
-        manifest = self.manifest_for(shards, watermark_ts_ms=watermark_ts_ms)
-        self._replace_manifest(manifest)
-        return manifest
+        with self._publication_lock():
+            for shard in shards:
+                self.verify_shard(shard)
+            manifest = self.manifest_for(shards, watermark_ts_ms=watermark_ts_ms)
+            self._replace_manifest(manifest, expected_previous=self._read_manifest_if_present())
+            return manifest
 
     def publish_from_repository(
         self, repository: VectorRepository, *, watermark_ts_ms: int
     ) -> ShardManifest:
-        """Make database-active shards visible, recoverably, after a sync batch."""
-        rows = repository.connection.execute(
-            """SELECT shard_id, model_version, path, dimension, row_count, checksum
-               FROM embedding_shard WHERE state = 'active' AND model_version = ?
-               ORDER BY created_at_ms, shard_id""",
-            (self.model_version,),
-        ).fetchall()
-        shards = tuple(ShardMetadata(
-            shard_id=str(row[0]), model_version=str(row[1]), path=str(row[2]),
-            dimension=int(row[3]), row_count=int(row[4]), checksum=str(row[5]),
-        ) for row in rows)
-        for shard in shards:
-            self.verify_shard(shard)
-        old = self._read_manifest_if_present()
-        new = self.manifest_for(shards, watermark_ts_ms=watermark_ts_ms)
-        self.write_publication_journal(old, new, shards, [])
-        try:
-            self._replace_manifest(new)
-        except Exception:
-            raise
-        self._remove_journal()
-        return new
+        raise RuntimeError(
+            "database rows must be published through publish_with_database before commit"
+        )
+
+    def publish_with_database(
+        self,
+        repository: VectorRepository,
+        *,
+        old_manifest: ShardManifest | None,
+        new_manifest: ShardManifest,
+        new_shards: Sequence[ShardMetadata],
+        row_remap: Sequence[dict[str, Any]],
+        database_mutation: Callable[[], None],
+    ) -> ShardManifest:
+        """Commit one journaled SQLite/manifest generation under one writer lock.
+
+        Caller-owned SQLite transactions are rejected before writing a journal:
+        otherwise neither this method nor SQLite can know whether the caller
+        will commit before a manifest becomes visible.
+        """
+        if repository.connection.in_transaction:
+            raise RuntimeError("coordinated publication requires no caller-owned transaction")
+        with self._publication_lock():
+            current = self._read_manifest_if_present()
+            if not self._same_manifest(current, old_manifest):
+                raise RuntimeError("stale manifest generation")
+            self._validate_manifest_for_publication(new_manifest, previous=old_manifest)
+            if old_manifest is None and (
+                new_manifest.generation != 1 or new_manifest.previous_watermark_ts_ms != 0
+            ):
+                raise ValueError("manifest generation is not the first generation")
+            self._validate_remap(new_manifest, row_remap)
+            self.write_publication_journal(old_manifest, new_manifest, new_shards, row_remap)
+            try:
+                repository.connection.execute("BEGIN IMMEDIATE")
+                database_mutation()
+                repository.connection.commit()
+            except Exception:
+                repository.connection.rollback()
+                raise
+            self._replace_manifest(new_manifest, expected_previous=old_manifest)
+            self._remove_journal()
+            return new_manifest
 
     def load_manifest(self) -> ShardManifest:
         manifest = self._read_manifest_if_present()
@@ -206,6 +232,8 @@ class ShardStore:
         if shard.dimension != self.dimension:
             raise ValueError("shard dimension does not match manifest")
         path = self.shard_path(shard)
+        if shard.shard_id != shard.checksum[:24] or path.name != f"shard-{shard.checksum[:16]}.npy":
+            raise ValueError("shard identity does not match checksum-derived path")
         if not path.is_file():
             raise ValueError("manifest shard file is missing")
         if sha256_file(path) != shard.checksum:
@@ -250,23 +278,44 @@ class ShardStore:
             raise ValueError("invalid old publication manifest")
         if not isinstance(new_payload, dict):
             raise ValueError("invalid new publication manifest")
-        new_manifest = self._manifest_from_payload(new_payload, verify_files=True)
+        # Decide using SQLite before touching new files.  A previous rollback may
+        # already have deleted replacement files but crashed before unlinking the
+        # journal; that journal must remain recoverable and idempotent.
+        new_manifest = self._manifest_from_payload(new_payload, verify_files=False)
         new_shards_raw = payload.get("new_shards")
         remap = payload.get("row_remap")
         if not isinstance(new_shards_raw, list) or not isinstance(remap, list):
             raise ValueError("invalid publication journal")
         new_shards = tuple(self._shard_from_payload(item) for item in new_shards_raw)
-        if self._database_matches_journal(repository, new_shards, remap):
-            self._replace_manifest(new_manifest)
+        old_manifest = (
+            self._manifest_from_payload(old_payload, verify_files=False)
+            if old_payload is not None else None
+        )
+        live = self._read_manifest_if_present()
+        if self._is_newer_manifest(live, new_manifest):
+            # A later generation won the CAS race.  Never restore either side
+            # of a stale journal over it.
+            self._remove_journal()
+            return True
+        if self._database_matches_journal(repository, new_manifest, remap):
+            self._validate_manifest_for_publication(new_manifest)
+            if not self._same_manifest(live, new_manifest):
+                self._replace_manifest(new_manifest, expected_previous=old_manifest)
         else:
-            if old_payload is None:
-                if self.manifest_path.exists():
-                    self.manifest_path.unlink()
+            if self._same_manifest(live, new_manifest):
+                if old_manifest is None:
+                    self.manifest_path.unlink(missing_ok=True)
                     self._fsync_directory(self.root)
-            else:
-                old_manifest = self._manifest_from_payload(old_payload, verify_files=True)
-                self._replace_manifest(old_manifest)
+                else:
+                    self._validate_manifest_for_publication(old_manifest)
+                    self._replace_manifest(old_manifest, expected_previous=new_manifest)
+            elif not self._same_manifest(live, old_manifest):
+                raise ValueError("publication journal does not match live generation")
             referenced = self._database_paths(repository)
+            if old_manifest is not None:
+                referenced.update(self.shard_path(shard) for shard in old_manifest.shards)
+            if live is not None:
+                referenced.update(self.shard_path(shard) for shard in live.shards)
             for shard in new_shards:
                 path = self.shard_path(shard)
                 if path not in referenced and path.exists():
@@ -275,32 +324,34 @@ class ShardStore:
         self._remove_journal()
         return True
 
-    def find_orphans(self, repository: VectorRepository | None = None) -> list[Path]:
+    def find_orphans(self, repository: VectorRepository) -> list[Path]:
         """Return, but never remove, immutable files with no durable reference."""
-        referenced: set[Path] = set()
-        if repository is not None:
-            referenced.update(self._database_paths(repository))
-        for payload in self._manifest_payloads_from_disk():
-            for raw in payload.get("shards", []):
-                try:
-                    referenced.add(self.shard_path(self._shard_from_payload(raw)))
-                except (TypeError, ValueError):
-                    continue
+        referenced = self._database_paths(repository)
+        live = self._read_manifest_if_present()
+        if live is not None:
+            referenced.update(self.shard_path(shard) for shard in live.shards)
         if self.publication_journal_path.exists():
             journal = self._read_json(self.publication_journal_path)
+            if journal.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+                raise ValueError("unknown publication journal schema version")
+            new_payload = journal.get("new_manifest")
+            row_remap = journal.get("row_remap")
+            if not isinstance(new_payload, dict) or not isinstance(row_remap, list):
+                raise ValueError("invalid publication journal")
+            self._validate_remap(
+                self._manifest_from_payload(new_payload, verify_files=False), row_remap
+            )
             for key in ("old_manifest", "new_manifest"):
                 item = journal.get(key)
                 if isinstance(item, dict):
-                    for raw in item.get("shards", []):
-                        try:
-                            referenced.add(self.shard_path(self._shard_from_payload(raw)))
-                        except (TypeError, ValueError):
-                            continue
-            for raw in journal.get("new_shards", []):
-                try:
-                    referenced.add(self.shard_path(self._shard_from_payload(raw)))
-                except (TypeError, ValueError):
-                    continue
+                    manifest = self._manifest_from_payload(item, verify_files=False)
+                    referenced.update(self.shard_path(shard) for shard in manifest.shards)
+                elif item is not None:
+                    raise ValueError("invalid publication journal manifest")
+            raw_new_shards = journal.get("new_shards")
+            if not isinstance(raw_new_shards, list):
+                raise ValueError("invalid publication journal")
+            referenced.update(self.shard_path(self._shard_from_payload(raw)) for raw in raw_new_shards)
         return sorted(path.resolve() for path in self.shards_dir.glob("*.npy") if path.resolve() not in referenced)
 
     def _read_manifest_if_present(self) -> ShardManifest | None:
@@ -375,7 +426,14 @@ class ShardStore:
             "row_count": shard.row_count, "checksum": shard.checksum,
         }
 
-    def _replace_manifest(self, manifest: ShardManifest) -> None:
+    def _replace_manifest(
+        self, manifest: ShardManifest, *, expected_previous: ShardManifest | None = None
+    ) -> None:
+        current = self._read_manifest_if_present()
+        if expected_previous is not None and not self._same_manifest(current, expected_previous):
+            raise RuntimeError("manifest generation changed before publication")
+        if current is not None and self._is_newer_manifest(current, manifest):
+            raise RuntimeError("manifest generation would regress")
         self._atomic_json_replace(self.manifest_path, self._manifest_payload(manifest))
         self._highest_watermark = max(self._highest_watermark, manifest.watermark_ts_ms)
 
@@ -395,51 +453,122 @@ class ShardStore:
             self._fsync_directory(self.root)
 
     def _database_matches_journal(
-        self, repository: VectorRepository, new_shards: Sequence[ShardMetadata], remap: Sequence[Any]
+        self, repository: VectorRepository, manifest: ShardManifest, remap: Sequence[Any]
     ) -> bool:
         connection = repository.connection
-        for shard in new_shards:
-            row = connection.execute(
-                """SELECT model_version, dimension, row_count, checksum, state
-                   FROM embedding_shard WHERE shard_id = ?""", (shard.shard_id,)
-            ).fetchone()
-            if row is None or tuple(row) != (
-                shard.model_version, shard.dimension, shard.row_count, shard.checksum, "active"
+        try:
+            self._validate_remap(manifest, remap)
+        except ValueError:
+            return False
+        manifest_ids = {shard.shard_id for shard in manifest.shards}
+        active_rows = connection.execute(
+            """SELECT shard_id, model_version, dimension, row_count, checksum
+               FROM embedding_shard WHERE state = 'active' AND model_version = ?""",
+            (self.model_version,),
+        ).fetchall()
+        if {str(row[0]) for row in active_rows} != manifest_ids:
+            return False
+        by_id = {shard.shard_id: shard for shard in manifest.shards}
+        for row in active_rows:
+            shard = by_id[str(row[0])]
+            if tuple(row[1:]) != (
+                shard.model_version, shard.dimension, shard.row_count, shard.checksum
             ):
                 return False
-        for item in remap:
-            if not isinstance(item, dict):
-                return False
-            try:
-                row = connection.execute(
-                    """SELECT shard_id, row_offset FROM embedding_record
-                       WHERE feedback_id = ? AND model_version = ? AND content_hash = ?""",
-                    (item["feedback_id"], item["model_version"], item["content_hash"]),
-                ).fetchone()
-                if row is None or tuple(row) != (item["shard_id"], item["row_offset"]):
-                    return False
-            except (KeyError, TypeError):
+        expected = {
+            (str(item["feedback_id"]), str(item["model_version"]), str(item["content_hash"])):
+            (str(item["shard_id"]), int(item["row_offset"]))
+            for item in remap
+        }
+        rows = connection.execute(
+            """SELECT feedback_id, model_version, content_hash, shard_id, row_offset
+               FROM embedding_record WHERE shard_id IN (%s)"""
+            % ",".join("?" for _ in manifest.shards),
+            tuple(manifest_ids),
+        ).fetchall() if manifest.shards else []
+        actual = {
+            (str(row[0]), str(row[1]), str(row[2])): (str(row[3]), int(row[4]))
+            for row in rows
+        }
+        if len(actual) != len(rows) or actual != expected:
+            return False
+        for shard in manifest.shards:
+            offsets = [offset for assigned, offset in actual.values() if assigned == shard.shard_id]
+            if sorted(offsets) != list(range(shard.row_count)):
                 return False
         return True
+
+    def _validate_remap(self, manifest: ShardManifest, remap: Sequence[Any]) -> None:
+        expected_rows = sum(shard.row_count for shard in manifest.shards)
+        if len(remap) != expected_rows:
+            raise ValueError("publication remap must contain every vector row")
+        metadata = {shard.shard_id: shard for shard in manifest.shards}
+        identities: set[tuple[str, str, str]] = set()
+        positions: set[tuple[str, int]] = set()
+        for item in remap:
+            if not isinstance(item, dict):
+                raise ValueError("invalid publication remap")
+            try:
+                identity = (str(item["feedback_id"]), str(item["model_version"]), str(item["content_hash"]))
+                shard_id, row_offset = str(item["shard_id"]), int(item["row_offset"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid publication remap") from exc
+            shard = metadata.get(shard_id)
+            if (not all(identity) or shard is None or identity[1] != self.model_version
+                    or row_offset < 0 or row_offset >= shard.row_count):
+                raise ValueError("invalid publication remap")
+            if identity in identities or (shard_id, row_offset) in positions:
+                raise ValueError("publication remap is not one-to-one")
+            identities.add(identity)
+            positions.add((shard_id, row_offset))
+
+    def _validate_manifest_for_publication(
+        self, manifest: ShardManifest, *, previous: ShardManifest | None = None
+    ) -> None:
+        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            raise ValueError("unknown manifest schema version")
+        if manifest.model_version != self.model_version or manifest.dimension != self.dimension:
+            raise ValueError("manifest does not match shard store")
+        if previous is not None and (
+            manifest.generation != previous.generation + 1
+            or manifest.previous_watermark_ts_ms != previous.watermark_ts_ms
+            or manifest.watermark_ts_ms < previous.watermark_ts_ms
+        ):
+            raise ValueError("manifest generation or watermark is not the next generation")
+        for shard in manifest.shards:
+            self.verify_shard(shard)
+
+    @staticmethod
+    def _same_manifest(left: ShardManifest | None, right: ShardManifest | None) -> bool:
+        return left == right
+
+    @staticmethod
+    def _is_newer_manifest(left: ShardManifest | None, right: ShardManifest) -> bool:
+        return left is not None and (
+            left.generation > right.generation
+            or (left.generation == right.generation and left.watermark_ts_ms > right.watermark_ts_ms)
+        )
+
+    @contextmanager
+    def _publication_lock(self) -> Iterator[None]:
+        import fcntl
+
+        with self.publication_lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _database_paths(self, repository: VectorRepository) -> set[Path]:
         paths: set[Path] = set()
         rows = repository.connection.execute("SELECT path FROM embedding_shard").fetchall()
         for row in rows:
-            try:
-                paths.add(self.shard_path(ShardMetadata(
-                    shard_id="", model_version=self.model_version, path=str(row[0]),
-                    dimension=self.dimension, row_count=1, checksum="",
-                )))
-            except ValueError:
-                continue
+            paths.add(self.shard_path(ShardMetadata(
+                shard_id="", model_version=self.model_version, path=str(row[0]),
+                dimension=self.dimension, row_count=1, checksum="",
+            )))
         return paths
-
-    def _manifest_payloads_from_disk(self) -> Iterable[dict[str, Any]]:
-        if self.manifest_path.exists():
-            payload = self._read_json(self.manifest_path)
-            if isinstance(payload, dict):
-                yield payload
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -462,10 +591,8 @@ class ShardStore:
 
 def compact_active_shards(repository: VectorRepository, store: ShardStore) -> ShardManifest:
     """Replace all active shards with one generation, preserving exact row mappings."""
-    if repository.connection.in_transaction:
-        raise RuntimeError("compaction requires a repository without a caller-owned transaction")
     old = store.load_manifest()
-    if not old.shards:
+    if len(old.shards) <= 1:
         return old
     matrices: list[np.ndarray] = []
     remap: list[dict[str, Any]] = []
@@ -490,13 +617,11 @@ def compact_active_shards(repository: VectorRepository, store: ShardStore) -> Sh
     replacement = store.write_shard(np.vstack(matrices), [item["feedback_id"] for item in remap])
     remap = [{**item, "shard_id": replacement.shard_id} for item in remap]
     new = store.manifest_for([replacement], watermark_ts_ms=old.watermark_ts_ms)
-    store.write_publication_journal(old, new, [replacement], remap)
-    connection = repository.connection
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+
+    def database_mutation() -> None:
         repository._insert_shard(replacement)
         for item in remap:
-            cursor = connection.execute(
+            cursor = repository.connection.execute(
                 """UPDATE embedding_record SET shard_id = ?, row_offset = ?
                    WHERE feedback_id = ? AND model_version = ? AND content_hash = ?""",
                 (item["shard_id"], item["row_offset"], item["feedback_id"],
@@ -504,17 +629,15 @@ def compact_active_shards(repository: VectorRepository, store: ShardStore) -> Sh
             )
             if cursor.rowcount != 1:
                 raise ValueError("embedding record changed during compaction")
-        cursor = connection.execute(
-            "UPDATE embedding_shard SET state = 'retired' WHERE shard_id IN (%s)"
+        cursor = repository.connection.execute(
+            "UPDATE embedding_shard SET state = 'retired' WHERE state = 'active' AND shard_id IN (%s)"
             % ",".join("?" for _ in old.shards),
             tuple(item.shard_id for item in old.shards),
         )
         if cursor.rowcount != len(old.shards):
             raise ValueError("active shard changed during compaction")
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    store._replace_manifest(new)
-    store._remove_journal()
-    return new
+
+    return store.publish_with_database(
+        repository, old_manifest=old, new_manifest=new, new_shards=[replacement],
+        row_remap=remap, database_mutation=database_mutation,
+    )

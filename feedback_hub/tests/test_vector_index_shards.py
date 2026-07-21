@@ -83,6 +83,25 @@ def test_manifest_never_switches_to_an_unverified_shard(tmp_path):
     assert [item.shard_id for item in store.load_manifest().shards] == [first.shard_id]
 
 
+def test_write_shard_requires_float32_input(tmp_path):
+    store = ShardStore(tmp_path, dimension=2, model_version="m1")
+
+    with pytest.raises(ValueError, match="float32"):
+        store.write_shard(np.array([[1.0, 0.0]], dtype=np.float64), ["f1"])
+
+
+def test_manifest_rejects_shard_metadata_with_noncanonical_identity(tmp_path):
+    store = ShardStore(tmp_path, dimension=2, model_version="m1")
+    shard = store.write_shard(normalized([[1, 0]]), ["f1"])
+    forged = ShardMetadata(
+        shard_id="0" * 24, model_version=shard.model_version, path=shard.path,
+        dimension=shard.dimension, row_count=shard.row_count, checksum=shard.checksum,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        store.publish_manifest([forged], watermark_ts_ms=1)
+
+
 @pytest.fixture
 def vector_fixture(tmp_path):
     config = replace(
@@ -127,7 +146,7 @@ def vector_fixture(tmp_path):
 
         def fail_publication_after_database_commit(self):
             original = store._replace_manifest
-            store._replace_manifest = lambda manifest: (_ for _ in ()).throw(RuntimeError("stop"))
+            store._replace_manifest = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop"))
             try:
                 with pytest.raises(RuntimeError, match="stop"):
                     compact_active_shards(repo, store)
@@ -164,6 +183,66 @@ def test_startup_rolls_forward_database_committed_manifest_pending_publication(v
     assert not recovered.publication_journal_path.exists()
 
 
+def test_coordinated_publication_writes_journal_before_its_database_transaction(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    new = store.manifest_for(old.shards, watermark_ts_ms=old.watermark_ts_ms)
+    mappings = _manifest_mappings(repo, old.shards)
+    observed = []
+
+    def database_mutation():
+        observed.append((store.publication_journal_path.exists(), repo.connection.in_transaction))
+
+    published = store.publish_with_database(
+        repo, old_manifest=old, new_manifest=new, new_shards=[],
+        row_remap=mappings, database_mutation=database_mutation,
+    )
+
+    assert observed == [(True, True)]
+    assert published.generation == new.generation
+    assert not store.publication_journal_path.exists()
+
+
+def test_coordinated_publication_requires_the_next_manifest_generation(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    new = store.manifest_for(old.shards, watermark_ts_ms=old.watermark_ts_ms)
+    skipped = replace(new, generation=new.generation + 1)
+
+    with pytest.raises(ValueError, match="generation"):
+        store.publish_with_database(
+            repo, old_manifest=old, new_manifest=skipped, new_shards=[],
+            row_remap=_manifest_mappings(repo, old.shards), database_mutation=lambda: None,
+        )
+
+    assert not store.publication_journal_path.exists()
+
+
+def test_recovery_requires_complete_mapping_even_when_journal_remap_is_empty(vector_fixture):
+    store = vector_fixture.store
+    old = store.load_manifest()
+    new = store.manifest_for(old.shards, watermark_ts_ms=old.watermark_ts_ms)
+    store.write_publication_journal(old, new, [], [])
+
+    recovered = ShardStore.open(vector_fixture.config)
+
+    assert recovered.load_manifest().generation == old.generation
+
+
+def test_stale_journal_cannot_regress_a_newer_live_generation(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    target = store.manifest_for(old.shards, watermark_ts_ms=20)
+    store.publish_manifest(old.shards, watermark_ts_ms=20)
+    latest = store.publish_manifest(old.shards, watermark_ts_ms=30)
+    store.write_publication_journal(old, target, [], _manifest_mappings(repo, old.shards))
+
+    recovered = ShardStore.open(vector_fixture.config)
+
+    assert recovered.load_manifest().generation == latest.generation
+    assert recovered.load_manifest().watermark_ts_ms == latest.watermark_ts_ms
+
+
 def test_recovery_rolls_back_uncommitted_publication_and_discovers_only_true_orphans(vector_fixture):
     store = vector_fixture.store
     orphan = store.write_shard(normalized([[1, 0]]), ["orphan"])
@@ -177,3 +256,66 @@ def test_recovery_rolls_back_uncommitted_publication_and_discovers_only_true_orp
     assert [item.shard_id for item in recovered.load_manifest().shards] == [item.shard_id for item in old.shards]
     assert not recovered.shard_path(replacement).exists()
     assert recovered.find_orphans(vector_fixture.repo) == [recovered.shard_path(orphan)]
+
+
+def test_rollback_recovery_is_idempotent_after_replacement_file_was_already_deleted(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    replacement = store.write_shard(normalized([[-1, 0]]), ["replacement"])
+    new = store.manifest_for([replacement], watermark_ts_ms=old.watermark_ts_ms)
+    store.write_publication_journal(old, new, [replacement], [])
+    original_remove = store._remove_journal
+    store._remove_journal = lambda: (_ for _ in ()).throw(RuntimeError("crash"))
+    try:
+        with pytest.raises(RuntimeError, match="crash"):
+            store.recover_publication(repo)
+    finally:
+        store._remove_journal = original_remove
+
+    assert not store.shard_path(replacement).exists()
+    store.recover_publication(repo)
+
+    assert not store.publication_journal_path.exists()
+    assert store.load_manifest().generation == old.generation
+
+
+def test_orphan_discovery_refuses_malformed_durable_journal(vector_fixture):
+    store = vector_fixture.store
+    old = store.load_manifest()
+    store.publication_journal_path.write_text(json.dumps({
+        "schema_version": 1,
+        "old_manifest": store._manifest_payload(old),
+        "new_manifest": store._manifest_payload(old),
+        "new_shards": [],
+        "row_remap": "not-a-list",
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="journal"):
+        store.find_orphans(vector_fixture.repo)
+
+
+def test_compacting_one_healthy_active_shard_is_a_noop(vector_fixture):
+    compact_active_shards(vector_fixture.repo, vector_fixture.store)
+    before = vector_fixture.store.load_manifest()
+
+    after = compact_active_shards(vector_fixture.repo, vector_fixture.store)
+
+    assert after == before
+    assert vector_fixture.repo.status().active_shards == 1
+    assert vector_fixture.repo.status().retired_shards == 2
+
+
+def _manifest_mappings(repo, shards):
+    mappings = []
+    for shard in shards:
+        rows = repo.connection.execute(
+            """SELECT feedback_id, model_version, content_hash, row_offset
+               FROM embedding_record WHERE shard_id = ? ORDER BY row_offset""",
+            (shard.shard_id,),
+        ).fetchall()
+        mappings.extend({
+            "feedback_id": str(row[0]), "model_version": str(row[1]),
+            "content_hash": str(row[2]), "shard_id": shard.shard_id,
+            "row_offset": int(row[3]),
+        } for row in rows)
+    return mappings
