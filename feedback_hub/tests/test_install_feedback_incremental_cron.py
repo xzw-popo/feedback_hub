@@ -22,6 +22,7 @@ set -euo pipefail
 state="${FAKE_CRONTAB_STATE:?}"
 case "${1:-}" in
   -l)
+    if [[ -n "${FAKE_LIST_EXIT:-}" ]]; then exit "$FAKE_LIST_EXIT"; fi
     if [[ -f "$state" ]]; then cat "$state"; else exit 1; fi
     ;;
   -r)
@@ -33,9 +34,21 @@ case "${1:-}" in
       if ! mkdir "$FAKE_ACTIVE_LOCK" 2>/dev/null; then : > "${FAKE_OVERLAP_MARKER:?}"; fi
     fi
     if [[ -n "${FAKE_INSTALL_READY:-}" ]]; then : > "$FAKE_INSTALL_READY"; fi
-    if [[ -n "${FAKE_INSTALL_DELAY:-}" ]]; then sleep "$FAKE_INSTALL_DELAY"; fi
+    if [[ -n "${FAKE_INSTALL_DELAY:-}" ]]; then
+      if [[ -z "${FAKE_INSTALL_DELAY_ONCE_MARKER:-}" || ! -e "$FAKE_INSTALL_DELAY_ONCE_MARKER" ]]; then
+        [[ -z "${FAKE_INSTALL_DELAY_ONCE_MARKER:-}" ]] || : > "$FAKE_INSTALL_DELAY_ONCE_MARKER"
+        sleep "$FAKE_INSTALL_DELAY"
+      fi
+    fi
     cp -- "$1" "$state"
     [[ -z "${FAKE_ACTIVE_LOCK:-}" ]] || rmdir "$FAKE_ACTIVE_LOCK" 2>/dev/null || true
+    if [[ -n "${FAKE_POST_COPY_READY:-}" ]]; then : > "$FAKE_POST_COPY_READY"; fi
+    if [[ -n "${FAKE_POST_COPY_DELAY:-}" ]]; then
+      if [[ -z "${FAKE_POST_COPY_DELAY_ONCE_MARKER:-}" || ! -e "$FAKE_POST_COPY_DELAY_ONCE_MARKER" ]]; then
+        [[ -z "${FAKE_POST_COPY_DELAY_ONCE_MARKER:-}" ]] || : > "$FAKE_POST_COPY_DELAY_ONCE_MARKER"
+        sleep "$FAKE_POST_COPY_DELAY"
+      fi
+    fi
     if [[ "${FAKE_CORRUPT_ONCE:-0}" == 1 && ! -e "${FAKE_CORRUPT_MARKER:?}" ]]; then
       : > "$FAKE_CORRUPT_MARKER"
       printf 'corrupt\\n' > "$state"
@@ -246,26 +259,56 @@ def test_foreign_global_lock_is_never_removed_or_bypassed(tmp_path):
     state = tmp_path / "crontab-state"
     state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
     fake = _fake_crontab(tmp_path / "fake-crontab")
-    lock = tmp_path / f"feedback-incremental-crontab-{os.getuid()}.lock"
-    lock.mkdir(mode=0o700)
-    (lock / "owner").write_text("foreign-owner\n", encoding="utf-8")
-    completed = subprocess.run(
-        [str(SCRIPT), "--project-dir", str(project)],
-        text=True,
-        capture_output=True,
-        env={
-            **os.environ,
-            "TMPDIR": str(tmp_path),
-            "CRONTAB_BIN": str(fake),
-            "FAKE_CRONTAB_STATE": str(state),
-            "LOCK_RETRY_ATTEMPTS": "1",
-            "LOCK_RETRY_DELAY": "0",
-        },
-    )
+    lock = Path(f"/tmp/feedback-incremental-crontab-{os.getuid()}.lock")
+    lock.unlink(missing_ok=True)
+    lock.write_text(f"{os.getpid()} foreign-owner\n", encoding="utf-8")
+    try:
+        completed = subprocess.run(
+            [str(SCRIPT), "--project-dir", str(project)],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "TMPDIR": str(tmp_path),
+                "CRONTAB_BIN": str(fake),
+                "FAKE_CRONTAB_STATE": str(state),
+                "LOCK_RETRY_ATTEMPTS": "1",
+                "LOCK_RETRY_DELAY": "0",
+            },
+        )
 
-    assert completed.returncode != 0
-    assert state.read_text(encoding="utf-8") == "15 4 * * * /opt/other.sh\n"
-    assert (lock / "owner").read_text(encoding="utf-8") == "foreign-owner\n"
+        assert completed.returncode != 0
+        assert state.read_text(encoding="utf-8") == "15 4 * * * /opt/other.sh\n"
+        assert lock.read_text(encoding="utf-8") == f"{os.getpid()} foreign-owner\n"
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def test_definitely_dead_exact_owner_lock_is_reclaimed(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    lock = Path(f"/tmp/feedback-incremental-crontab-{os.getuid()}.lock")
+    lock.unlink(missing_ok=True)
+    lock.write_text("99999999 dead-owner\n", encoding="utf-8")
+    try:
+        completed = subprocess.run(
+            [str(SCRIPT), "--project-dir", str(project)],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "CRONTAB_BIN": str(fake),
+                "FAKE_CRONTAB_STATE": str(state),
+                "LOCK_RETRY_DELAY": "0",
+            },
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert not lock.exists()
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def test_term_releases_only_its_owned_global_lock(tmp_path):
@@ -282,6 +325,7 @@ def test_term_releases_only_its_owned_global_lock(tmp_path):
         "FAKE_CRONTAB_STATE": str(state),
         "FAKE_INSTALL_READY": str(ready),
         "FAKE_INSTALL_DELAY": "10",
+        "FAKE_INSTALL_DELAY_ONCE_MARKER": str(tmp_path / "install-delayed"),
     }
     run = subprocess.Popen(
         [str(SCRIPT), "--project-dir", str(project)],
@@ -300,3 +344,133 @@ def test_term_releases_only_its_owned_global_lock(tmp_path):
 
     assert run.returncode != 0, (stdout, stderr)
     assert not (tmp_path / f"feedback-incremental-crontab-{os.getuid()}.lock").exists()
+
+
+def test_read_failure_other_than_no_crontab_aborts_before_backup_or_mutation(tmp_path):
+    existing = "15 4 * * * /opt/other.sh\n"
+    completed, project, state = run_installer(tmp_path, existing, extra_env={"FAKE_LIST_EXIT": "42"})
+
+    assert completed.returncode == 42
+    assert state.read_text(encoding="utf-8") == existing
+    backup_dir = project / "feedback_hub" / "data" / "cron-backups"
+    assert not backup_dir.exists()
+    assert "Unable to read current crontab" in completed.stderr
+
+
+def test_installer_replaces_exact_legacy_production_job_with_env_and_redirect(tmp_path):
+    existing = (
+        "0 */2 * * * cd /opt/feedback_hub && "
+        "PYTHON_BIN=./.venv/bin/python APP_PORT=8000 "
+        "scripts/feedback_daily_sync.sh --last 150m --no-sync "
+        ">> /opt/feedback_hub/feedback_hub/data/logs/daily.log 2>&1\n"
+        "0 */2 * * * cd /opt/feedback_hub && PYTHON_BIN=./.venv/bin/python "
+        "scripts/feedback_daily_sync.sh --last 150m --no-sync --audit\n"
+    )
+    completed, _project, state = run_installer(tmp_path, existing)
+
+    assert completed.returncode == 0, completed.stderr
+    installed = state.read_text(encoding="utf-8")
+    assert "APP_PORT=8000" not in installed
+    assert "--no-sync --audit" in installed
+
+
+def test_global_lock_is_shared_even_when_callers_set_different_tmpdirs(tmp_path):
+    projects = [tmp_path / "one", tmp_path / "two"]
+    tmpdirs = [tmp_path / "tmp-one", tmp_path / "tmp-two"]
+    for project, temp_dir in zip(projects, tmpdirs):
+        (project / "feedback_hub" / "data").mkdir(parents=True)
+        temp_dir.mkdir()
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    active_lock = tmp_path / "fake-active"
+    overlap = tmp_path / "fake-overlap"
+    runs = []
+    for project, temp_dir in zip(projects, tmpdirs):
+        runs.append(subprocess.Popen(
+            [str(SCRIPT), "--project-dir", str(project)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "TMPDIR": str(temp_dir),
+                "CRONTAB_BIN": str(fake),
+                "FAKE_CRONTAB_STATE": str(state),
+                "FAKE_ACTIVE_LOCK": str(active_lock),
+                "FAKE_OVERLAP_MARKER": str(overlap),
+                "FAKE_INSTALL_DELAY": "0.2",
+            },
+        ))
+    output = [run.communicate(timeout=10) for run in runs]
+
+    assert [run.returncode for run in runs] == [0, 0], output
+    assert not overlap.exists()
+    assert state.read_text(encoding="utf-8").count("scripts/feedback_incremental_sync.sh") == 1
+
+
+def test_term_after_candidate_copy_restores_previous_crontab_and_releases_global_lock(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    existing = "15 4 * * * /opt/other.sh\n"
+    state = tmp_path / "crontab-state"
+    state.write_text(existing, encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    ready = tmp_path / "candidate-copied"
+    run = subprocess.Popen(
+        [str(SCRIPT), "--project-dir", str(project)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "CRONTAB_BIN": str(fake),
+            "FAKE_CRONTAB_STATE": str(state),
+            "FAKE_POST_COPY_READY": str(ready),
+            "FAKE_POST_COPY_DELAY": "10",
+            "FAKE_INSTALL_DELAY_ONCE_MARKER": str(tmp_path / "copy-delayed"),
+            "FAKE_POST_COPY_DELAY_ONCE_MARKER": str(tmp_path / "copy-post-delayed"),
+        },
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()
+    os.killpg(run.pid, signal.SIGTERM)
+    stdout, stderr = run.communicate(timeout=5)
+
+    assert run.returncode != 0, (stdout, stderr)
+    assert state.read_text(encoding="utf-8") == existing
+    assert not Path(f"/tmp/feedback-incremental-crontab-{os.getuid()}.lock").exists()
+
+
+def test_immediate_signal_after_global_lock_appearance_never_leaves_a_lock(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    state = tmp_path / "crontab-state"
+    state.write_text("15 4 * * * /opt/other.sh\n", encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    lock = Path(f"/tmp/feedback-incremental-crontab-{os.getuid()}.lock")
+    for _ in range(10):
+        run = subprocess.Popen(
+            [str(SCRIPT), "--project-dir", str(project)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "CRONTAB_BIN": str(fake),
+                "FAKE_CRONTAB_STATE": str(state),
+                "FAKE_INSTALL_DELAY": "10",
+                "FAKE_INSTALL_DELAY_ONCE_MARKER": str(tmp_path / f"delay-once-{_}"),
+            },
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 2
+        while not lock.exists() and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert lock.exists()
+        os.killpg(run.pid, signal.SIGTERM)
+        run.communicate(timeout=5)
+        assert not lock.exists()
