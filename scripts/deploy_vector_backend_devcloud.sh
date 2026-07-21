@@ -89,11 +89,11 @@ for directory, dirnames, filenames in os.walk(model_dir, followlinks=False):
         if (current / name).is_symlink():
             raise SystemExit(f"[vector-deploy] Model tree must not contain symlink: {current / name}")
     for filename in filenames:
-        if current == model_dir and filename in ignored_root_metadata:
-            continue
         path = current / filename
         if not path.is_file():
             raise SystemExit(f"[vector-deploy] Model tree entry is not a regular file: {path}")
+        if current == model_dir and filename in ignored_root_metadata:
+            continue
         resolved = path.resolve()
         try:
             relative = resolved.relative_to(model_dir).as_posix()

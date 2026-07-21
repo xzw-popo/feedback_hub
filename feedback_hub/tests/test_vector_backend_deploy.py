@@ -544,6 +544,37 @@ def test_vector_deploy_ignores_known_modelscope_metadata_in_manifest(tmp_path):
         assert f"  {filename}\n" in manifest
 
 
+def test_vector_deploy_rejects_modelscope_metadata_fifo_before_ssh(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model_dir / filename).write_text("fixture", encoding="utf-8")
+    os.mkfifo(model_dir / ".msc")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ssh_called = tmp_path / "ssh-called"
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/bin/sh\ntouch \"${SSH_CALLED:?}\"\nexit 99\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(VECTOR_DEPLOY)],
+        env={
+            **os.environ,
+            "MODEL_SOURCE_DIR": str(model_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SSH_CALLED": str(ssh_called),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "not a regular file" in result.stderr.lower()
+    assert not ssh_called.exists()
+
+
 @pytest.mark.parametrize(
     "unsafe_relative",
     [".unknown", ".metadata.json", ".hidden/payload.json", "nested/.msc"],
