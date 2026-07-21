@@ -16,8 +16,8 @@ from feedback_hub.topic_mining.service import RunVerificationError
 CUTOFF_MS = 1_700_000_000_000
 
 
-def _spec():
-    return validate_topic_spec({"schema_version": 1, "topic_name": "专题", "objective": "找工具栏", "scope": {"start_time": "2023-11-14T00:00:00+00:00", "end_time": "2023-11-16T00:00:00+00:00", "platforms": ["Win"], "products": ["微信输入法"]}, "unit": "feedback", "inclusion_criteria": ["工具栏"], "exclusion_criteria": ["系统任务栏"], "positive_examples": ["全屏工具栏"], "negative_examples": ["黑屏"], "lexical_hints": {"objects": ["工具栏"]}, "classification_labels": [{"id": "matched", "meaning": "命中"}, {"id": "not_matched", "meaning": "不命中"}], "output": {"preferred_format": "xlsx", "required_fields": ["feedback_text"]}})
+def _spec(*, mode: str = "standard"):
+    return validate_topic_spec({"schema_version": 1, "topic_name": "专题", "objective": "找工具栏", "scope": {"start_time": "2023-11-14T00:00:00+00:00", "end_time": "2023-11-16T00:00:00+00:00", "platforms": ["Win"], "products": ["微信输入法"]}, "unit": "feedback", "mode": mode, "inclusion_criteria": ["工具栏"], "exclusion_criteria": ["系统任务栏"], "positive_examples": ["全屏工具栏"], "negative_examples": ["黑屏"], "lexical_hints": {"objects": ["工具栏"]}, "classification_labels": [{"id": "matched", "meaning": "命中"}, {"id": "not_matched", "meaning": "不命中"}], "output": {"preferred_format": "xlsx", "required_fields": ["feedback_text"]}})
 
 
 def _row(run_id: str, item_id: str = "f-1") -> dict:
@@ -32,6 +32,29 @@ def _row(run_id: str, item_id: str = "f-1") -> dict:
             "source_url": "https://example.test/chat/1",
         },
     }
+
+
+def _rows(run_id: str, count: int) -> list[dict]:
+    rows = []
+    for index in range(count):
+        row = _row(run_id, f"f-{index:03d}")
+        item = row["source_item"]
+        item.update({
+            "ts_ms": CUTOFF_MS - index,
+            "channel": "pc" if index % 2 else "mobile",
+            "text": f"游戏全屏工具栏一直显示 {index}",
+            "source_url": f"https://example.test/chat/{index}",
+        })
+        row["evidence"] = [f"工具栏一直显示 {index}"]
+        rows.append(row)
+    return rows
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _persist_verified_manifest(
@@ -116,6 +139,76 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
     assert report["data_cutoff_ms"] == CUTOFF_MS
     assert report["required_fields"] == ["feedback_text"]
+
+
+def test_standard_export_limits_rows_and_reports_representative_scope(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 130)),
+        encoding="utf-8",
+    )
+    _persist_verified_manifest(store, run, final)
+
+    path = export_topic_run(run["run_id"], "jsonl", store=store)
+
+    assert len(_read_jsonl(path)) == 100
+    report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert {key: report[key] for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")} == {
+        "mode": "standard", "result_scope": "representative", "matched_total": 130,
+        "returned_feedback": 100, "possibly_more_matches": True,
+    }
+    manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert manifest["result_scope"] == "representative"
+    assert len(_read_jsonl(final)) == 130
+
+
+def test_standard_export_under_limit_reports_possible_unclassified_matches_in_xlsx_metadata(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 23)),
+        encoding="utf-8",
+    )
+    manifest = _persist_verified_manifest(store, run, final)
+    manifest.update({"retrieved_candidate_count": 130, "classified_count": 23})
+    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified")
+    (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    path = export_topic_run(run["run_id"], "xlsx", store=store)
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    metadata = dict(workbook["导出元数据"].iter_rows(values_only=True))
+    workbook.close()
+    assert metadata == {
+        "mode": "standard", "result_scope": "reviewed", "matched_total": 23,
+        "returned_feedback": 23, "possibly_more_matches": True,
+    }
+
+
+def test_exhaustive_export_keeps_all_reviewed_matches(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(mode="exhaustive"), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 130)),
+        encoding="utf-8",
+    )
+    _persist_verified_manifest(store, run, final)
+
+    path = export_topic_run(run["run_id"], "jsonl", store=store)
+
+    assert len(_read_jsonl(path)) == 130
+    report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert {key: report[key] for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")} == {
+        "mode": "exhaustive", "result_scope": "reviewed", "matched_total": 130,
+        "returned_feedback": 130, "possibly_more_matches": False,
+    }
 
 
 def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):

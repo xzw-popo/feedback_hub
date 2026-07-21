@@ -252,6 +252,42 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
     assert verify_topic_run(run["run_id"], store=store) == {
         "run_id": run["run_id"], "status": "verified", "matched_count": 2,
     }
+    verified_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
+    assert {
+        key: verified_manifest[key]
+        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
+    } == {
+        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
+        "returned_feedback": 2, "possibly_more_matches": False,
+    }
+    with TestClient(app) as client:
+        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
+    assert response.status_code == 200
+    assert {
+        key: response.json()[key]
+        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
+    } == {
+        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
+        "returned_feedback": 2, "possibly_more_matches": False,
+    }
+    # Verified runs created before scope metadata was introduced remain
+    # inspectable. The public response derives the exact bounded scope from
+    # the authenticated verification counts without rewriting the old run.
+    historical_manifest = json.loads(json.dumps(verified_manifest))
+    for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):
+        historical_manifest.pop(key)
+    store.update_manifest(run["run_id"], historical_manifest, stage="verified")
+    (artifact_dir / "manifest.json").write_text(json.dumps(historical_manifest), encoding="utf-8")
+    with TestClient(app) as client:
+        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
+    assert response.status_code == 200
+    assert {
+        key: response.json()[key]
+        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
+    } == {
+        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
+        "returned_feedback": 2, "possibly_more_matches": False,
+    }
     final_reviewed = [json.loads(line) for line in (artifact_dir / "final_reviewed.jsonl").read_text(encoding="utf-8").splitlines()]
     final_by_id = {row["item_id"]: row for row in final_reviewed}
     assert final_by_id["win-paraphrase"]["evidence"] == ["悬浮控件遮住画面"]

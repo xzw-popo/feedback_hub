@@ -21,7 +21,7 @@ from typing import Any, Mapping, Sequence
 
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
-from .diversity import select_diverse_candidates
+from .diversity import select_diverse_candidates, select_representative_results
 from .contracts import TopicSpec, topic_spec_hash, validate_topic_spec
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
@@ -48,6 +48,7 @@ _CLASSIFICATION_WORK_FILES = (
     "classification_audit.jsonl",
     "classified.jsonl",
 )
+_STANDARD_RESULT_LIMIT = 100
 
 
 def default_store(config: TopicMiningConfig | None = None) -> TopicRunStore:
@@ -513,8 +514,13 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         final_rows, spec, contexts=contexts, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,
     )
+    scope = _result_scope(
+        spec, final_rows, {hit.item_id: hit for hit in recalls}, manifest,
+        classified_count=len(classifications),
+    )
     final_bytes = _jsonl_bytes(final_rows)
     proposed = json.loads(json.dumps(manifest))
+    proposed.update(scope)
     proposed["verified"] = {
         "matched_count": len(final_rows),
         "verified_at_ms": int(time.time() * 1000),
@@ -534,6 +540,51 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         files={"final_reviewed.jsonl": final_bytes},
     )
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
+
+
+def _result_scope(
+    spec: TopicSpec,
+    rows: Sequence[Mapping[str, Any]],
+    recall_by_id: Mapping[str, RecallHit],
+    manifest: Mapping[str, Any],
+    *,
+    classified_count: int | None = None,
+) -> dict[str, Any]:
+    """Describe exactly what a downloadable result may claim to cover."""
+    matched_total = len(rows)
+    if spec.mode == "standard":
+        returned_feedback = len(select_representative_results(
+            rows, recall_by_id, limit=_STANDARD_RESULT_LIMIT,
+        ))
+    else:
+        returned_feedback = matched_total
+    fallback_classified = (
+        classified_count
+        if classified_count is not None
+        else (len(recall_by_id) if recall_by_id else matched_total)
+    )
+    manifest_classified = manifest.get("classified_count", fallback_classified)
+    if isinstance(manifest_classified, bool) or not isinstance(manifest_classified, int):
+        manifest_classified = fallback_classified
+    retrieved = manifest.get("retrieved_candidate_count", len(recall_by_id) or manifest_classified)
+    if isinstance(retrieved, bool) or not isinstance(retrieved, int):
+        retrieved = len(recall_by_id) or manifest_classified
+    return {
+        "mode": spec.mode,
+        "result_scope": (
+            "representative"
+            if spec.mode == "standard" and matched_total > returned_feedback
+            else "reviewed"
+        ),
+        "matched_total": matched_total,
+        "returned_feedback": returned_feedback,
+        "possibly_more_matches": (
+            spec.mode == "standard" and (
+                retrieved > manifest_classified
+                or matched_total > returned_feedback
+            )
+        ),
+    }
 
 
 def _final_row(

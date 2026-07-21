@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
-from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _require_run, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
+from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
+from .diversity import select_representative_results
 from .contracts import validate_topic_spec
 
 
@@ -42,7 +43,18 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         expected_data_cutoff_ms=data_cutoff_ms,
     )
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))
-    export_rows = [_export_row(row) for row in rows]
+    recall_by_id = _verified_recall_by_id(manifest, artifact_dir)
+    if recall_by_id and not {str(row["item_id"]) for row in rows} <= set(recall_by_id):
+        raise RunVerificationError("final_result_not_in_recall_pool")
+    scope = _result_scope(spec, rows, recall_by_id, manifest)
+    selected_rows = (
+        select_representative_results(rows, recall_by_id, limit=100)
+        if spec.mode == "standard"
+        else list(rows)
+    )
+    if len(selected_rows) != scope["returned_feedback"]:
+        raise RunVerificationError("result_scope_mismatch")
+    export_rows = [_export_row(row) for row in selected_rows]
     required_fields = tuple(spec.output["required_fields"])
     if any(
         not set(required_fields).issubset(export_row)
@@ -59,6 +71,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         "artifact": jsonl_path.name, "data_cutoff_ms": data_cutoff_ms,
         "data_cutoff_time": _format_time(data_cutoff_ms),
         "required_fields": list(required_fields),
+        **scope,
     }
     report_bytes = (
         json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -68,13 +81,15 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         "quality_report.json": report_bytes,
     }
     if export_format == "jsonl":
+        manifest.update(scope)
         _publish_terminal_mutation(
             run, store, manifest, stage="verified", status="verified",
             files=files,
         )
         return jsonl_path
     workbook_path = artifact_dir / "feedback_list.xlsx"
-    files[workbook_path.name] = _xlsx_bytes(rows)
+    files[workbook_path.name] = _xlsx_bytes(selected_rows, scope)
+    manifest.update(scope)
     _publish_terminal_mutation(
         run, store, manifest, stage="verified", status="verified",
         files=files,
@@ -82,8 +97,34 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     return workbook_path
 
 
-def _write_xlsx(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    path.write_bytes(_xlsx_bytes(rows))
+def _verified_recall_by_id(
+    manifest: Mapping[str, Any], artifact_dir: Path,
+) -> dict[str, Any]:
+    recall_path = artifact_dir / "recall_candidates.jsonl"
+    artifacts = manifest.get("artifacts")
+    if not recall_path.is_file() and (
+        not isinstance(artifacts, Mapping) or recall_path.name not in artifacts
+    ):
+        return {}
+    try:
+        recalls = [
+            _recall_from_dict(row)
+            for line in read_verified_artifact_bytes(manifest, recall_path).decode("utf-8").splitlines()
+            if line.strip()
+            for row in [json.loads(line)]
+        ]
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RunVerificationError("invalid_artifact") from exc
+    recall_by_id = {recall.item_id: recall for recall in recalls}
+    if len(recall_by_id) != len(recalls):
+        raise RunVerificationError("duplicate_item_id")
+    return recall_by_id
+
+
+def _write_xlsx(
+    path: Path, rows: Sequence[Mapping[str, Any]], scope: Mapping[str, Any],
+) -> None:
+    path.write_bytes(_xlsx_bytes(rows, scope))
 
 
 def _export_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -97,7 +138,9 @@ def _export_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _xlsx_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
+def _xlsx_bytes(
+    rows: Sequence[Mapping[str, Any]], scope: Mapping[str, Any],
+) -> bytes:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -132,6 +175,14 @@ def _xlsx_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
         for cell in row:
             cell.font = Font(name="Aptos", size=10)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
+    metadata = workbook.create_sheet("导出元数据")
+    for key in (
+        "mode", "result_scope", "matched_total", "returned_feedback",
+        "possibly_more_matches",
+    ):
+        metadata.append([key, scope[key]])
+    metadata.column_dimensions["A"].width = 26
+    metadata.column_dimensions["B"].width = 24
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()

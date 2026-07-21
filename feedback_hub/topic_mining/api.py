@@ -326,7 +326,17 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=_redact(str(exc), config)) from None
-        return {"run_id": run_id, "artifact_name": path.name, "format": export_format}
+        manifest = _manifest(_get_or_404(run_id, store))
+        return {
+            "run_id": run_id, "artifact_name": path.name, "format": export_format,
+            **{
+                key: manifest.get(key)
+                for key in (
+                    "mode", "result_scope", "matched_total",
+                    "returned_feedback", "possibly_more_matches",
+                )
+            },
+        }
 
     @router.get("/runs/{run_id}/artifacts/{artifact_name}", dependencies=[Depends(require_token)])
     def artifact(run_id: str, artifact_name: str):
@@ -377,16 +387,67 @@ def _public_run(run: dict[str, Any]) -> dict[str, Any]:
     manifest = _manifest(run)
     classifier = manifest.get("classifier", {}) if isinstance(manifest.get("classifier"), dict) else {}
     source_watermark_ms = _effective_data_cutoff(run, manifest)
+    result_scope = _public_result_scope(run, manifest)
     return {
         "run_id": run["run_id"], "status": run["status"], "stage": run["stage"],
         "error_code": run.get("error_code"), "error_message": run.get("error_message"),
         "created": bool(run.get("created", False)), "source_watermark_ms": source_watermark_ms,
+        **result_scope,
         "quality": {
             "funnel": manifest.get("funnel", {}), "source_watermark_ms": source_watermark_ms,
             "vector_watermark_ms": manifest.get("vector_watermark_ms"),
             "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items")},
             "models": classifier.get("models", []), "retry_total": classifier.get("retry_total", 0),
         },
+    }
+
+
+_RESULT_SCOPE_KEYS = (
+    "mode", "result_scope", "matched_total", "returned_feedback",
+    "possibly_more_matches",
+)
+
+
+def _public_result_scope(
+    run: dict[str, Any], manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose scope for legacy verified runs without mutating their record."""
+    if all(key in manifest for key in _RESULT_SCOPE_KEYS):
+        return {key: manifest[key] for key in _RESULT_SCOPE_KEYS}
+    if run.get("status") != "verified":
+        return {key: None for key in _RESULT_SCOPE_KEYS}
+    verified = manifest.get("verified")
+    matched_total = (
+        verified.get("matched_count") if isinstance(verified, dict) else None
+    )
+    if isinstance(matched_total, bool) or not isinstance(matched_total, int):
+        return {key: None for key in _RESULT_SCOPE_KEYS}
+    try:
+        spec = validate_topic_spec(json.loads(run["spec_json"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return {key: None for key in _RESULT_SCOPE_KEYS}
+    classified_count = manifest.get("classified_count", matched_total)
+    if isinstance(classified_count, bool) or not isinstance(classified_count, int):
+        classified_count = matched_total
+    retrieved_count = manifest.get("retrieved_candidate_count", classified_count)
+    if isinstance(retrieved_count, bool) or not isinstance(retrieved_count, int):
+        retrieved_count = classified_count
+    returned_feedback = min(matched_total, 100) if spec.mode == "standard" else matched_total
+    return {
+        "mode": spec.mode,
+        "result_scope": (
+            "representative"
+            if spec.mode == "standard" and matched_total > returned_feedback
+            else "reviewed"
+        ),
+        "matched_total": matched_total,
+        "returned_feedback": returned_feedback,
+        "possibly_more_matches": (
+            spec.mode == "standard" and (
+                retrieved_count > classified_count
+                or matched_total > returned_feedback
+            )
+        ),
     }
 
 
