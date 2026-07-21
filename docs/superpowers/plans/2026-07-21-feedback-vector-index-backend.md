@@ -315,7 +315,7 @@ Expected: all tests PASS without loading the real model.
 Run:
 
 ```bash
-python3 -c 'import json,numpy as np; from dataclasses import replace; from pathlib import Path; from feedback_hub.vector_index.config import VectorIndexConfig; from feedback_hub.vector_index.encoder import QwenEmbeddingEncoder; c=replace(VectorIndexConfig(), model_dir=Path("feedback_hub/data/embedding_lab/models/Qwen3-Embedding-0.6B")); v=QwenEmbeddingEncoder(c).encode_queries(["工具栏不会隐藏"]); print(json.dumps({"shape":list(v.shape),"dtype":str(v.dtype),"norm":float(np.linalg.norm(v[0]))}))'
+python3 -c 'import json,numpy as np; from dataclasses import replace; from pathlib import Path; from feedback_hub.vector_index.config import VectorIndexConfig; from feedback_hub.vector_index.encoder import QwenEmbeddingEncoder; c=replace(VectorIndexConfig(), model_dir=Path("/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/embedding_lab/models/Qwen3-Embedding-0.6B")); v=QwenEmbeddingEncoder(c).encode_queries(["工具栏不会隐藏"]); print(json.dumps({"shape":list(v.shape),"dtype":str(v.dtype),"norm":float(np.linalg.norm(v[0]))}))'
 ```
 
 Expected: JSON reports `shape: [1, 1024]`, `dtype: float32`, and norm within `0.999..1.001`.
