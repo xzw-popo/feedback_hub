@@ -41,14 +41,13 @@ VITE_API_BASE_URL= npm --prefix dashboard run build
 
 echo "[deploy] Creating archive..."
 export COPYFILE_DISABLE=1
-TAR_ENV_EXCLUDES=()
+TAR_ENV_EXCLUDES=("--exclude=.git")
 while IFS= read -r -d '' ENV_PATH; do
   TAR_ENV_EXCLUDES+=("--exclude=${ENV_PATH#./}")
 done < <(find . \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print0)
 # Persisted paths include feedback_hub/data/models/Qwen3-Embedding-0.6B and feedback_hub/data/vector_index.
 tar \
   "${TAR_ENV_EXCLUDES[@]}" \
-  --exclude='.git' \
   --exclude='.pytest_cache' \
   --exclude='.vite' \
   --exclude='.DS_Store' \
