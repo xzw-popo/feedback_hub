@@ -26,4 +26,10 @@ Keep every target object and behavior named by the user as required inclusion co
 
 For example, `语音输入结束后文字不上屏` can include “speech ends but recognized text is not inserted into the focused field” and exclude recognition errors, microphone failures, or ordinary clipboard use. Put those boundaries in criteria and examples, not in backend settings. Hints may contain terms such as “语音输入”, “上屏”, and “焦点”, but they only broaden recall.
 
-Validate the completed file with [`validate_topic_spec.py`](../scripts/validate_topic_spec.py) before creating a run. Read the bundled [schema](topic-spec.schema.json) when exact structure is needed.
+Prepare a separate canonical JSON file before creating a run:
+
+```bash
+python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH
+```
+
+The validator leaves `TOPIC_SPEC_PATH` unchanged, atomically writes `PREPARED_SPEC_PATH`, and prints the same canonical JSON to stdout for compatibility. It rejects using the source path as output and removes temporary files after write errors. Pass only `PREPARED_SPEC_PATH` to `create-run`. Read the bundled [schema](topic-spec.schema.json) when exact structure is needed.

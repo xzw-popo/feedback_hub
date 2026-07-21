@@ -55,6 +55,7 @@
       "unnecessary_blocking_question",
       "silent_partial_result",
       "wrong_default_time",
+      "invented_time_boundary",
       "invented_or_wrong_mode",
       "partial_review_queue",
       "missing_result_scope",

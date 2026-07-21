@@ -1,6 +1,6 @@
 # With-Skill Evaluation: Mining Feedback Topics
 
-All agents received the Skill by absolute path in a fresh context. They were not given the rubric, baseline failures, or expected answer. No topic service URL was configured, so forward tests could not mutate a live service.
+This file preserves several evaluation generations. Sections explicitly labeled with-Skill received the Skill by absolute path in a fresh context; the Phase 3 baseline explicitly did not. Agents were not given the rubric or expected answer. No topic service URL was configured, and the Phase 3 prompts prohibited service execution, so these tests did not mutate a live service.
 
 ## Phase 3 policy baseline (before new guidance)
 
@@ -18,11 +18,142 @@ Observed choices and rationalizations:
 
 The baseline shows that mode naming, the 14-day default, one-sided-time behavior, and representative delivery require positive structural guidance. Pagination still needs an explicit loop in the Skill because the correct baseline depended on the API constraint being supplied in the prompt; the distributable Skill must carry that constraint itself.
 
+### Phase 3 baseline raw outputs
+
+The following text is preserved from the single fresh-context baseline response, split only at its original A–E bullets.
+
+#### default-time
+
+> A「找工具栏错位反馈」（无时间）
+> - 时间：不擅自理解为全历史。优先追问；若允许默认执行，采用产品约定的默认窗口，例如最近 30 天，`end_time=当前时间`。
+> - mode：`standard`，适合普通主题检索。
+> - 审查：拉取全部实际队列并处理，不只看第一页。
+> - 披露：明确写“结果覆盖最近 30 天，并非全历史”；同时说明检索词、语义范围及导出时间。
+> - 原因：无时间条件时，全历史既可能昂贵，也容易让用户误以为结果完整。
+
+#### one-sided-time
+
+> B 只给 `start_time`
+> - 时间：将 `end_time` 明确补为运行创建时的当前时间，并固定该时间，避免运行过程中窗口漂移。
+> - mode：默认 `standard`，除非请求还含“全部/完整”等完整性要求。
+> - 审查：完整分页至 `next_offset` 为空。
+> - 披露：写明实际闭区间/半开区间，例如 `[start_time, 固定的 end_time)`，并注明 `end_time` 是系统补全值。
+> - 原因：这最贴近“从某时起到现在”，且结果可复现。
+
+#### multi-page-review
+
+> C 预计审查队列 113 条
+> - 审查调用：`review-queue(limit=50, offset=0)`，再按返回值调用 `offset=50`、`offset=100`；最后一页预计 13 条。始终使用服务返回的 `next_offset`，不自行假定总数。
+> - 覆盖全部 113 条后统一 `apply-overrides`，再 `verify`、`export`。
+> - 披露：报告实际审查数、修改数、保留/排除数和是否仍有未决项。
+> - 原因：API 单页最多 50；只取一页会造成静默漏审。
+
+#### explicit-exhaustive
+
+> D「我要全部/完整结果」
+> - 时间：仍需明确时间边界；“全部”不能替代 scope。若用户未给时间，先追问是全历史还是指定区间。
+> - mode：选择 `capabilities` 中面向完整召回的模式，如 `comprehensive/full`，不用 `standard`。
+> - 审查：遍历完整队列、解决未决项、`verify` 通过后才导出。
+> - 披露：避免绝对承诺“零遗漏”；写明完整性是“在指定数据源、时间范围、权限、系统索引和当前能力上限内”，同时披露任何截断、失败源、未决项及去重规则。
+> - 原因：“完整”要求更高召回和更严格的可审计披露。
+
+#### six-month-standard
+
+> E「看过去六个月”，但 `standard` 最多候选 500/输出 100
+> - 时间：固定为创建时刻往前六个月至该时刻，并披露采用自然月还是 180 天；优先按自然月解释并给出精确时间戳。
+> - mode：优先改用无该截断或上限更高的 `comprehensive/full`。若能力中没有，则把六个月拆成较小、不重叠窗口分别运行，直到每窗不触顶；合并后按稳定反馈 ID 去重，再统一审查、验证和导出。
+> - 审查：每个 run 都按 `next_offset` 全量分页，最终披露跨窗合并与去重数量。
+> - 披露：如果任何窗口仍达到 500 候选或 100 输出上限，明确标记“结果被截断，不能称为六个月完整结果”；若只能使用 `standard`，应将交付称为“最多 100 条的标准模式结果/每窗结果”，而非“全部”。
+> - 原因：直接跑一个六个月的 `standard` run 存在明显静默截断风险；切换模式或分窗能降低压力并提高覆盖可解释性。
+
+### Phase 3 baseline scoring
+
+| Scenario | Failure codes present | Evidence |
+| --- | --- | --- |
+| default-time | `wrong_default_time` | Asked or invented 30 days instead of using 14. |
+| one-sided-time | `invented_time_boundary` | Invented current `end_time` instead of asking one boundary question. |
+| multi-page-review | none | Followed all pages and merged before submit. |
+| explicit-exhaustive | `invented_or_wrong_mode` | Invented `comprehensive/full`. |
+| six-month-standard | `invented_or_wrong_mode`, `missing_result_scope` | Escalated/split instead of one bounded standard representative run. |
+
 ### Phase 3 minimal-context forward test
 
-A fresh agent then received the revised Skill by absolute path and the same five planning-only scenarios. It made no service calls. It correctly used the 14-day default, blocked on one-sided time, chose canonical `standard`/`exhaustive`, followed all three expected pages for 113 items, merged before one override submission, and disclosed all scope fields. One new loophole appeared: for a successful exhaustive run it invented `result_scope=complete`, although the backend only returns `reviewed` or `representative`. A package test was added and observed failing; delivery guidance and the backend contract now require copying one of the backend-returned values and forbid invented scope values.
+A fresh agent then received the revised Skill by absolute path and the same five planning-only scenarios. It made no service calls. It correctly used the 14-day default, blocked on one-sided time, chose canonical `standard`/`exhaustive`, followed all three expected pages for 113 items, merged before one override submission, and described the five backend scope fields required for runnable deliveries. One new loophole appeared: for a successful exhaustive run it invented `result_scope=complete`, although the backend only returns `reviewed` or `representative`. A package test was added and observed failing; delivery guidance and the backend contract now require copying one of the backend-returned values and forbid invented scope values.
+
+### Phase 3 first forward-test raw outputs
+
+The following text is preserved from the single fresh-context with-Skill response, split only at its original A–E bullets.
+
+#### default-time
+
+> A. 无时间边界：把 capabilities 的 default_time_days=14 物化为固定 RFC3339 窗口；end_time=规划/建 spec 时固定的 Asia/Shanghai 当前时刻，start_time=end_time−14天（不能默认全历史）。mode=standard。若进入 review，limit=50，从 offset=0 按返回 next_offset 翻到 null，合并全部 item_id 的显式决定后仅 apply-overrides 一次。交付必须报 mode/result_scope/matched_total/returned_feedback/possibly_more_matches；standard 候选上限500、导出最多100，若 result_scope=representative 或 possibly_more_matches=true，只能称代表性清单。
+
+#### one-sided-time
+
+> B. 只有 start_time=2026-07-01T00:00:00+08:00：这是单边界，不能补默认 end_time；必须问原文：‘What start time, end time, and timezone should this run use?’ 在补齐前阻塞，不 create/review/export，也无交付物；可提议 mode=standard，scope 列表仍只填用户明确项。最终若运行，仍按完整 review 分页一次提交，并交付上述5字段。
+
+#### multi-page-review
+
+> C. review queue=113：从 offset=0、limit=50 开始，严格跟随每页 next_offset；正常会是3页（0/50/100），但不可凭 total 推算，须直到 next_offset=null。审核全部113个 source_item+context_items，每项一个显式决定（含维持原标签），按 item_id 合并/拒绝重复，最后一次性提交113条；不得先交第一页。matched 且原无证据时 evidence 必须为 source/context 原文精确子串。mode/time/交付范围沿用该 run；交付仍报5字段。
+
+#### explicit-exhaustive
+
+> D. ‘过去半年全部、完整’：在建 spec 时把 Asia/Shanghai 的固定当前时刻作为 end_time，start_time 为同一当地时刻向前6个月；显式‘全部、完整’=> mode=exhaustive。review 仍全页后一次提交。仅在无覆盖缺口/陈旧索引/漏分类/证据或链接问题且无5000候选安全截断时，才能交付完整：result_scope=complete、returned_feedback=matched_total、possibly_more_matches=false；若安全限截断则必须披露，并不能称完整（相应 scope/flag 以服务返回为准）。
+
+#### six-month-standard
+
+> E. ‘过去六个月…代表性清单’：同样物化固定 Asia/Shanghai 当前时刻至向前6个月；六个月本身不等于 exhaustive，且明确要代表性清单=> mode=standard。review 全页后一次提交。交付报 mode=standard、result_scope=representative、matched_total、returned_feedback（最多100）、possibly_more_matches（按后端；受候选/结果限制时通常为true），明确不是完整清单。
+
+### Phase 3 first forward-test scoring
+
+| Scenario | Failure codes present | Evidence |
+| --- | --- | --- |
+| default-time | none | Used 14 days, standard mode, full paging, and all five fields. |
+| one-sided-time | none | Asked one direct boundary question and did not create a run. |
+| multi-page-review | none | Followed offsets through null and submitted one 113-item set. |
+| explicit-exhaustive | `missing_result_scope` | Invented non-contract `result_scope=complete`; other mode/paging behavior passed. |
+| six-month-standard | none | Kept one bounded standard run and disclosed representative semantics. |
 
 A second fresh-context exhaustive-only rerun closed that loophole: it selected `mode=exhaustive`, followed `next_offset` with `limit=50` through null, submitted one merged decision set, and stated that `result_scope` must be the returned `reviewed` or `representative` value—explicitly rejecting invented `complete`. It also preserved coverage, evidence, link, no-direct-database, and no-formal-label constraints. This forward test remained planning-only and did not touch production.
+
+### Phase 3 exhaustive rerun raw output
+
+> 方案如下（仅规划，未连接服务、未创建 run、未验证或产出文件）：
+>
+> - 时间：以 Asia/Shanghai 固定解析“过去半年”为 6 个自然月，当前计划窗口为 `2026-01-22T04:30:05+08:00` 至 `2026-07-22T04:30:05+08:00`；执行时不滚动窗口，也不改用默认 14 天。
+> - 主题边界：必须同时满足“工具栏”对象与“错位/位置偏移/布局错乱”行为。排除非工具栏区域、单纯缺失/按钮失效、尺寸或样式问题但没有位置错乱。未指定的 `platforms/products/channels/versions` 保持空列表，不推断。
+> - 规格：`schema_version: 1`、`unit: feedback`、`mode: exhaustive`（因“全部、完整”明确要求穷尽）；输出 `xlsx`，字段仅为 `feedback_text`、`feedback_time`、`source_url`。
+> - 执行前先调用 `capabilities` 确认服务实际 schema、格式、状态、只读策略、范围与限额，再校验 spec。`exhaustive` 取消普通 100 行导出上限，但仍受候选安全上限约束，因此不能预先承诺绝对完整。
+> - 复核：从 `offset=0`、`limit=50` 开始，严格按每页返回的 `next_offset` 翻页，直到其为 `null`。逐项查看 `source_item` 和 `context_items`；所有项都提交明确决定，包括维持原标签的确认。无既有证据却判为 `matched` 时，证据必须是源文本或上下文中的精确子串。按 `item_id` 合并全部页面、拒绝重复，并仅调用一次 `apply-overrides` 提交完整决策集。
+> - 交付必须原样报告：`run_id`、`cutoff`、各阶段 counts、limitations、`mode=exhaustive`、后端返回的 `result_scope`、`matched_total`、`returned_feedback`、`possibly_more_matches`。其中 `result_scope` 只能是 `reviewed` 或 `representative`；不得写成 `complete`。`representative` 或 `possibly_more_matches=true` 均表示仍可能有更多匹配，不能宣称“全部完整”。只有验证满足零覆盖缺口、零陈旧索引违规、分类覆盖精确、证据和链接有效后，才能交付实际存在的 `feedback_list.xlsx`。
+
+Post-refactor scoring: `explicit-exhaustive` has no Phase 3 failure code present.
+
+### Prepared-spec handoff forward test
+
+A fresh-context, planning-only run after the review fix preserved the exact handoff and field allowlist:
+
+> ```bash
+> TOPIC_SPEC_PATH=/tmp/toolbar-misalignment-topic-source.json
+> PREPARED_SPEC_PATH=/tmp/toolbar-misalignment-topic-prepared.json
+>
+> python3 scripts/validate_topic_spec.py \
+>   --default-now 'NOW_RFC3339_ASIA_SHANGHAI' \
+>   --default-days 14 \
+>   --output "$PREPARED_SPEC_PATH" \
+>   "$TOPIC_SPEC_PATH"
+>
+> python3 scripts/topic_backend_client.py create-run \
+>   --spec "$PREPARED_SPEC_PATH"
+> ```
+>
+> 校验器保持 `TOPIC_SPEC_PATH` 不变，并原子写入独立的 canonical JSON `PREPARED_SPEC_PATH`；`create-run` 只能接收后者，绝不能传源文件。
+>
+> 最终交付仅照抄后端返回的五个字段：
+>
+> `mode`、`result_scope`、`matched_total`、`returned_feedback`、`possibly_more_matches`。
+
+Scoring: no prepared-handoff, default-time, mode, or delivery-field failure was present. No service was called.
 
 ## Micro-test control
 

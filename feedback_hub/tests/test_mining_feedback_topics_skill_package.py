@@ -122,6 +122,99 @@ def test_skill_validator_fills_missing_time_pair_from_fixed_now(tmp_path):
     assert normalized["scope"]["end_time"] == "2026-07-21T12:00:00+08:00"
 
 
+def test_validator_prepares_independent_spec_consumed_by_create_run(tmp_path, monkeypatch):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        source,
+        "--default-now", "2026-07-21T12:00:00+08:00",
+        "--default-days", "14",
+        "--output", str(prepared),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(source.read_text(encoding="utf-8"))["scope"].get("start_time") is None
+    expected = json.loads(result.stdout)
+    assert json.loads(prepared.read_text(encoding="utf-8")) == expected
+
+    module = _load_client_module()
+    submitted = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"run_id":"run-1"}'
+
+    def recording_urlopen(request, *, timeout):
+        submitted.append(json.loads(request.data.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, stdout, stderr = _run_client(
+        module,
+        ["--base-url", "https://topic.internal", "create-run", "--spec", str(prepared)],
+    )
+
+    assert code == 0, stderr
+    assert json.loads(stdout) == {"run_id": "run-1"}
+    assert submitted == [expected]
+    assert submitted[0]["scope"]["start_time"] == "2026-07-07T12:00:00+08:00"
+
+
+def test_validator_failure_leaves_no_prepared_output(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(source, "--output", str(prepared))
+
+    assert result.returncode == 2
+    assert not prepared.exists()
+    assert not prepared.with_name(f".{prepared.name}.tmp").exists()
+
+
+def test_validator_rejects_overwriting_source_with_prepared_output(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    original = source.read_bytes()
+
+    result = _run_validator(source, "--output", str(source))
+
+    assert result.returncode == 2
+    assert "must differ from topic spec path" in result.stderr
+    assert source.read_bytes() == original
+
+
+def test_validator_atomic_output_failure_preserves_target_and_removes_temporary_file(tmp_path, monkeypatch):
+    validator = _load_validator_module()
+    source = tmp_path / "source.json"
+    target = tmp_path / "prepared.json"
+    source.write_text("{}", encoding="utf-8")
+    target.write_bytes(b"old")
+
+    def fail_replace(_source, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(validator.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="cannot write prepared topic spec"):
+        validator._write_prepared_spec(target, source, b"new\n")
+
+    assert target.read_bytes() == b"old"
+    assert list(tmp_path.glob(".prepared.json.*.tmp")) == []
+
+
 def test_skill_validator_rejects_only_one_time_boundary(tmp_path):
     raw = valid_spec()
     raw["scope"].pop("start_time")
@@ -259,7 +352,7 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
     commands = (
         "`capabilities`",
         "validate_topic_spec.py",
-        "`create-run --spec file`",
+        "`create-run --spec prepared_spec_path`",
         "`get-run run_id`",
         "`resume run_id`",
         "`review-queue run_id --output file --offset offset --limit 50`",
@@ -306,6 +399,16 @@ def test_skill_discloses_representative_scope():
     assert "representative" in body
 
 
+def test_skill_delivery_copies_all_five_backend_scope_fields_only():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    for field in (
+        "mode", "result_scope", "matched_total", "returned_feedback",
+        "possibly_more_matches",
+    ):
+        assert f"`{field}`" in body
+    assert "copy only these five backend-returned fields" in body
+
+
 def test_skill_uses_only_backend_returned_result_scope_values():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "result_scope=reviewed" in body
@@ -329,8 +432,8 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
     text = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
     commands = (
         "python3 scripts/topic_backend_client.py capabilities",
-        "python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 TOPIC_SPEC_PATH",
-        "python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH",
+        "python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH",
         "python3 scripts/topic_backend_client.py get-run RUN_ID",
         "python3 scripts/topic_backend_client.py resume RUN_ID",
         "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PAGE_PATH --offset OFFSET --limit 50",
@@ -350,10 +453,12 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
 
     assert "`mode: standard`" in topic_spec
     assert "`mode: exhaustive`" in topic_spec
-    assert "--default-now NOW --default-days 14" in topic_spec
+    assert "--default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH" in topic_spec
     for value in ("500 candidates", "100 confirmed rows", "result_scope=representative", "possibly_more_matches=true"):
         assert value in backend
     assert "authentication=internal_network_boundary" in backend
+    for field in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):
+        assert f"`{field}`" in backend
     assert "follow the returned `next_offset` and stop only when it is null" in backend
     assert "including queues of 51 or more items" in review
     assert "call `apply-overrides` only once" in review

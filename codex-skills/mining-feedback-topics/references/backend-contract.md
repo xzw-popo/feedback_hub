@@ -18,9 +18,10 @@ Run from the Skill directory and copy this complete sequence. Keep the override 
 
 ```bash
 python3 scripts/topic_backend_client.py capabilities
-# Materialize the advertised default only when both times are absent; complete pairs pass unchanged:
-python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 TOPIC_SPEC_PATH
-python3 scripts/topic_backend_client.py create-run --spec TOPIC_SPEC_PATH
+# Materialize the advertised default only when both times are absent; complete pairs pass unchanged.
+# This atomically writes a distinct canonical JSON file and leaves TOPIC_SPEC_PATH unchanged:
+python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH
+python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH
 python3 scripts/topic_backend_client.py get-run RUN_ID
 # Run only after repairing a pending-orphan, paused, or repairable failed run:
 python3 scripts/topic_backend_client.py resume RUN_ID

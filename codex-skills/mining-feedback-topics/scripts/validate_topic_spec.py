@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -187,11 +189,39 @@ def _prepare_default_scope_times(
     scope["start_time"] = (end_time - timedelta(days=default_days)).isoformat()
 
 
+def _write_prepared_spec(path: Path, source_path: Path, raw: bytes) -> None:
+    if path.suffix.lower() != ".json":
+        raise _error("--output", "prepared topic spec path must end in .json")
+    if path.resolve(strict=False) == source_path.resolve(strict=False):
+        raise _error("--output", "must differ from topic spec path")
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except OSError as error:
+        raise _error("--output", f"cannot write prepared topic spec: {error.strerror or 'I/O error'}") from error
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--default-now", metavar="RFC3339")
     parser.add_argument("--default-days", type=int, metavar="DAYS")
+    parser.add_argument("--output", metavar="PREPARED_SPEC_PATH")
     parser.add_argument("topic_spec_path", metavar="TOPIC_SPEC_PATH")
     args = parser.parse_args(arguments)
     path = Path(args.topic_spec_path)
@@ -200,10 +230,13 @@ def main(argv: list[str] | None = None) -> None:
         _prepare_default_scope_times(value, args.default_now, args.default_days)
         _validate(value, _load_schema(), "$")
         _validate_scope_time_order(value)
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if args.output:
+            _write_prepared_spec(Path(args.output), path, (rendered + "\n").encode("utf-8"))
     except ValueError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(2)
-    print(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    print(rendered)
 
 
 if __name__ == "__main__":
