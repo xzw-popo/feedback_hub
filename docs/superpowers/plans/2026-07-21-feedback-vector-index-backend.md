@@ -418,7 +418,7 @@ git commit -m "feat: add atomic NumPy vector shards"
 - Test: `feedback_hub/tests/test_vector_index_sync.py`
 
 **Interfaces:**
-- Produces: `sync_pending(config, *, encoder=None, max_items=None) -> SyncResult` and `rebuild_index(config, *, encoder=None) -> SyncResult`.
+- Produces: `sync_pending(config, *, encoder=None, max_items=None) -> SyncResult` and `rebuild_index(config, *, target_model_version, target_generation_id, encoder=None) -> SyncResult`.
 - Consumes: `VectorRepository`, `ShardStore`, and `EmbeddingEncoder` from Tasks 1–3.
 
 ```python
@@ -487,7 +487,7 @@ Loop in shard-sized chunks until no pending rows or `max_items` is reached. Adva
 
 - [ ] **Step 4: Implement rebuild into a separate model generation**
 
-`rebuild_index()` must require an explicit model version, write to a separate directory, checkpoint each shard, and switch the active manifest only after every non-empty feedback row has a published record. It must never clear the current active index first.
+`rebuild_index()` must require explicit non-empty `target_model_version` and safe `target_generation_id` values. It checkpoints under that stable generation directory, so a retry resumes only unpublished chunks. Promotion records both logical model and generation ID, and switches only after every non-empty feedback row has a published record. It must never clear the current active index first.
 
 - [ ] **Step 5: Run sync tests**
 

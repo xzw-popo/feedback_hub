@@ -51,6 +51,18 @@ class FailOnceEncoder(DeterministicEncoder):
         return super().encode_documents(texts)
 
 
+class FailOnSecondCallEncoder(DeterministicEncoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def encode_documents(self, texts: list[str]) -> np.ndarray:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("second chunk failed")
+        return super().encode_documents(texts)
+
+
 @pytest.fixture
 def sync_fixture(tmp_path):
     config = replace(
@@ -210,7 +222,8 @@ def test_rebuild_uses_a_separate_generation_without_clearing_active_index(sync_f
     old_manifest = sync_fixture.shards.load_manifest()
 
     result = rebuild_index(
-        sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder()
+        sync_fixture.config, target_model_version="m2", target_generation_id="m2-first",
+        encoder=DeterministicEncoder(),
     )
 
     active = active_index_config(sync_fixture.config)
@@ -226,7 +239,8 @@ def test_rebuild_requires_a_model_version_distinct_from_the_active_index(sync_fi
 
     with pytest.raises(ValueError, match="distinct"):
         rebuild_index(
-            sync_fixture.config, target_model_version="m1", encoder=DeterministicEncoder()
+            sync_fixture.config, target_model_version="m1", target_generation_id="same-model",
+            encoder=DeterministicEncoder(),
         )
 
 
@@ -235,7 +249,8 @@ def test_failed_rebuild_leaves_the_prior_active_generation_selected(sync_fixture
 
     with pytest.raises(RuntimeError, match="encoder failed"):
         rebuild_index(
-            sync_fixture.config, target_model_version="m2", encoder=FailOnceEncoder()
+            sync_fixture.config, target_model_version="m2", target_generation_id="failed-m2",
+            encoder=FailOnceEncoder(),
         )
 
     assert active_index_config(sync_fixture.config).model_version == "m1"
@@ -253,7 +268,8 @@ def test_promotion_crash_recovers_the_completed_target_generation(sync_fixture, 
     monkeypatch.setattr(sync_module, "_atomic_json_replace", crash_before_pointer)
     with pytest.raises(RuntimeError, match="promotion crash"):
         rebuild_index(
-            sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder()
+            sync_fixture.config, target_model_version="m2", target_generation_id="m2-crash",
+            encoder=DeterministicEncoder(),
         )
     monkeypatch.setattr(sync_module, "_atomic_json_replace", original)
 
@@ -316,3 +332,77 @@ def test_concurrent_pointer_recovery_serializes_a_promotion_journal(sync_fixture
         results = list(pool.map(lambda _: active_index_config(sync_fixture.config).data_dir, range(2)))
 
     assert results == [sync_fixture.config.data_dir / "generations" / "m2-race"] * 2
+
+
+def test_rebuild_retry_same_generation_only_embeds_unpublished_chunks(sync_fixture):
+    failing = FailOnSecondCallEncoder()
+
+    with pytest.raises(RuntimeError, match="second chunk failed"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", target_generation_id="resume-m2",
+            encoder=failing,
+        )
+
+    retry = DeterministicEncoder()
+    result = rebuild_index(
+        sync_fixture.config, target_model_version="m2", target_generation_id="resume-m2",
+        encoder=retry,
+    )
+
+    assert result.vectorized_count == 3
+    assert retry.document_count == 3
+    assert list((sync_fixture.config.data_dir / "generations").iterdir()) == [
+        sync_fixture.config.data_dir / "generations" / "resume-m2"
+    ]
+
+
+def test_rebuild_requires_an_explicit_generation_id(sync_fixture):
+    with pytest.raises(TypeError):
+        rebuild_index(sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder())
+
+
+def test_pointer_backed_active_model_cannot_be_rebuilt_again(sync_fixture):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+    rebuild_index(
+        sync_fixture.config, target_model_version="m2", target_generation_id="m2-active",
+        encoder=DeterministicEncoder(),
+    )
+
+    with pytest.raises(ValueError, match="distinct"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", target_generation_id="m2-again",
+            encoder=DeterministicEncoder(),
+        )
+
+    assert not (sync_fixture.config.data_dir / "generations" / "m2-again").exists()
+
+
+def test_stale_promotion_journal_cannot_overwrite_a_newer_live_pointer(sync_fixture):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+    rebuild_index(
+        sync_fixture.config, target_model_version="m2", target_generation_id="g2",
+        encoder=DeterministicEncoder(),
+    )
+    stale_target = __import__("json").loads(
+        (sync_fixture.config.data_dir / "active-generation.json").read_text(encoding="utf-8")
+    )
+    rebuild_index(
+        sync_fixture.config, target_model_version="m3", target_generation_id="g3",
+        encoder=DeterministicEncoder(),
+    )
+    live = __import__("json").loads(
+        (sync_fixture.config.data_dir / "active-generation.json").read_text(encoding="utf-8")
+    )
+    (sync_fixture.config.data_dir / "generation-promotion-journal.json").write_text(
+        __import__("json").dumps({
+            "schema_version": 1, "expected_previous": None, "target": stale_target,
+        }),
+        encoding="utf-8",
+    )
+
+    active_index_config(sync_fixture.config)
+
+    assert __import__("json").loads(
+        (sync_fixture.config.data_dir / "active-generation.json").read_text(encoding="utf-8")
+    ) == live
+    assert not (sync_fixture.config.data_dir / "generation-promotion-journal.json").exists()

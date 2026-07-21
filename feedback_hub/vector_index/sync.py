@@ -269,13 +269,24 @@ def _recover_active_generation(base_config: VectorIndexConfig) -> None:
         return
     journal = _read_json(journal_path)
     target = journal.get("target")
-    if not isinstance(target, dict):
+    expected_previous = journal.get("expected_previous", _UNSET)
+    if (not isinstance(target, dict)
+            or (expected_previous is not None and not isinstance(expected_previous, dict))
+            or expected_previous is _UNSET):
         raise ValueError("invalid generation promotion journal")
+    previous = _read_json(pointer_path) if pointer_path.exists() else None
+    if previous == target:
+        journal_path.unlink(missing_ok=True)
+        return
+    if previous != expected_previous:
+        # A later promotion won.  A stale journal must never resurrect its
+        # target over the live pointer; remove only the obsolete intent.
+        journal_path.unlink(missing_ok=True)
+        return
     target_config = _config_from_pointer(base_config, target)
     target_store = ShardStore.from_config(target_config)
     target_store.load_manifest()
-    previous = _read_json(pointer_path) if pointer_path.exists() else None
-    _atomic_json_replace(pointer_path, target, expected=previous)
+    _atomic_json_replace(pointer_path, target, expected=expected_previous)
     journal_path.unlink(missing_ok=True)
 
 
@@ -308,7 +319,11 @@ def _promote_generation(
     previous = _read_json(pointer_path) if pointer_path.exists() else None
     _atomic_json_replace(
         journal_path,
-        {"schema_version": PROMOTION_SCHEMA_VERSION, "target": target},
+        {
+            "schema_version": PROMOTION_SCHEMA_VERSION,
+            "expected_previous": previous,
+            "target": target,
+        },
     )
     _atomic_json_replace(pointer_path, target, expected=previous)
     journal_path.unlink(missing_ok=True)
@@ -428,12 +443,14 @@ def _storage_model_version(model_version: str, generation_id: str) -> str:
 
 
 def _rebuild_generation_spec(
-    config: VectorIndexConfig, target_model_version: str, target_generation_id: str | None,
+    config: VectorIndexConfig, target_model_version: str, target_generation_id: str,
 ) -> GenerationSpec:
     model_version = target_model_version.strip()
     if not model_version or Path(model_version).name != model_version or model_version in {".", ".."}:
         raise ValueError("rebuild requires an explicit safe model_version")
-    generation_id = target_generation_id or uuid.uuid4().hex
+    if not isinstance(target_generation_id, str):
+        raise ValueError("generation_id must be a safe non-empty path component")
+    generation_id = target_generation_id
     data_dir = _validated_generation_path(config, generation_id)
     return GenerationSpec(
         logical_model_version=model_version, generation_id=generation_id,
@@ -444,7 +461,7 @@ def _rebuild_generation_spec(
 
 def rebuild_index(
     config: VectorIndexConfig, *, target_model_version: str,
-    target_generation_id: str | None = None,
+    target_generation_id: str,
     encoder: EmbeddingEncoder | None = None,
 ) -> SyncResult:
     """Rebuild and atomically promote an explicit, distinct target model.
@@ -457,14 +474,14 @@ def rebuild_index(
     spec = _rebuild_generation_spec(config, target_model_version, target_generation_id)
     with process_lock(config.data_dir / ".sync.lock"):
         try:
+            active_index_config(config, _lock_held=True)
             pointer_path, _ = _pointer_paths(config)
             active_logical = (
                 str(_read_json(pointer_path)["model_version"])
                 if pointer_path.exists() else config.model_version
             )
-            if active_logical == spec.logical_model_version and not pointer_path.exists():
+            if active_logical == spec.logical_model_version:
                 raise ValueError("rebuild requires a model_version distinct from the active index")
-            active_index_config(config, _lock_held=True)
         except Exception as exc:
             _record_preopen_failure(
                 config, run_type="rebuild", model_version=target_model_version, error=exc
