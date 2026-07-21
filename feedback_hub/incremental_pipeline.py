@@ -67,6 +67,8 @@ class IncrementalPipelineError(RuntimeError):
 
 @dataclass(frozen=True)
 class BackfillResult:
+    """Normalized UTC second-aligned half-open bounds actually covered."""
+
     start: str
     end: str
     chunk: str
@@ -108,6 +110,25 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _floor_second(value: datetime) -> datetime:
+    return _as_utc(value).replace(microsecond=0)
+
+
+def _ceil_second(value: datetime) -> datetime:
+    normalized = _as_utc(value)
+    if normalized.microsecond:
+        return normalized.replace(microsecond=0) + timedelta(seconds=1)
+    return normalized
+
+
+def _whole_seconds(value: timedelta, *, name: str) -> timedelta:
+    if value <= timedelta(0):
+        raise ValueError(f"{name} must be positive")
+    if value.microseconds:
+        raise ValueError(f"{name} must use whole-second precision")
+    return value
+
+
 def _timestamp_ms(value: datetime) -> int:
     return int(_as_utc(value).timestamp() * 1000)
 
@@ -123,6 +144,8 @@ def _table_columns(connection: Any, table: str) -> set[str]:
 
 def _ensure_pipeline_audit_columns(connection: Any) -> None:
     """Add only missing audit fields, preserving all prior vector-sync rows."""
+    if getattr(connection, "in_transaction", False):
+        raise RuntimeError("pipeline audit migration requires an idle connection")
     additions = {
         "window_start_ms": "INTEGER",
         "window_end_ms": "INTEGER",
@@ -133,10 +156,19 @@ def _ensure_pipeline_audit_columns(connection: Any) -> None:
         "failed_count": "INTEGER NOT NULL DEFAULT 0",
         "error_code": "TEXT NOT NULL DEFAULT ''",
     }
-    for name, ddl in additions.items():
-        if name not in _table_columns(connection, "embedding_sync_run"):
-            connection.execute(f"ALTER TABLE embedding_sync_run ADD COLUMN {name} {ddl}")
-    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-check only after the writer lock: another process may have
+        # completed this additive migration while this connection was waiting.
+        columns = _table_columns(connection, "embedding_sync_run")
+        for name, ddl in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE embedding_sync_run ADD COLUMN {name} {ddl}")
+                columns.add(name)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def _insert_pipeline_run(
@@ -208,13 +240,17 @@ def _pull_counts(payload: dict[str, Any]) -> tuple[int, int, int, int | None]:
 def run_incremental(
     *, now: datetime, pull_window: timedelta, pull_fn: Callable[..., dict[str, Any]] | None = None,
     vector_sync_fn: Callable[[], SyncResult] | None = None,
-    config: VectorIndexConfig | None = None,
+    config: VectorIndexConfig | None = None, channel: str = DEFAULT_CHANNEL,
 ) -> IncrementalRunResult:
-    """Commit one supplied pull window before synchronizing missing vectors."""
-    if pull_window <= timedelta(0):
-        raise ValueError("pull_window must be positive")
+    """Pull a UTC whole-second ``[window_start, window_end]`` then vectorize.
+
+    Injected pull callables follow ``pull(start, end, *, channel, conn)``;
+    requiring the channel prevents coverage from being checked under one
+    channel while another channel is fetched.
+    """
+    pull_window = _whole_seconds(pull_window, name="pull_window")
     active_config = config or VectorIndexConfig()
-    window_end = _as_utc(now)
+    window_end = _floor_second(now)
     window_start = window_end - pull_window
     run_id = uuid.uuid4().hex
     started_at = _utc_now()
@@ -237,7 +273,9 @@ def run_incremental(
             )
             try:
                 with source_ingestion_lock(active_config):
-                    pull_payload = pull(window_start, window_end, conn=connection)
+                    pull_payload = pull(
+                        window_start, window_end, channel=channel, conn=connection,
+                    )
                     connection.commit()
             except Exception as exc:
                 connection.rollback()
@@ -310,13 +348,16 @@ def backfill_coverage(
     pull_fn: Callable[..., dict[str, Any]] | None = None,
     config: VectorIndexConfig | None = None, channel: str = DEFAULT_CHANNEL,
 ) -> BackfillResult:
-    """Fill missing half-open source windows, checkpointing every successful chunk."""
+    """Fill normalized UTC whole-second half-open chunks, checkpointing each.
+
+    ``start`` is floored and ``end`` is ceiled to seconds, so the returned
+    result bounds fully contain the caller's original half-open request.
+    Injected pull callables must accept ``channel`` and ``conn`` keywords.
+    """
     active_config = config or VectorIndexConfig()
-    interval = chunk or timedelta(hours=6)
-    if interval <= timedelta(0):
-        raise ValueError("chunk must be positive")
-    cursor = _as_utc(start)
-    end_at = _as_utc(end)
+    interval = _whole_seconds(chunk or timedelta(hours=6), name="chunk")
+    cursor = _floor_second(start)
+    end_at = _ceil_second(end)
     if end_at <= cursor:
         raise ValueError("end must be after start")
     pull = pull_fn or puller.pull
@@ -336,8 +377,15 @@ def backfill_coverage(
                     skipped += 1
                 else:
                     with source_ingestion_lock(active_config):
-                        pull(cursor, window_end, conn=connection)
+                        pull(cursor, window_end, channel=channel, conn=connection)
                         connection.commit()
+                        if not _covered_continuously(
+                            connection, channel=channel, start_ms=_timestamp_ms(cursor),
+                            end_ms=_timestamp_ms(window_end),
+                        ):
+                            raise RuntimeError(
+                                "pull did not commit exact source coverage for backfill chunk"
+                            )
                     completed += 1
             except Exception:
                 connection.rollback()
@@ -347,6 +395,7 @@ def backfill_coverage(
             cursor = window_end
 
     return BackfillResult(
-        start=_as_utc(start).isoformat(), end=end_at.isoformat(), chunk=str(interval),
+        start=_floor_second(start).isoformat(),
+        end=end_at.isoformat(), chunk=str(interval),
         completed_windows=completed, skipped_covered_windows=skipped,
     )

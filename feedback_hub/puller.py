@@ -35,6 +35,34 @@ urllib3.disable_warnings()
 PLATFORM_MAP = {1: "iOS", 2: "Android", 7: "Win", 9: "Mac", 11: "小程序"}
 
 
+class PullError(RuntimeError):
+    """A safe, non-success response from the feedback OpenAPI."""
+
+
+def _validate_success_response(response: object) -> dict:
+    """Accept only the documented success shape before any local write begins.
+
+    Existing API fixtures establish integer ``errCode == 0`` as success; an
+    omitted ``errCode`` remains compatible with older successful payloads.
+    Error response text is intentionally not copied into the exception because
+    it may contain user or service details.
+    """
+    if not isinstance(response, dict):
+        raise PullError("OpenAPI application failure (invalid response)")
+    if "errCode" in response:
+        code = response["errCode"]
+        if isinstance(code, bool) or not isinstance(code, int) or code != 0:
+            raise PullError("OpenAPI application failure (non-success errCode)")
+    if (
+        response.get("success") is False
+        or response.get("ok") is False
+        or response.get("error")
+        or ("errCode" not in response and response.get("errMsg"))
+    ):
+        raise PullError("OpenAPI application failure")
+    return response
+
+
 def _platform(ci: dict) -> str:
     if not isinstance(ci, dict):
         return "未知"
@@ -80,7 +108,7 @@ def fetch_window(start_sec: int, end_sec: int, *,
             f"前 200 字节：{snippet}\n"
             f"➡️  常见原因：iOA SmartVPN 没开 / DNS 解析失败 / OpenAPI 临时维护"
         )
-    return r.json()
+    return _validate_success_response(r.json())
 
 
 def extract_rows(resp: dict, *, start_ms: int, end_ms: int,
@@ -190,7 +218,11 @@ def pull(start_dt: datetime, end_dt: datetime, *,
     """端到端：拉取 → 抽取 → 落 raw → 写库。返回汇总统计。"""
     s_sec, e_sec = int(start_dt.timestamp()), int(end_dt.timestamp())
     s_ms, e_ms = s_sec * 1000, e_sec * 1000
-    resp = fetch_window(s_sec, e_sec, channel=channel, service_vid=service_vid)
+    # Validate here as well: tests and callers may inject ``fetch_window``.
+    # This remains before raw dumps, feedback writes, and coverage publication.
+    resp = _validate_success_response(
+        fetch_window(s_sec, e_sec, channel=channel, service_vid=service_vid)
+    )
     rows, debug = extract_rows(resp, start_ms=s_ms, end_ms=e_ms, channel=channel)
 
     tag = _make_tag(start_dt, end_dt)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ from feedback_hub import db
 from feedback_hub.incremental_pipeline import (
     IncrementalPipelineError,
     PipelineAlreadyRunning,
+    _ensure_pipeline_audit_columns,
     backfill_coverage,
     run_incremental,
 )
@@ -68,11 +71,13 @@ def _scalar(path: Path, sql: str, params: tuple[object, ...] = ()) -> object:
         conn.close()
 
 
-def _successful_pull(start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+def _successful_pull(
+    start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection,
+) -> dict[str, object]:
     _insert_feedback(conn, "feedback-1")
     db.record_feedback_source_coverage(
         conn,
-        channel="wetype",
+        channel=channel,
         start_ts_ms=int(start.timestamp() * 1000),
         end_ts_ms=int(end.timestamp() * 1000),
         completed_at_ms=100,
@@ -89,8 +94,8 @@ def _successful_pull(start: datetime, end: datetime, *, conn: sqlite3.Connection
 def test_pipeline_commits_pull_before_vector_sync_and_persists_matching_run(config: VectorIndexConfig):
     observed: list[str] = []
 
-    def pull_fn(start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
-        result = _successful_pull(start, end, conn=conn)
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
+        result = _successful_pull(start, end, channel=channel, conn=conn)
         observed.append("pull_committed")
         return result
 
@@ -152,7 +157,7 @@ def test_vector_failure_preserves_pull_returns_immutable_partial_and_is_audited(
 def test_pull_failure_never_starts_vector_and_records_failed_pipeline_run(config: VectorIndexConfig):
     calls: list[str] = []
 
-    def failing_pull(start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+    def failing_pull(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
         calls.append("pull")
         raise RuntimeError("pull fixture failed")
 
@@ -176,7 +181,7 @@ def test_pull_failure_never_starts_vector_and_records_failed_pipeline_run(config
 def test_second_pipeline_invocation_fails_immediately_while_lock_is_held(config: VectorIndexConfig):
     entered = False
 
-    def pull_fn(start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
         nonlocal entered
         entered = True
         with pytest.raises(PipelineAlreadyRunning):
@@ -184,7 +189,7 @@ def test_second_pipeline_invocation_fails_immediately_while_lock_is_held(config:
                 now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
                 pull_fn=_successful_pull, vector_sync_fn=lambda: SyncResult("v", 0, 0, 0),
             )
-        return _successful_pull(start, end, conn=conn)
+        return _successful_pull(start, end, channel=channel, conn=conn)
 
     result = run_incremental(
         now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
@@ -198,10 +203,10 @@ def test_second_pipeline_invocation_fails_immediately_while_lock_is_held(config:
 def test_repeat_overlapping_pipeline_delegates_exact_id_dedupe_to_puller(config: VectorIndexConfig):
     inserted: list[int] = []
 
-    def pull_fn(start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
         added = int(db.upsert_feedback(conn, _row("stable-feedback")))
         db.record_feedback_source_coverage(
-            conn, channel="wetype", start_ts_ms=int(start.timestamp() * 1000),
+            conn, channel=channel, start_ts_ms=int(start.timestamp() * 1000),
             end_ts_ms=int(end.timestamp() * 1000), completed_at_ms=100 + len(inserted),
         )
         conn.commit()
@@ -258,12 +263,12 @@ class PullSequence:
         self.channel = channel
         self.calls = 0
 
-    def __call__(self, start: datetime, end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+    def __call__(self, start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
         self.calls += 1
         if self.calls == self.fail_on_call:
             raise RuntimeError("fixture pull failure")
         db.record_feedback_source_coverage(
-            conn, channel=self.channel, start_ts_ms=int(start.timestamp() * 1000),
+            conn, channel=channel, start_ts_ms=int(start.timestamp() * 1000),
             end_ts_ms=int(end.timestamp() * 1000), completed_at_ms=1000 + self.calls,
         )
         return {"fetched_count": 0, "inserted_count": 0, "skipped_dup_count": 0}
@@ -308,10 +313,10 @@ def test_backfill_skips_only_continuously_covered_exact_channel_and_uses_half_op
     conn.close()
     calls: list[tuple[datetime, datetime]] = []
 
-    def pull_fn(window_start: datetime, window_end: datetime, *, conn: sqlite3.Connection) -> dict[str, object]:
+    def pull_fn(window_start: datetime, window_end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
         calls.append((window_start, window_end))
         db.record_feedback_source_coverage(
-            conn, channel="wetype", start_ts_ms=int(window_start.timestamp() * 1000),
+            conn, channel=channel, start_ts_ms=int(window_start.timestamp() * 1000),
             end_ts_ms=int(window_end.timestamp() * 1000), completed_at_ms=100 + len(calls),
         )
         return {}
@@ -329,3 +334,132 @@ def test_incremental_pipeline_does_not_import_or_call_a_tagger():
     body = Path(__file__).parents[1].joinpath("incremental_pipeline.py").read_text(encoding="utf-8")
     assert "tagger" not in body
     assert "run_tagging" not in body
+
+
+def test_pipeline_normalizes_fractional_now_down_to_second_without_future_pull(config: VectorIndexConfig):
+    seen: list[tuple[datetime, datetime, str]] = []
+
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
+        seen.append((start, end, channel))
+        db.record_feedback_source_coverage(
+            conn, channel=channel, start_ts_ms=int(start.timestamp() * 1000),
+            end_ts_ms=int(end.timestamp() * 1000), completed_at_ms=1,
+        )
+        return {}
+
+    result = run_incremental(
+        now=datetime(2026, 7, 21, 8, 30, 0, 999999, tzinfo=timezone.utc),
+        pull_window=timedelta(minutes=30), config=config, pull_fn=pull_fn,
+        vector_sync_fn=lambda: SyncResult("v", 0, 0, 0),
+    )
+
+    assert seen == [(fixed_now() - timedelta(minutes=30), fixed_now(), "wetype")]
+    assert result.window_start == "2026-07-21T08:00:00+00:00"
+    assert result.window_end == "2026-07-21T08:30:00+00:00"
+
+
+def test_pipeline_rejects_application_error_audits_pull_failure_and_never_vectors(config: VectorIndexConfig, monkeypatch):
+    from feedback_hub import puller
+
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 9, "errMsg": "denied"})
+    vectors: list[str] = []
+    with pytest.raises(puller.PullError):
+        run_incremental(
+            now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
+            vector_sync_fn=lambda: vectors.append("started"),
+        )
+
+    assert vectors == []
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback") == 0
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback_source_coverage") == 0
+    assert _scalar(
+        config.db_path,
+        "SELECT status FROM embedding_sync_run WHERE run_type = 'incremental_pipeline'",
+    ) == "failed"
+
+
+def test_backfill_normalizes_fractional_request_and_rerun_skips_exact_coverage(config: VectorIndexConfig):
+    requested_start = datetime(2026, 7, 21, 8, 0, 0, 250000, tzinfo=timezone.utc)
+    requested_end = datetime(2026, 7, 21, 20, 0, 0, 1, tzinfo=timezone.utc)
+    windows: list[tuple[datetime, datetime, str]] = []
+
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
+        windows.append((start, end, channel))
+        db.record_feedback_source_coverage(
+            conn, channel=channel, start_ts_ms=int(start.timestamp() * 1000),
+            end_ts_ms=int(end.timestamp() * 1000), completed_at_ms=100 + len(windows),
+        )
+        return {}
+
+    first = backfill_coverage(
+        start=requested_start, end=requested_end, chunk=timedelta(hours=6),
+        config=config, channel="pc", pull_fn=pull_fn,
+    )
+    second = backfill_coverage(
+        start=requested_start, end=requested_end, chunk=timedelta(hours=6),
+        config=config, channel="pc", pull_fn=pull_fn,
+    )
+
+    assert windows == [
+        (datetime(2026, 7, 21, 8, tzinfo=timezone.utc), datetime(2026, 7, 21, 14, tzinfo=timezone.utc), "pc"),
+        (datetime(2026, 7, 21, 14, tzinfo=timezone.utc), datetime(2026, 7, 21, 20, tzinfo=timezone.utc), "pc"),
+        (datetime(2026, 7, 21, 20, tzinfo=timezone.utc), datetime(2026, 7, 21, 20, 0, 1, tzinfo=timezone.utc), "pc"),
+    ]
+    assert first.start == "2026-07-21T08:00:00+00:00"
+    assert first.end == "2026-07-21T20:00:01+00:00"
+    assert second.completed_windows == 0
+    assert second.skipped_covered_windows == 3
+
+
+def test_backfill_refuses_to_count_a_pull_without_exact_channel_coverage(config: VectorIndexConfig):
+    called: list[str] = []
+
+    def pull_fn(start: datetime, end: datetime, *, channel: str, conn: sqlite3.Connection) -> dict[str, object]:
+        called.append(channel)
+        return {}
+
+    with pytest.raises(RuntimeError, match="exact source coverage"):
+        backfill_coverage(
+            start=fixed_now(), end=fixed_now() + timedelta(hours=1), config=config,
+            channel="pc", pull_fn=pull_fn,
+        )
+    assert called == ["pc"]
+
+
+def test_audit_column_migration_serializes_two_connections_without_losing_columns(tmp_path: Path):
+    path = tmp_path / "legacy.db"
+    first = db.connect(path)
+    first.execute(
+        """CREATE TABLE embedding_sync_run (
+               run_id TEXT PRIMARY KEY, run_type TEXT NOT NULL, model_version TEXT NOT NULL,
+               status TEXT NOT NULL, started_at_ms INTEGER NOT NULL, finished_at_ms INTEGER
+           )"""
+    )
+    first.commit()
+    first.execute("BEGIN IMMEDIATE")
+    failures: list[BaseException] = []
+
+    def migrate_from_second_connection() -> None:
+        second = db.connect(path)
+        try:
+            _ensure_pipeline_audit_columns(second)
+        except BaseException as exc:  # assertion below preserves the worker failure
+            failures.append(exc)
+        finally:
+            second.close()
+
+    worker = threading.Thread(target=migrate_from_second_connection)
+    worker.start()
+    time.sleep(0.05)
+    first.commit()
+    worker.join(timeout=2)
+    first.close()
+
+    assert not worker.is_alive()
+    assert failures == []
+    verify = db.connect(path)
+    try:
+        columns = {row[1] for row in verify.execute("PRAGMA table_info(embedding_sync_run)")}
+    finally:
+        verify.close()
+    assert {"window_start_ms", "window_end_ms", "fetched_count", "inserted_count", "duplicate_count", "vectorized_count", "failed_count", "error_code"} <= columns

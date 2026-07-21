@@ -151,6 +151,35 @@ def test_pull_end_to_end_with_mock(tmp_path, monkeypatch):
     assert len(raw_files) == 1
 
 
+def test_pull_rejects_application_error_before_feedback_or_coverage_commit(tmp_path, monkeypatch):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 403, "errMsg": "denied"},
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    try:
+        with pytest.raises(puller.PullError, match="application failure"):
+            puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=conn)
+    finally:
+        conn.close()
+
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 0
+
+
+def test_fetch_window_rejects_http_200_application_error_without_err_code(monkeypatch):
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"content-type": "application/json"}
+    response.json.return_value = {"errMsg": "permission denied"}
+    monkeypatch.setattr(puller.requests, "post", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(puller.PullError, match="application failure"):
+        puller.fetch_window(1, 2)
+
+
 def test_pull_publishes_feedback_and_coverage_in_one_transaction(
     tmp_path, monkeypatch,
 ):
