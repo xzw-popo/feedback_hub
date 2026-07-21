@@ -264,6 +264,62 @@ def build_parser() -> argparse.ArgumentParser:
                     help="推送通道：webhook（默认）或 ws（长连接，需 ws_bot 进程运行）")
     pu.set_defaults(func=cmd_push)
 
+    vectors = sub.add_parser("vectors", help="管理反馈向量索引")
+    vector_sub = vectors.add_subparsers(dest="vector_command", required=True)
+
+    def add_vector_config(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--db", dest="db_path", help="反馈 SQLite 数据库路径")
+        parser.add_argument("--data-dir", help="向量索引运行目录")
+        parser.add_argument("--model-dir", help="本地 Qwen 模型目录")
+        parser.add_argument("--index-name", help="向量索引名称")
+        parser.add_argument("--model-version", help="增量索引模型版本")
+        parser.add_argument("--dimension", type=int, help="向量维度（默认 1024）")
+        parser.add_argument("--batch-size", type=int, help="模型批大小")
+        parser.add_argument("--max-length", type=int, help="模型最大 token 数")
+        parser.add_argument("--shard-size", type=int, help="每个不可变分片的向量数")
+        parser.add_argument("--compact-after-shards", type=int, help="触发压缩的分片数")
+        parser.add_argument("--host", help="兼容性参数；服务始终绑定 localhost")
+        parser.add_argument("--port", type=int, help="localhost 服务端口")
+
+    vs = vector_sub.add_parser("sync", help="增量写入缺失反馈向量")
+    add_vector_config(vs)
+    vs.add_argument("--max-items", type=int, help="本次最多编码多少条")
+
+    vst = vector_sub.add_parser("status", help="输出活动索引健康状态")
+    add_vector_config(vst)
+
+    vr = vector_sub.add_parser("rebuild", help="构建并原子切换新的模型代次")
+    add_vector_config(vr)
+    vr.add_argument("--target-model-version", required=True, help="新的逻辑模型版本")
+    vr.add_argument("--generation-id", required=True, help="稳定、可恢复的代次 ID")
+
+    vc = vector_sub.add_parser("compact", help="压缩活动不可变分片")
+    add_vector_config(vc)
+
+    vsearch = vector_sub.add_parser("search", help="本地精确向量检索")
+    add_vector_config(vsearch)
+    vsearch.add_argument("--query", action="append", help="正向查询，可重复")
+    vsearch.add_argument("--negative-query", action="append", help="负向查询，可重复")
+    vsearch.add_argument("--limit", type=int, default=10, choices=range(1, 101), metavar="1-100")
+    vsearch.add_argument("--start-ts-ms", type=int)
+    vsearch.add_argument("--end-ts-ms", type=int)
+    vsearch.add_argument("--platform", action="append")
+    vsearch.add_argument("--channel", action="append")
+    vsearch.add_argument("--version", action="append")
+    vsearch.add_argument("--product", action="append")
+
+    vserve = vector_sub.add_parser("serve", help="仅在 localhost 启动向量 API")
+    add_vector_config(vserve)
+    vserve.add_argument("--allow-empty-index", action="store_true",
+                        help="仅用于受控 bootstrap；允许服务以未就绪状态启动")
+
+    vsmoke = vector_sub.add_parser("smoke-encode", help="编码一条文本以验证模型")
+    add_vector_config(vsmoke)
+    vsmoke.add_argument("--text", default="微信输入法向量编码健康检查")
+
+    from feedback_hub.vector_index.commands import cmd_vectors
+    vectors.set_defaults(func=cmd_vectors)
+
     return p
 
 

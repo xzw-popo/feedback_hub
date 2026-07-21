@@ -256,7 +256,7 @@ python -m feedback_hub.cli pipeline incremental --pull-window 30m
 python -m feedback_hub.cli ingest pull --last 30m
 python -m feedback_hub.cli vectors sync
 python -m feedback_hub.cli vectors status
-python -m feedback_hub.cli vectors rebuild --model qwen3-embedding-0.6b
+python -m feedback_hub.cli vectors rebuild --target-model-version qwen3-embedding-0.6b --generation-id qwen3-embedding-0.6b-20260721
 python -m feedback_hub.cli vectors compact
 python -m feedback_hub.cli vectors search --query "工具栏不会隐藏"
 ```

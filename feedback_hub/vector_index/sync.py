@@ -43,11 +43,12 @@ class GenerationSpec:
 
 
 @contextmanager
-def process_lock(path: Path) -> Iterator[None]:
+def process_lock(path: Path, *, nonblocking: bool = False) -> Iterator[None]:
     """Serialize writers across processes for this index root."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        fcntl.flock(handle.fileno(), operation)
         try:
             yield
         finally:
@@ -422,11 +423,11 @@ def _record_preopen_failure(
 
 def sync_pending(
     config: VectorIndexConfig, *, encoder: EmbeddingEncoder | None = None,
-    max_items: int | None = None,
+    max_items: int | None = None, nonblocking: bool = False,
 ) -> SyncResult:
     """Embed missing exact feedback IDs in shard-sized, restartable chunks."""
     _validate_index_root(config)
-    with process_lock(config.data_dir / ".sync.lock"):
+    with process_lock(config.data_dir / ".sync.lock", nonblocking=nonblocking):
         try:
             active = active_index_config(config, _lock_held=True)
         except Exception as exc:
@@ -465,6 +466,7 @@ def rebuild_index(
     config: VectorIndexConfig, *, target_model_version: str,
     target_generation_id: str,
     encoder: EmbeddingEncoder | None = None,
+    nonblocking: bool = False,
 ) -> SyncResult:
     """Rebuild and atomically promote an explicit, distinct target model.
 
@@ -474,7 +476,7 @@ def rebuild_index(
     """
     _validate_index_root(config)
     spec = _rebuild_generation_spec(config, target_model_version, target_generation_id)
-    with process_lock(config.data_dir / ".sync.lock"):
+    with process_lock(config.data_dir / ".sync.lock", nonblocking=nonblocking):
         try:
             active_index_config(config, _lock_held=True)
             pointer_path, _ = _pointer_paths(config)
