@@ -268,6 +268,8 @@ def _recover_active_generation(base_config: VectorIndexConfig) -> None:
     if not journal_path.exists():
         return
     journal = _read_json(journal_path)
+    if journal.get("schema_version") != PROMOTION_SCHEMA_VERSION:
+        raise ValueError("unknown generation promotion journal schema version")
     target = journal.get("target")
     expected_previous = journal.get("expected_previous", _UNSET)
     if (not isinstance(target, dict)

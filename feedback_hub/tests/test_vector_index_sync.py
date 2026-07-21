@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 import numpy as np
 import pytest
@@ -406,3 +407,24 @@ def test_stale_promotion_journal_cannot_overwrite_a_newer_live_pointer(sync_fixt
         (sync_fixture.config.data_dir / "active-generation.json").read_text(encoding="utf-8")
     ) == live
     assert not (sync_fixture.config.data_dir / "generation-promotion-journal.json").exists()
+
+
+def test_unknown_promotion_journal_schema_fails_closed_without_promoting(sync_fixture):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+    rebuild_index(
+        sync_fixture.config, target_model_version="m2", target_generation_id="m2-invalid-journal",
+        encoder=DeterministicEncoder(),
+    )
+    pointer_path = sync_fixture.config.data_dir / "active-generation.json"
+    target = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer_path.unlink()
+    journal_path = sync_fixture.config.data_dir / "generation-promotion-journal.json"
+    journal_path.write_text(json.dumps({
+        "schema_version": 999, "expected_previous": None, "target": target,
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema"):
+        active_index_config(sync_fixture.config)
+
+    assert not pointer_path.exists()
+    assert journal_path.exists()
