@@ -119,16 +119,18 @@ class VectorRepository:
     def publish_shard(
         self, shard: ShardMetadata, records: Sequence[EmbeddingRecord]
     ) -> None:
-        """Commit the active shard and every feedback mapping as one transaction."""
+        """Publish one shard atomically without taking ownership of caller transactions."""
+        savepoint = f"publish_shard_{uuid.uuid4().hex}"
+        self.connection.execute(f"SAVEPOINT {savepoint}")
         try:
-            self.connection.execute("BEGIN")
             self._insert_shard(shard)
             for record in records:
                 self._insert_record(record)
-            self.connection.commit()
         except Exception:
-            self.connection.rollback()
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def finish_run(
         self,

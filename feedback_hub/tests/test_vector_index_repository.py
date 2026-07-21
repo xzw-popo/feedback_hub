@@ -38,13 +38,13 @@ def feedback(feedback_id: str, text: str, *, ts_ms: int = 1) -> dict[str, object
     }
 
 
-def shard(shard_id: str) -> ShardMetadata:
+def shard(shard_id: str, *, row_count: int = 1) -> ShardMetadata:
     return ShardMetadata(
         shard_id=shard_id,
         model_version=MODEL_VERSION,
         path=f"/vectors/{shard_id}.npy",
         dimension=1024,
-        row_count=1,
+        row_count=row_count,
         checksum=f"checksum-{shard_id}",
     )
 
@@ -99,18 +99,43 @@ def test_pending_feedback_is_feedback_id_idempotent(repository_fixture):
 
 
 def test_publish_shard_and_records_commit_atomically(repository_fixture, monkeypatch):
-    repo = repository_fixture(feedback_rows=[feedback("f1", "正文")])
-    monkeypatch.setattr(
-        repo,
-        "_insert_record",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("boom")),
+    repo = repository_fixture(feedback_rows=[feedback("f1", "正文"), feedback("f2", "正文")])
+    original_insert_record = repo._insert_record
+
+    def fail_on_second_record(embedding_record):
+        if embedding_record.feedback_id == "f2":
+            raise RuntimeError("boom")
+        original_insert_record(embedding_record)
+
+    monkeypatch.setattr(repo, "_insert_record", fail_on_second_record)
+    repo.connection.execute("BEGIN")
+    repo.connection.execute(
+        """INSERT INTO embedding_sync_run
+           (run_id, run_type, model_version, status, started_at_ms)
+           VALUES ('caller-run', 'sync', ?, 'running', 1)""",
+        (MODEL_VERSION,),
     )
 
-    with pytest.raises(RuntimeError, match="boom"):
-        repo.publish_shard(shard("s1"), [record("f1", "s1", 0)])
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            repo.publish_shard(
+                shard("s1", row_count=2),
+                [record("f1", "s1", 0), record("f2", "s1", 1)],
+            )
 
-    assert repo.status().active_shards == 0
-    assert repo.connection.execute("SELECT COUNT(*) FROM embedding_record").fetchone()[0] == 0
+        assert repo.connection.execute(
+            "SELECT COUNT(*) FROM embedding_shard WHERE shard_id = ?",
+            ("s1",),
+        ).fetchone()[0] == 0
+        assert repo.connection.execute(
+            "SELECT feedback_id FROM embedding_record WHERE shard_id = ?",
+            ("s1",),
+        ).fetchall() == []
+        assert repo.connection.execute(
+            "SELECT COUNT(*) FROM embedding_sync_run WHERE run_id = 'caller-run'"
+        ).fetchone()[0] == 1
+    finally:
+        repo.connection.rollback()
 
 
 def test_init_schema_creates_metadata_tables(repository_fixture):
