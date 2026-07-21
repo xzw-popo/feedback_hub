@@ -378,6 +378,44 @@ def test_pipeline_rejects_application_error_audits_pull_failure_and_never_vector
     ) == "failed"
 
 
+@pytest.mark.parametrize("payload", [{}, {"errCode": 0}, {"errCode": 0, "results": "not-a-list"}, {"errCode": 0, "results": None}, {"errCode": 0, "results": [], "errMsg": {}}, {"errCode": 0, "results": [], "error": {}}])
+def test_pipeline_rejects_malformed_success_shapes_before_raw_source_or_vector(config: VectorIndexConfig, monkeypatch, tmp_path: Path, payload):
+    from feedback_hub import puller
+
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: payload)
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    vectors: list[str] = []
+    with pytest.raises(puller.PullError):
+        run_incremental(
+            now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
+            vector_sync_fn=lambda: vectors.append("started"),
+        )
+
+    assert vectors == []
+    assert not (tmp_path / "raw").exists()
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback") == 0
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback_source_coverage") == 0
+
+
+def test_pipeline_accepts_empty_results_and_starts_vector_after_coverage(config: VectorIndexConfig, monkeypatch, tmp_path: Path):
+    from feedback_hub import puller
+
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 0, "results": []})
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    vectors: list[str] = []
+    result = run_incremental(
+        now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
+        vector_sync_fn=lambda: (vectors.append("started") or SyncResult("v", 0, 0, 0)),
+    )
+
+    assert result.status == "succeeded"
+    assert vectors == ["started"]
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback") == 0
+    assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback_source_coverage") == 1
+
+
 def test_backfill_normalizes_fractional_request_and_rerun_skips_exact_coverage(config: VectorIndexConfig):
     requested_start = datetime(2026, 7, 21, 8, 0, 0, 250000, tzinfo=timezone.utc)
     requested_end = datetime(2026, 7, 21, 20, 0, 0, 1, tzinfo=timezone.utc)

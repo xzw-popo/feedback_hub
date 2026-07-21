@@ -48,18 +48,26 @@ def _validate_success_response(response: object) -> dict:
     it may contain user or service details.
     """
     if not isinstance(response, dict):
-        raise PullError("OpenAPI application failure (invalid response)")
+        raise PullError("OpenAPI success payload is invalid")
     if "errCode" in response:
         code = response["errCode"]
         if isinstance(code, bool) or not isinstance(code, int) or code != 0:
             raise PullError("OpenAPI application failure (non-success errCode)")
-    if (
-        response.get("success") is False
-        or response.get("ok") is False
-        or response.get("error")
-        or ("errCode" not in response and response.get("errMsg"))
-    ):
+    for field in ("success", "ok"):
+        if field in response and not isinstance(response[field], bool):
+            raise PullError("OpenAPI success payload has malformed status")
+        if response.get(field) is False:
+            raise PullError("OpenAPI application failure")
+    if "errMsg" in response:
+        message = response["errMsg"]
+        if not isinstance(message, str):
+            raise PullError("OpenAPI success payload has malformed error field")
+        if message:
+            raise PullError("OpenAPI application failure")
+    if "error" in response and response["error"] is not None:
         raise PullError("OpenAPI application failure")
+    if not isinstance(response.get("results"), list):
+        raise PullError("OpenAPI success payload requires list results")
     return response
 
 

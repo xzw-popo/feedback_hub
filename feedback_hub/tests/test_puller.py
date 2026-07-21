@@ -180,6 +180,44 @@ def test_fetch_window_rejects_http_200_application_error_without_err_code(monkey
         puller.fetch_window(1, 2)
 
 
+@pytest.mark.parametrize("payload", [{}, {"errCode": 0}, {"errCode": 0, "results": "not-a-list"}, {"errCode": 0, "results": None}, {"errCode": 0, "results": [], "errMsg": {}}, {"errCode": 0, "results": [], "error": {}}])
+def test_pull_rejects_malformed_success_shape_before_raw_feedback_or_coverage(tmp_path, monkeypatch, payload):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: payload)
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    connection = db.connect(db_path)
+    db.init_schema(connection)
+    try:
+        with pytest.raises(puller.PullError):
+            puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=connection)
+    finally:
+        connection.close()
+
+    assert not (tmp_path / "raw").exists()
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 0
+
+
+def test_pull_accepts_documented_empty_results_list(tmp_path, monkeypatch):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 0, "results": []})
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    connection = db.connect(db_path)
+    db.init_schema(connection)
+    try:
+        result = puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=connection)
+    finally:
+        connection.close()
+
+    assert result["fetched_count"] == 0
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 1
+
+
 def test_pull_publishes_feedback_and_coverage_in_one_transaction(
     tmp_path, monkeypatch,
 ):
