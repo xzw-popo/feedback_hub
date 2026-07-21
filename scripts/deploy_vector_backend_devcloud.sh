@@ -82,12 +82,15 @@ for name in required:
 
 entries: list[tuple[str, str]] = []
 safe_path = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+ignored_root_metadata = {".msc", ".mv"}
 for directory, dirnames, filenames in os.walk(model_dir, followlinks=False):
     current = Path(directory)
     for name in [*dirnames, *filenames]:
         if (current / name).is_symlink():
             raise SystemExit(f"[vector-deploy] Model tree must not contain symlink: {current / name}")
     for filename in filenames:
+        if current == model_dir and filename in ignored_root_metadata:
+            continue
         path = current / filename
         if not path.is_file():
             raise SystemExit(f"[vector-deploy] Model tree entry is not a regular file: {path}")
@@ -96,7 +99,12 @@ for directory, dirnames, filenames in os.walk(model_dir, followlinks=False):
             relative = resolved.relative_to(model_dir).as_posix()
         except ValueError as exc:
             raise SystemExit(f"[vector-deploy] Model file escapes source root: {path}") from exc
-        if not safe_path.fullmatch(relative) or "//" in relative or "/../" in f"/{relative}/":
+        if (
+            not safe_path.fullmatch(relative)
+            or any(part.startswith(".") for part in relative.split("/"))
+            or "//" in relative
+            or "/../" in f"/{relative}/"
+        ):
             raise SystemExit(f"[vector-deploy] Unsafe model filename: {relative!r}")
         digest = hashlib.sha256()
         with resolved.open("rb") as source:
@@ -106,7 +114,12 @@ for directory, dirnames, filenames in os.walk(model_dir, followlinks=False):
 entries.sort()
 lines: list[str] = []
 for relative, digest in entries:
-    if not safe_path.fullmatch(relative) or "//" in relative or "/../" in f"/{relative}/":
+    if (
+        not safe_path.fullmatch(relative)
+        or any(part.startswith(".") for part in relative.split("/"))
+        or "//" in relative
+        or "/../" in f"/{relative}/"
+    ):
         raise SystemExit(f"[vector-deploy] Unsafe model filename: {relative!r}")
     lines.append(f"{digest}  {relative}\n")
 if not entries:

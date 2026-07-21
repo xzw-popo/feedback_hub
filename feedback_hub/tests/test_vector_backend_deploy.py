@@ -506,6 +506,76 @@ def test_vector_deploy_accepts_a_valid_model_manifest_before_first_ssh(tmp_path)
     assert "ssh-reached" in result.stderr
 
 
+def test_vector_deploy_ignores_known_modelscope_metadata_in_manifest(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model_dir / filename).write_text("fixture", encoding="utf-8")
+    (model_dir / ".msc").write_bytes(b"modelscope cache metadata")
+    (model_dir / ".mv").write_text("model revision metadata", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    captured_manifest = tmp_path / "captured-manifest"
+    _write_executable(fake_bin / "ssh", "#!/bin/sh\nexit 0\n")
+    _write_executable(
+        fake_bin / "scp",
+        "#!/bin/sh\n"
+        "cp -- \"$4\" \"${CAPTURED_MANIFEST:?}\"\n"
+        "exit 44\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(VECTOR_DEPLOY)],
+        env={
+            **os.environ,
+            "MODEL_SOURCE_DIR": str(model_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURED_MANIFEST": str(captured_manifest),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 44
+    manifest = captured_manifest.read_text(encoding="utf-8")
+    assert ".msc" not in manifest
+    assert ".mv" not in manifest
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        assert f"  {filename}\n" in manifest
+
+
+@pytest.mark.parametrize(
+    "unsafe_relative",
+    [".unknown", ".metadata.json", ".hidden/payload.json", "nested/.msc"],
+)
+def test_vector_deploy_still_rejects_unknown_dot_entries_before_ssh(tmp_path, unsafe_relative):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model_dir / filename).write_text("fixture", encoding="utf-8")
+    unsafe_path = model_dir / unsafe_relative
+    unsafe_path.parent.mkdir(parents=True, exist_ok=True)
+    unsafe_path.write_text("unexpected metadata", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "ssh", "#!/bin/sh\necho unexpected >&2\nexit 99\n")
+
+    result = subprocess.run(
+        ["bash", str(VECTOR_DEPLOY)],
+        env={
+            **os.environ,
+            "MODEL_SOURCE_DIR": str(model_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe model filename" in result.stderr.lower()
+    assert "unexpected" not in result.stderr
+
+
 def test_vector_bootstrap_arms_remote_cleanup_before_first_transport_failure(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
