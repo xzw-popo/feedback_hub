@@ -61,11 +61,16 @@ def validate_vectors(
         raise ValueError("empty shards are not allowed")
     if vectors.shape[1] != dimension:
         raise ValueError("vector dimension does not match index dimension")
-    if not np.isfinite(vectors).all():
-        raise ValueError("vectors contain non-finite values")
-    norms = np.linalg.norm(vectors.astype(np.float64, copy=False), axis=1)
-    if not np.allclose(norms, 1.0, rtol=1e-4, atol=1e-4):
-        raise ValueError("vectors must be normalized")
+    # Keep the validation path bounded when opening a 127k-row mmap.  In
+    # particular, do not promote the complete matrix to float64 just to check
+    # norms: each chunk is already float32 and only needs a small score vector.
+    for start in range(0, expected_rows, 8192):
+        chunk = vectors[start : start + 8192]
+        if not np.isfinite(chunk).all():
+            raise ValueError("vectors contain non-finite values")
+        squared_norms = np.einsum("nd,nd->n", chunk, chunk, dtype=np.float32)
+        if not np.allclose(squared_norms, 1.0, rtol=2e-4, atol=2e-4):
+            raise ValueError("vectors must be normalized")
 
 
 class ShardStore:

@@ -56,3 +56,47 @@ def test_health_reports_ready_index_and_watermark(indexed):
     assert response.status_code == 200
     assert response.json()["ready"] is True
     assert response.json()["watermark_ts_ms"] == 777
+
+
+def test_api_returns_503_when_reload_is_degraded_but_old_search_state_exists(indexed):
+    config, _, store = indexed
+    from feedback_hub.tests.test_vector_index_search import StubEncoder
+    app = create_app(config, encoder=StubEncoder())
+    client = TestClient(app, raise_server_exceptions=False)
+    store.manifest_path.write_text("{broken", encoding="utf-8")
+
+    for method, path, kwargs in (
+        ("get", "/health", {}),
+        ("get", "/capabilities", {"params": {"index": config.index_name}}),
+        ("post", "/search", {"json": {"index": config.index_name, "queries": [], "filters": {"unit": "feedback"}, "limit": 1}}),
+    ):
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 503
+        assert str(config.data_dir) not in response.text
+        assert "Traceback" not in response.text
+
+
+@pytest.mark.parametrize("limit", [True, 1.5, "1"])
+def test_api_rejects_non_integer_limits_with_422(indexed, limit):
+    config, _, _ = indexed
+    from feedback_hub.tests.test_vector_index_search import StubEncoder
+    client = TestClient(create_app(config, encoder=StubEncoder()))
+    response = client.post("/search", json={
+        "index": config.index_name, "queries": [], "filters": {"unit": "feedback"}, "limit": limit,
+    })
+    assert response.status_code == 422
+
+
+def test_injected_encoder_readiness_failure_degrades_without_leaking_details(indexed):
+    config, _, _ = indexed
+
+    class FailingReadyEncoder:
+        def ensure_ready(self):
+            raise RuntimeError(f"cannot open {config.data_dir}/model-secret")
+
+    client = TestClient(create_app(config, encoder=FailingReadyEncoder()), raise_server_exceptions=False)
+    for path, kwargs in (("/capabilities", {"params": {"index": config.index_name}}), ("/health", {})):
+        response = client.get(path, **kwargs)
+        assert response.status_code == 503
+        assert response.json()["detail"] == "RuntimeError"
+        assert str(config.data_dir) not in response.text

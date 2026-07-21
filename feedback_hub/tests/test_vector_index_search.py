@@ -69,7 +69,12 @@ def indexed(tmp_path):
             ) for offset, item_id in enumerate(ids)
         ])
     connection.commit()
-    store.publish_manifest([first, second], watermark_ts_ms=777)
+    manifest = store.publish_manifest([first, second], watermark_ts_ms=777)
+    repo.mark_publication(
+        publication_key=str(store.root), model_version=config.model_version,
+        generation=manifest.generation, watermark_ts_ms=manifest.watermark_ts_ms,
+    )
+    connection.commit()
     yield config, connection, store
     connection.close()
 
@@ -131,10 +136,57 @@ def test_reload_promotes_a_complete_new_manifest_without_dropping_old_state(inde
     repo = VectorRepository(connection)
     repo.publish_shard(shard, [EmbeddingRecord("new", config.model_version, hashlib.sha256(b"new").hexdigest(), shard.shard_id, 0, 1)])
     connection.commit()
-    store.publish_manifest([*store.load_manifest().shards, shard], watermark_ts_ms=888)
+    manifest = store.publish_manifest([*store.load_manifest().shards, shard], watermark_ts_ms=888)
+    repo.mark_publication(
+        publication_key=str(store.root), model_version=config.model_version,
+        generation=manifest.generation, watermark_ts_ms=manifest.watermark_ts_ms,
+    )
+    connection.commit()
     assert searcher.reload_if_changed()
     assert searcher.search([{"id": "q", "text": "第二个", "kind": "positive"}], {"unit": "feedback"}, 1).watermark_ts_ms == 888
     store.manifest_path.write_text("{broken", encoding="utf-8")
     assert not searcher.reload_if_changed()
     assert searcher.search([{"id": "q", "text": "工具栏", "kind": "positive"}], {"unit": "feedback"}, 1).watermark_ts_ms == 888
     assert old.watermark_ts_ms == 777
+
+
+def test_failed_reload_degrades_health_but_retains_old_state(indexed, searcher):
+    _, _, store = indexed
+    store.manifest_path.write_text("{broken", encoding="utf-8")
+
+    assert not searcher.reload_if_changed()
+    assert searcher.health().ready is False
+    assert searcher.health().error_code == "ValueError"
+    assert [hit.item_id for hit in searcher.search(
+        [{"id": "q", "text": "工具栏", "kind": "positive"}], {"unit": "feedback"}, 1,
+    )] == ["in-window"]
+
+
+@pytest.mark.parametrize("tamper", ["duplicate", "hash", "shard", "marker"])
+def test_active_generation_integrity_failure_keeps_old_state(indexed, searcher, tamper):
+    config, connection, store = indexed
+    old = searcher.current_manifest()
+    if tamper == "duplicate":
+        connection.execute(
+            """INSERT INTO embedding_record
+               (feedback_id, model_version, content_hash, shard_id, row_offset, embedded_at_ms)
+               SELECT feedback_id, model_version, 'second-content-version', shard_id, row_offset, embedded_at_ms
+               FROM embedding_record WHERE feedback_id = 'in-window'"""
+        )
+    elif tamper == "hash":
+        connection.execute("UPDATE embedding_record SET content_hash = 'bad' WHERE feedback_id = 'in-window'")
+    elif tamper == "shard":
+        connection.execute("UPDATE embedding_shard SET row_count = row_count + 1")
+    connection.commit()
+    replacement = store.publish_manifest(old.shards, watermark_ts_ms=old.watermark_ts_ms)
+    repo = VectorRepository(connection)
+    if tamper != "marker":
+        repo.mark_publication(
+            publication_key=str(store.root), model_version=config.model_version,
+            generation=replacement.generation, watermark_ts_ms=replacement.watermark_ts_ms,
+        )
+    connection.commit()
+
+    assert not searcher.reload_if_changed()
+    assert searcher.health().ready is False
+    assert searcher.current_manifest() == old

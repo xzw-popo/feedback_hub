@@ -106,6 +106,11 @@ class QwenEmbeddingEncoder:
         """Encode feedback bodies without a query instruction."""
         return self._encode(texts)
 
+    def ensure_ready(self) -> None:
+        """Load the runtime only when a running service asks for readiness."""
+        if self._runtime is None:
+            self._runtime = _QwenRuntime(str(self.config.model_dir))
+
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
         """Encode query text with the Qwen retrieval instruction."""
         return self._encode([instruct_query(text) for text in texts])
