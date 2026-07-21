@@ -3,6 +3,7 @@
 from .config import VectorIndexConfig
 from .models import EmbeddingRecord, PendingFeedback, ShardMetadata, VectorIndexStatus
 from .repository import VectorRepository
+from .search import VectorSearcher
 
 __all__ = [
     "EmbeddingRecord",
@@ -11,4 +12,5 @@ __all__ = [
     "VectorIndexConfig",
     "VectorIndexStatus",
     "VectorRepository",
+    "VectorSearcher",
 ]
