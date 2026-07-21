@@ -66,9 +66,13 @@ def _validate_rebuild_request(target_model_version: str, generation_id: str) -> 
 def _status(config: VectorIndexConfig) -> dict[str, Any]:
     # The production searcher validates publication markers, mappings, shards,
     # and model readiness together.  Do not substitute a shallow manifest read.
-    searcher = VectorSearcher(config)
-    manifest = searcher.ensure_ready()
     active = active_index_config(config)
+    searcher = VectorSearcher(active)
+    manifest = searcher.ensure_ready()
+    # A promotion may occur while model readiness is being established.  Never
+    # combine fields from the old manifest with a new pointer's repository.
+    if active_index_config(config) != active:
+        raise RuntimeError("active generation changed during status validation")
     repository = VectorRepository(active)
     try:
         repository.init_schema()
@@ -165,6 +169,10 @@ def _serve(config: VectorIndexConfig, *, allow_empty_index: bool) -> int:
     # Keep the root config: VectorSearcher resolves the active-generation
     # pointer before each request and therefore sees future promotions.
     app = create_app(config)
+    if not allow_empty_index:
+        # Validate with the exact searcher owned by this app.  This prevents a
+        # separate preflight model instance from being retained or pinned.
+        app.state.vector_searcher.ensure_ready()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=config.port,
                                            reload=False, log_level="info"))
     server.run()
@@ -227,7 +235,7 @@ def cmd_vectors(args: Any) -> int:
             _emit({"ok": True, "dimension": int(vectors.shape[1]), "count": int(vectors.shape[0])})
             return 0
         raise ValueError("unknown vector command")
-    except Exception as error:
+    except (Exception, KeyboardInterrupt, SystemExit) as error:
         print(f"vector command failed: {type(error).__name__}", file=sys.stderr)
         command = getattr(args, "vector_command", "unknown")
         payload = {"ok": False, "command": command, "error": type(error).__name__}

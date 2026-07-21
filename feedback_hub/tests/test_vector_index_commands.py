@@ -9,6 +9,7 @@ import sys
 from dataclasses import replace
 from types import SimpleNamespace
 import types
+import socket
 
 import pytest
 
@@ -76,6 +77,24 @@ def test_vector_status_reports_bad_manifest_as_nonzero_json(capsys, vector_fixtu
     captured = capsys.readouterr()
     assert json.loads(captured.out)["ready"] is False
     assert "vector command failed" in captured.err
+
+
+def test_vector_status_rejects_a_generation_promotion_during_validation(monkeypatch, capsys, vector_fixture):
+    from feedback_hub.vector_index import commands
+    promoted = replace(vector_fixture, data_dir=vector_fixture.data_dir / "generations" / "next", model_version="m2")
+    seen = iter((vector_fixture, promoted))
+
+    class ReadySearcher:
+        def __init__(self, config):
+            assert config == vector_fixture
+
+        def ensure_ready(self):
+            return SimpleNamespace(generation=1, dimension=1024, watermark_ts_ms=0, shards=())
+
+    monkeypatch.setattr(commands, "active_index_config", lambda *args, **kwargs: next(seen))
+    monkeypatch.setattr(commands, "VectorSearcher", ReadySearcher)
+    assert main(["vectors", "status", *_base_args(vector_fixture)]) == 1
+    assert json.loads(capsys.readouterr().out)["ready"] is False
 
 
 def test_rebuild_requires_stable_generation_id_before_loading_model(capsys, vector_fixture):
@@ -156,9 +175,19 @@ def test_serve_uses_root_config_so_future_promotions_remain_visible(monkeypatch,
     calls: dict[str, object] = {}
     api = types.ModuleType("feedback_hub.vector_index.api")
 
+    class Searcher:
+        def ensure_ready(self):
+            calls["ensure_ready"] = calls.get("ensure_ready", 0) + 1
+
+    class App:
+        state = SimpleNamespace(vector_searcher=Searcher())
+
+        async def __call__(self, scope, receive, send):
+            return None
+
     def create_app(config):
         calls["app_config"] = config
-        return object()
+        return App()
 
     class Config:
         def __init__(self, app, **kwargs):
@@ -179,5 +208,53 @@ def test_serve_uses_root_config_so_future_promotions_remain_visible(monkeypatch,
 
     assert _serve(vector_fixture, allow_empty_index=False) == 0
     assert calls["app_config"] == vector_fixture
+    assert calls["ensure_ready"] == 1
     assert calls["server_config"]["host"] == "127.0.0.1"
     assert json.loads(capsys.readouterr().out)["state"] == "stopped"
+
+
+def test_serve_port_collision_returns_one_error_json_after_preflight(monkeypatch, capsys, vector_fixture):
+    from feedback_hub.vector_index import api
+    ready_calls: list[object] = []
+
+    class Searcher:
+        def ensure_ready(self):
+            ready_calls.append(True)
+
+    class App:
+        state = SimpleNamespace(vector_searcher=Searcher())
+
+        async def __call__(self, scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    monkeypatch.setattr(api, "create_app", lambda config: App())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        try:
+            occupied.bind(("127.0.0.1", 0))
+        except PermissionError:
+            pytest.skip("sandbox disallows loopback bind; exercise this test in an unrestricted runtime")
+        occupied.listen()
+        port = occupied.getsockname()[1]
+        assert main(["vectors", "serve", "--port", str(port)]) != 0
+    captured = capsys.readouterr()
+    assert ready_calls == [True]
+    assert len(captured.out.strip().splitlines()) == 1
+    assert json.loads(captured.out)["ok"] is False
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_serve_interruptions_emit_one_error_json(monkeypatch, capsys, vector_fixture, raised):
+    from feedback_hub.vector_index.commands import cmd_vectors
+    args = SimpleNamespace(vector_command="serve", allow_empty_index=False, **{
+        "db_path": vector_fixture.db_path, "data_dir": vector_fixture.data_dir,
+        "model_dir": vector_fixture.model_dir, "index_name": None, "model_version": None,
+        "dimension": None, "batch_size": None, "max_length": None, "shard_size": None,
+        "compact_after_shards": None, "host": None, "port": 8011,
+    })
+
+    monkeypatch.setattr("feedback_hub.vector_index.commands._serve", lambda *_args, **_kw: (_ for _ in ()).throw(raised()))
+    assert cmd_vectors(args) == 1
+    captured = capsys.readouterr()
+    assert len(captured.out.strip().splitlines()) == 1
+    assert json.loads(captured.out)["ok"] is False

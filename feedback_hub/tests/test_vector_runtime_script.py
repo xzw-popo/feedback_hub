@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import shutil
 import subprocess
+import sys
+import time
 
 
 VECTOR_RUNTIME = Path(__file__).parents[2] / "scripts" / "vector_runtime.sh"
@@ -52,3 +55,59 @@ def test_vector_runtime_uses_token_bound_pid_ownership():
     assert "--runtime-token" in body
     assert "pid_is_owned" in body
     assert "kill -9" in body
+
+
+def test_runtime_treats_zombie_as_stopped_without_leaving_a_pid_record(tmp_path):
+    script = tmp_path / "scripts" / "vector_runtime.sh"
+    script.parent.mkdir()
+    shutil.copy2(VECTOR_RUNTIME, script)
+    parent = subprocess.Popen(
+        [sys.executable, "-c", "import os,time; child=os.fork(); child or os._exit(0); print(child, flush=True); time.sleep(20)"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert parent.stdout is not None
+        zombie_pid = parent.stdout.readline().strip()
+        time.sleep(0.1)
+        check = subprocess.run(
+            ["bash", "-c", 'VECTOR_RUNTIME_LIBRARY=1 source "$1"; set +e; ps(){ printf "Z\\n"; }; process_alive "$2"', "bash", str(script), zombie_pid],
+            capture_output=True, text=True,
+        )
+        assert check.returncode == 1
+    finally:
+        parent.terminate()
+        parent.wait(timeout=5)
+
+
+def test_runtime_escalates_owned_term_ignoring_process_without_leaking_pid_record(tmp_path):
+    script = tmp_path / "scripts" / "vector_runtime.sh"
+    script.parent.mkdir()
+    shutil.copy2(VECTOR_RUNTIME, script)
+    stubborn = subprocess.Popen(["bash", "-c", "trap '' TERM; while :; do /bin/sleep 1; done"])
+    try:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "vector_index.pid").write_text(f"{stubborn.pid} token123\n", encoding="utf-8")
+        counter = tmp_path / "ps-count"
+        counter.write_text("0", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", (
+                'VECTOR_RUNTIME_LIBRARY=1 source "$1"; set +e; pid_is_owned(){ return 0; }; '
+                'counter_path="$2"; sleep(){ :; }; ps(){ n=$(cat "$counter_path"); n=$((n+1)); printf "%s" "$n" > "$counter_path"; '
+                'if [ "$n" -gt 11 ]; then printf "Z\\n"; else printf "S\\n"; fi; }; stop_app'
+            ), "bash", str(script), str(counter)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert not (run_dir / "vector_index.pid").exists()
+        exit_code = None
+        for _ in range(20):
+            exit_code = stubborn.poll()
+            if exit_code is not None:
+                break
+            time.sleep(0.1)
+        assert exit_code == -9
+    finally:
+        if stubborn.poll() is None:
+            stubborn.kill()
+            stubborn.wait(timeout=5)

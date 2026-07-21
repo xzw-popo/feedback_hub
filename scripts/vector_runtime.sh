@@ -2,7 +2,7 @@
 # Manage the loopback-only feedback vector API inside a DevCloud container.
 set -euo pipefail
 
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${APP_DIR}/.venv"
 RUN_DIR="${APP_DIR}/run"
 LOG_DIR="${APP_DIR}/logs"
@@ -44,9 +44,21 @@ read_pid_record() {
   [ -z "$extra" ]
 }
 
+process_alive() {
+  local pid="$1" state=""
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  # Failure to inspect process state must be conservative: a live process is
+  # never considered stale merely because a restricted container denies ps.
+  state="$(ps -p "$pid" -o stat= 2>/dev/null)" || return 0
+  state="$(printf '%s' "$state" | tr -d '[:space:]')"
+  [ -n "$state" ] || return 0
+  case "$state" in *Z*) return 1 ;; esac
+  return 0
+}
+
 pid_is_owned() {
   local pid="$1" token="$2" command=""
-  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  process_alive "$pid" || return 1
   command="$(ps -p "$pid" -o command= 2>/dev/null)"
   case " $command " in
     *" -m feedback_hub.cli vectors serve "*" --runtime-token ${token} "*) return 0 ;;
@@ -75,22 +87,22 @@ stop_app() {
     echo "[vector-runtime] Stopping vector process ${pid}..."
     kill -TERM "$pid"
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$pid" >/dev/null 2>&1 || break
+      process_alive "$pid" || break
       sleep 1
     done
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if process_alive "$pid"; then
       echo "[vector-runtime] Sending SIGKILL to owned vector process ${pid}..." >&2
       kill -9 "$pid"
       for _ in 1 2 3 4 5; do
-        kill -0 "$pid" >/dev/null 2>&1 || break
+        process_alive "$pid" || break
         sleep 1
       done
-      if kill -0 "$pid" >/dev/null 2>&1; then
+      if process_alive "$pid"; then
         echo "[vector-runtime] Vector process did not stop" >&2
         return 1
       fi
     fi
-  elif kill -0 "$pid" >/dev/null 2>&1; then
+  elif process_alive "$pid"; then
     echo "[vector-runtime] Refusing to signal PID ${pid}: ownership token does not match" >&2
     return 1
   fi
@@ -180,7 +192,7 @@ start_app() {
       echo "[vector-runtime] already running pid=${old_pid} port=${VECTOR_PORT}"
       return 0
     fi
-    if kill -0 "$old_pid" >/dev/null 2>&1; then
+    if process_alive "$old_pid"; then
       echo "[vector-runtime] Refusing stale PID owned by another process" >&2
       return 1
     fi
@@ -219,7 +231,7 @@ status_app() {
     fi
     echo "[vector-runtime] running pid=${RUNTIME_PID} port=${VECTOR_PORT}"
   else
-    if read_pid_record && ! kill -0 "$RUNTIME_PID" >/dev/null 2>&1; then
+    if read_pid_record && ! process_alive "$RUNTIME_PID"; then
       remove_pid_record_if_owned "$RUNTIME_PID" "$RUNTIME_TOKEN"
     fi
     echo "[vector-runtime] stopped"
@@ -227,11 +239,13 @@ status_app() {
   fi
 }
 
-case "${1:-restart}" in
-  start) start_app ;;
-  stop) stop_app ;;
-  restart) stop_app; start_app ;;
-  status) status_app ;;
-  logs) tail -n "${LINES:-120}" "$LOG_FILE" ;;
-  *) echo "Usage: $0 {start|stop|restart|status|logs}" >&2; exit 2 ;;
-esac
+if [ "${VECTOR_RUNTIME_LIBRARY:-0}" != "1" ]; then
+  case "${1:-restart}" in
+    start) start_app ;;
+    stop) stop_app ;;
+    restart) stop_app; start_app ;;
+    status) status_app ;;
+    logs) tail -n "${LINES:-120}" "$LOG_FILE" ;;
+    *) echo "Usage: $0 {start|stop|restart|status|logs}" >&2; exit 2 ;;
+  esac
+fi
