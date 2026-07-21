@@ -216,6 +216,76 @@ unset TOPIC_TOKEN
 
 专题后端部署不上传或安装 `codex-skills/mining-feedback-topics/`：该目录是单独分发给 Codex 的客户端 Skill，不属于服务运行时。打包部署时应将其排除出服务包。部署也绝不替换生产 `feedback_hub/data/feedback.db`；仅保留既有数据库，并让专题 run 在独立 `topic_mining/` 数据目录内创建快照和产物。
 
+### 5.2 部署本地 Qwen 向量后端（需单独批准远端写入）
+
+向量模型、索引和日志都是远端运行态，固定保存在代码包之外；常规 `deploy_devcloud.sh` 会保留它们，归档和 Git 均不包含这些路径：
+
+- 模型：`/opt/feedback_hub/feedback_hub/data/models/Qwen3-Embedding-0.6B`
+- 索引：`/opt/feedback_hub/feedback_hub/data/vector_index`
+- 向量 API：只监听 `127.0.0.1:8011`（可用 `VECTOR_PORT` 覆盖）
+- 向量日志：`/opt/feedback_hub/logs/vector_index.log`
+- 增量同步日志：`/opt/feedback_hub/feedback_hub/data/logs/feedback_incremental_sync.log`
+
+模型只在获得远端写入批准后从本机已验证的实验目录上传。脚本要求本地模型同时有 `config.json`、`tokenizer.json`、`model.safetensors`，生成确定性 SHA-256 清单，仅上传与远端清单不同的文件，并通过临时目录校验后原子提升。它会先安装 `requirements-vector.txt`，再从官方 CPU 索引安装 PyTorch，并拒绝 CUDA 版本。它不会拉取原始反馈、不会打标、不会重建索引、不会修改 cron。
+
+```bash
+cd /Users/charvel/Desktop/用户反馈_2026_0612
+MODEL_SOURCE_DIR=/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/embedding_lab/models/Qwen3-Embedding-0.6B \
+  scripts/deploy_vector_backend_devcloud.sh
+```
+
+首次 bootstrap 默认不启动向量服务：没有已验证的活动根 `manifest.json` 或安全的 `active-generation.json` 指针时，启动会被拒绝。完成获批的两周数据准备和 rebuild 后，才可明确请求启动：
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  cd /opt/feedback_hub &&
+  ./.venv/bin/python -m feedback_hub.cli ingest backfill --last 14d --chunk 6h &&
+  ./.venv/bin/python -m feedback_hub.cli vectors rebuild \
+    --target-model-version qwen3-embedding-0.6b-document-v2 \
+    --generation-id qwen3-embedding-0.6b-document-v2-20260721 &&
+  scripts/vector_runtime.sh start
+'
+```
+
+`--last 14d` 是本轮批准的最大历史回填窗口；不要因未来可能需要更长专题范围而扩大到 180 天。回填只写原始覆盖和向量数据，不能调用通用 `tag`。如果模型部署时索引已经存在，可用 `--start-after-bootstrap` 只在上述活动清单/指针有效时启动：
+
+```bash
+MODEL_SOURCE_DIR=/path/to/Qwen3-Embedding-0.6B \
+  scripts/deploy_vector_backend_devcloud.sh --start-after-bootstrap
+```
+
+常规代码部署在代码目录原子切换后，如果检测到活动索引，会先重启并检查向量服务，再启动 FastAPI。向量服务无法达到 `/health` 时应用保持停止，部署返回非零；脚本会把代码目录回滚，同时保留 `.venv`、`.env`、模型、SQLite 与 `feedback_hub/data/`。
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  cd /opt/feedback_hub &&
+  scripts/vector_runtime.sh status &&
+  curl -fsS http://127.0.0.1:8011/health &&
+  APP_PORT=8000 scripts/devcloud_runtime.sh status
+'
+```
+
+当前节点只通过内网/VPN 访问专题接口，因此 `TOPIC_MINING_API_TOKEN` 保持 unset；不要为了此部署设置、打印或提交该 token。仍需保留 `TOPIC_VECTOR_API_URL=http://127.0.0.1:8011` 和相应 `TOPIC_*` 运行时配置在远端 `.env`，而不是本机 shell 或仓库。
+
+在切换每 20 分钟增量 cron 前，先备份当前 crontab；回滚时恢复此备份并删除新条目。以下命令是一次性远端操作，不由部署脚本执行：
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  cd /opt/feedback_hub &&
+  mkdir -p feedback_hub/data/cron-backups &&
+  crontab -l > feedback_hub/data/cron-backups/crontab-pre-vector.txt &&
+  scripts/install_feedback_incremental_cron.sh &&
+  crontab -l
+'
+
+# rollback the cron only after inspecting the backup:
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  crontab /opt/feedback_hub/feedback_hub/data/cron-backups/crontab-pre-vector.txt
+'
+```
+
+若 rebuild 生成了错误活动代际，先停止向量服务，恢复已确认健康的 `active-generation.json`（或其受控备份），再重新启动并检查 loopback health；不要删除模型或覆盖 `feedback_hub/data/`。记录操作后再决定是否恢复 crontab 备份。
+
 ## 6. 数据更新方案
 
 数据更新有两种方式：容器自动更新，或本机更新后同步数据库到容器。

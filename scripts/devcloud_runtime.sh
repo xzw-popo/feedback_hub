@@ -8,8 +8,43 @@ RUN_DIR="${APP_DIR}/run"
 LOG_DIR="${APP_DIR}/logs"
 PID_FILE="${RUN_DIR}/feedback_hub.pid"
 APP_PORT="${APP_PORT:-8000}"
+VECTOR_PORT="${VECTOR_PORT:-8011}"
+VECTOR_RUNTIME="${APP_DIR}/scripts/vector_runtime.sh"
+VECTOR_DATA_DIR="${VECTOR_DATA_DIR:-${APP_DIR}/feedback_hub/data/vector_index}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "${APP_DIR}/feedback_hub/data"
+
+vector_index_is_active() {
+  if [ -f "${VECTOR_DATA_DIR}/manifest.json" ]; then
+    return 0
+  fi
+  python3 - "$VECTOR_DATA_DIR" <<'PY' >/dev/null 2>&1
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+payload = json.loads((root / "active-generation.json").read_text(encoding="utf-8"))
+generation = payload["generation_id"]
+model = payload["model_version"]
+assert payload["schema_version"] == 1
+assert isinstance(generation, str) and generation and Path(generation).name == generation
+assert payload["data_dir"] == "generations/" + generation
+assert payload["storage_model_version"] == model + "::generation::" + generation
+target = (root / "generations" / generation).resolve()
+target.relative_to(root)
+assert target.parent == (root / "generations").resolve()
+assert (target / "manifest.json").is_file()
+PY
+}
+
+ensure_vector_runtime_health() {
+  [ -x "$VECTOR_RUNTIME" ] || return 0
+  vector_index_is_active || return 0
+  echo "[runtime] Ensuring vector runtime is healthy on 127.0.0.1:${VECTOR_PORT}..."
+  VECTOR_PORT="$VECTOR_PORT" "$VECTOR_RUNTIME" start
+  curl -fsS --max-time 2 "http://127.0.0.1:${VECTOR_PORT}/health" >/dev/null
+}
 
 ensure_venv() {
   if [ ! -x "${VENV_DIR}/bin/python" ]; then
@@ -67,6 +102,7 @@ stop_app() {
 
 start_app() {
   ensure_venv
+  ensure_vector_runtime_health
   cd "$APP_DIR"
   export PORT="$APP_PORT"
   export DB_MODE="${DB_MODE:-sqlite}"

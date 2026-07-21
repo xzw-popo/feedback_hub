@@ -61,7 +61,7 @@ def test_devcloud_archive_excludes_local_data_and_secret_envs_but_keeps_example(
     assert "-name '.env.*'" in script
     assert "! -name '.env.example'" in script
     assert "rm -f \"$ARCHIVE\"" in script
-    assert "rm -f \\\"${REMOTE_ARCHIVE}\\\"" in script
+    assert 'rm -f -- "$REMOTE_ARCHIVE"' in script
 
 
 def test_devcloud_archive_excludes_skill_fixture_but_keeps_backend(tmp_path):
