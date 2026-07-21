@@ -226,6 +226,12 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_vectors(args) -> int:
+    """Load optional vector dependencies only for the nested vector command."""
+    from feedback_hub.vector_index.commands import cmd_vectors as dispatch_vectors
+    return dispatch_vectors(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="feedback_hub")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -312,19 +318,29 @@ def build_parser() -> argparse.ArgumentParser:
     add_vector_config(vserve)
     vserve.add_argument("--allow-empty-index", action="store_true",
                         help="仅用于受控 bootstrap；允许服务以未就绪状态启动")
+    vserve.add_argument("--runtime-token", default="", help=argparse.SUPPRESS)
 
     vsmoke = vector_sub.add_parser("smoke-encode", help="编码一条文本以验证模型")
     add_vector_config(vsmoke)
     vsmoke.add_argument("--text", default="微信输入法向量编码健康检查")
 
-    from feedback_hub.vector_index.commands import cmd_vectors
     vectors.set_defaults(func=cmd_vectors)
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = build_parser().parse_args(values)
+    except SystemExit as error:
+        # Keep vector automation machine-readable even for argparse failures.
+        # Existing command behavior intentionally remains argparse-native.
+        if values and values[0] == "vectors" and error.code:
+            print(json.dumps({"ok": False, "command": "vectors", "error": "ArgumentError"},
+                             ensure_ascii=False, separators=(",", ":")))
+            return int(error.code)
+        raise
     return args.func(args)
 
 

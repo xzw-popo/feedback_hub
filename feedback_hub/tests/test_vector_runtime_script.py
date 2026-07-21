@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import subprocess
 
 
 VECTOR_RUNTIME = Path(__file__).parents[2] / "scripts" / "vector_runtime.sh"
@@ -34,3 +36,19 @@ def test_vector_runtime_checks_bootstrap_survival_and_existing_service_health():
     body = VECTOR_RUNTIME.read_text(encoding="utf-8")
     assert "wait_for_process" in body
     assert "wait_for_health \"$old_pid\"" in body
+
+
+def test_vector_runtime_is_executable_and_git_tracks_executable_mode():
+    assert os.stat(VECTOR_RUNTIME).st_mode & 0o111
+    result = subprocess.run(
+        ["git", "ls-files", "-s", "scripts/vector_runtime.sh"],
+        cwd=VECTOR_RUNTIME.parents[1], capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.startswith("100755 ")
+
+
+def test_vector_runtime_uses_token_bound_pid_ownership():
+    body = VECTOR_RUNTIME.read_text(encoding="utf-8")
+    assert "--runtime-token" in body
+    assert "pid_is_owned" in body
+    assert "kill -9" in body

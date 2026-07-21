@@ -21,6 +21,11 @@ from .sync import active_index_config, process_lock, rebuild_index, sync_pending
 
 
 _MAX_SEARCH_LIMIT = 100
+_MAX_QUERIES_PER_KIND = 8
+_MAX_QUERY_TEXT_LENGTH = 2048
+_MAX_FILTER_VALUES = 12
+_MAX_FILTER_VALUE_LENGTH = 128
+_MAX_SEARCH_WORK = 200
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -59,13 +64,14 @@ def _validate_rebuild_request(target_model_version: str, generation_id: str) -> 
 
 
 def _status(config: VectorIndexConfig) -> dict[str, Any]:
+    # The production searcher validates publication markers, mappings, shards,
+    # and model readiness together.  Do not substitute a shallow manifest read.
+    searcher = VectorSearcher(config)
+    manifest = searcher.ensure_ready()
     active = active_index_config(config)
-    store = ShardStore.from_config(active)
-    manifest = store.load_manifest()
     repository = VectorRepository(active)
     try:
         repository.init_schema()
-        counts = repository.status()
         pending = repository.pending_count(active.model_version)
     finally:
         repository.close()
@@ -75,9 +81,9 @@ def _status(config: VectorIndexConfig) -> dict[str, Any]:
         "index": active.index_name,
         "model_version": _logical_model_version(active.model_version),
         "generation": manifest.generation,
+        "dimension": manifest.dimension,
         "watermark_ts_ms": manifest.watermark_ts_ms,
-        "active_shards": counts.active_shards,
-        "retired_shards": counts.retired_shards,
+        "active_shards": len(manifest.shards),
         "pending_count": pending,
     }
 
@@ -107,7 +113,31 @@ def _search_filters(args: Any) -> dict[str, Any]:
     return filters
 
 
+def _validate_search_args(args: Any) -> None:
+    positive = list(args.query or [])
+    negative = list(args.negative_query or [])
+    if not positive and not negative:
+        raise ValueError("search requires at least one --query or --negative-query")
+    if len(positive) > _MAX_QUERIES_PER_KIND or len(negative) > _MAX_QUERIES_PER_KIND:
+        raise ValueError("too many search queries")
+    for text in [*positive, *negative]:
+        if not isinstance(text, str) or not text.strip() or len(text) > _MAX_QUERY_TEXT_LENGTH:
+            raise ValueError("search query text is invalid or too long")
+    if not isinstance(args.limit, int) or not 1 <= args.limit <= _MAX_SEARCH_LIMIT:
+        raise ValueError("search limit is out of range")
+    if (len(positive) + len(negative)) * args.limit > _MAX_SEARCH_WORK:
+        raise ValueError("requested vector search work is too large")
+    for name in ("platform", "channel", "version", "product"):
+        values = list(getattr(args, name, None) or [])
+        if len(values) > _MAX_FILTER_VALUES:
+            raise ValueError("too many vector filter values")
+        if any(not isinstance(value, str) or not value.strip() or len(value) > _MAX_FILTER_VALUE_LENGTH
+               for value in values):
+            raise ValueError("vector filter value is invalid or too long")
+
+
 def _search(config: VectorIndexConfig, args: Any) -> dict[str, Any]:
+    _validate_search_args(args)
     _require_model(config)
     active = active_index_config(config)
     queries = [
@@ -117,8 +147,6 @@ def _search(config: VectorIndexConfig, args: Any) -> dict[str, Any]:
         {"id": f"negative-{position}", "text": text, "kind": "negative"}
         for position, text in enumerate(args.negative_query or [], start=1)
     ]
-    if not queries:
-        raise ValueError("search requires at least one --query or --negative-query")
     searcher = VectorSearcher(active)
     searcher.ensure_ready()
     result = searcher.search(queries, _search_filters(args), args.limit)
@@ -132,24 +160,17 @@ def _search(config: VectorIndexConfig, args: Any) -> dict[str, Any]:
 
 
 def _serve(config: VectorIndexConfig, *, allow_empty_index: bool) -> int:
-    if not allow_empty_index:
-        _require_model(config)
-    active = active_index_config(config)
-    watermark = 0
-    if not allow_empty_index:
-        searcher = VectorSearcher(active)
-        watermark = searcher.ensure_ready().watermark_ts_ms
-    _emit({
-        "ok": True, "index": active.index_name,
-        "model_version": _logical_model_version(active.model_version),
-        "watermark_ts_ms": watermark,
-        "host": "127.0.0.1", "port": config.port,
-        "allow_empty_index": allow_empty_index,
-    })
     import uvicorn
     from .api import create_app
-    # The command is loopback-only even if a caller supplies a different host.
-    uvicorn.run(create_app(active), host="127.0.0.1", port=config.port, reload=False, log_level="info")
+    # Keep the root config: VectorSearcher resolves the active-generation
+    # pointer before each request and therefore sees future promotions.
+    app = create_app(config)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=config.port,
+                                           reload=False, log_level="info"))
+    server.run()
+    _emit({"ok": True, "state": "stopped", "index": config.index_name,
+           "host": "127.0.0.1", "port": config.port,
+           "allow_empty_index": allow_empty_index})
     return 0
 
 

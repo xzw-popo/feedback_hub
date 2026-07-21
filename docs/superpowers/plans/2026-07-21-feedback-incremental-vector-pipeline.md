@@ -391,7 +391,7 @@ Expected: every successful six-hour window has a coverage row, duplicates are sk
 Run:
 
 ```bash
-ssh -p 36000 root@charvelxia-any2.devcloud.woa.com 'cd /opt/feedback_hub && ./.venv/bin/python -m feedback_hub.cli vectors rebuild --target-model-version qwen3-embedding-0.6b-document-v1 --generation-id qwen3-embedding-0.6b-document-v1-20260721 && scripts/vector_runtime.sh start'
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com 'cd /opt/feedback_hub && ./.venv/bin/python -m feedback_hub.cli vectors rebuild --target-model-version qwen3-embedding-0.6b-document-v2 --generation-id qwen3-embedding-0.6b-document-v2-20260721 && scripts/vector_runtime.sh start'
 ```
 
 Expected: final status reports `pending_count=0`, `dimension=1024`, an active generation, and a vector watermark equal to the latest fully indexed source generation.
