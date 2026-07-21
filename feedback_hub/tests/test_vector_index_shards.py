@@ -249,6 +249,38 @@ def test_coordinated_publication_checks_committed_database_state_before_manifest
     assert store.publication_journal_path.exists()
 
 
+def test_invalid_partial_remap_rolls_back_database_before_recovery(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    replacement = store.write_shard(normalized([[1, 0], [0, 1], [1, 1]]), ["f1", "f2", "f3"])
+    new = store.manifest_for([replacement], watermark_ts_ms=old.watermark_ts_ms)
+    remap = _manifest_mappings(repo, old.shards)
+    remap = [{**item, "shard_id": replacement.shard_id, "row_offset": index} for index, item in enumerate(remap)]
+
+    def partial_mutation():
+        repo._insert_shard(replacement)
+        repo.connection.execute(
+            "UPDATE embedding_record SET shard_id = ?, row_offset = 0 WHERE feedback_id = 'f1'",
+            (replacement.shard_id,),
+        )
+        repo.connection.execute("UPDATE embedding_shard SET state = 'retired' WHERE shard_id IN (?, ?)",
+                            tuple(shard.shard_id for shard in old.shards))
+
+    with pytest.raises(ValueError, match="database state"):
+        store.publish_with_database(
+            repo, old_manifest=old, new_manifest=new, new_shards=[replacement],
+            row_remap=remap, database_mutation=partial_mutation,
+        )
+
+    recovered = ShardStore.open(vector_fixture.config)
+    assert recovered.load_manifest() == old
+    assert repo.status().active_shards == 2
+    assert repo.status().retired_shards == 0
+    assert [row[0] for row in repo.connection.execute(
+        "SELECT feedback_id FROM embedding_record ORDER BY feedback_id"
+    ).fetchall()] == ["f1", "f2", "f3"]
+
+
 def test_coordinated_publication_rejects_two_active_vectors_for_one_feedback_id(vector_fixture):
     store, repo = vector_fixture.store, vector_fixture.repo
     old = store.load_manifest()

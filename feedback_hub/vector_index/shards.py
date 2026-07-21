@@ -211,12 +211,12 @@ class ShardStore:
             try:
                 repository.connection.execute("BEGIN IMMEDIATE")
                 database_mutation()
+                if not self._database_matches_journal(repository, new_manifest, row_remap):
+                    raise ValueError("database state does not match publication journal")
                 repository.connection.commit()
             except Exception:
                 repository.connection.rollback()
                 raise
-            if not self._database_matches_journal(repository, new_manifest, row_remap):
-                raise ValueError("committed database state does not match publication journal")
             self._replace_manifest(new_manifest, expected_previous=old_manifest)
             self._remove_journal()
             return new_manifest
