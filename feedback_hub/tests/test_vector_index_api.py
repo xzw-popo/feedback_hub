@@ -100,3 +100,25 @@ def test_injected_encoder_readiness_failure_degrades_without_leaking_details(ind
         assert response.status_code == 503
         assert response.json()["detail"] == "RuntimeError"
         assert str(config.data_dir) not in response.text
+
+
+def test_api_validates_filter_before_reporting_a_degraded_service(indexed):
+    config, _, _ = indexed
+
+    class FailingReadyEncoder:
+        def ensure_ready(self):
+            raise RuntimeError("model unavailable")
+
+    client = TestClient(create_app(config, encoder=FailingReadyEncoder()), raise_server_exceptions=False)
+    malformed = client.post("/search", json={
+        "index": config.index_name, "queries": [], "filters": {"unit": "feedback", "typo": 1}, "limit": 1,
+    })
+    valid = client.post("/search", json={
+        "index": config.index_name, "queries": [], "filters": {"unit": "feedback"}, "limit": 1,
+    })
+    unknown = client.post("/search", json={
+        "index": "other", "queries": [], "filters": {"unit": "feedback", "typo": 1}, "limit": 1,
+    })
+    assert malformed.status_code == 422
+    assert valid.status_code == 503
+    assert unknown.status_code == 404

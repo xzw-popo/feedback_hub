@@ -53,12 +53,11 @@ def test_exact_search_127k_x_1024_production_baseline(tmp_path):
     repo.init_schema()
     store = ShardStore.from_config(config)
     rng = np.random.default_rng(20260721)
-    matrices, shards = [], []
+    shards = []
     for start in range(0, rows, rows // 2):
         count = min(rows // 2, rows - start)
         values = rng.standard_normal((count, dimension), dtype=np.float32)
         values /= np.sqrt(np.einsum("nd,nd->n", values, values, dtype=np.float32))[:, None]
-        matrices.append(values)
         ids = [f"f-{index:06d}" for index in range(start, start + count)]
         shards.append(store.write_shard(values, ids))
         repo.publish_shard(shards[-1], [
@@ -69,6 +68,9 @@ def test_exact_search_127k_x_1024_production_baseline(tmp_path):
             )
             for offset, (index, item_id) in enumerate(zip(range(start, start + count), ids))
         ])
+        # Keep only the immutable shard metadata; the next chunk must not hold
+        # a second half-corpus matrix in Python heap memory.
+        del values, ids
     connection.commit()
     manifest = store.publish_manifest(shards, watermark_ts_ms=9_999_999)
     repo.mark_publication(

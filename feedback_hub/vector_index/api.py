@@ -54,10 +54,12 @@ def create_app(config: VectorIndexConfig, encoder: Any | None = None) -> FastAPI
     def search(payload: SearchPayload) -> dict[str, object]:
         if payload.index != config.index_name:
             raise HTTPException(status_code=404, detail="unknown vector index")
+        queries = [query.model_dump() for query in payload.queries]
+        # Validation is deliberately before readiness: clients must receive a
+        # deterministic 422 for malformed filters even during model/reload 503.
+        searcher.validate_request(queries, payload.filters, payload.limit)
         searcher.ensure_ready()
-        result = searcher.search(
-            [query.model_dump() for query in payload.queries], payload.filters, payload.limit
-        )
+        result = searcher.search(queries, payload.filters, payload.limit)
         return {
             "index": config.index_name, "watermark_ts_ms": result.watermark_ts_ms,
             "hits": [hit.to_dict() for hit in result.hits],

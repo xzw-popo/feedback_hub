@@ -190,3 +190,43 @@ def test_active_generation_integrity_failure_keeps_old_state(indexed, searcher, 
     assert not searcher.reload_if_changed()
     assert searcher.health().ready is False
     assert searcher.current_manifest() == old
+
+
+def test_model_readiness_recovers_after_a_transient_failure(indexed):
+    config, _, _ = indexed
+
+    class FlakyEncoder:
+        calls = 0
+
+        def ensure_ready(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary model startup failure")
+
+    searcher = VectorSearcher(config, encoder=FlakyEncoder())
+    with pytest.raises(RuntimeError):
+        searcher.ensure_ready()
+    assert searcher.health().ready is False
+    searcher.ensure_ready()
+    assert searcher.health().ready is True
+
+
+def test_successful_model_retry_does_not_clear_reload_corruption(indexed):
+    config, _, store = indexed
+
+    class FlakyEncoder:
+        calls = 0
+
+        def ensure_ready(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary model startup failure")
+
+    searcher = VectorSearcher(config, encoder=FlakyEncoder())
+    with pytest.raises(RuntimeError):
+        searcher.ensure_ready()
+    store.manifest_path.write_text("{broken", encoding="utf-8")
+    assert searcher.health().error_code == "ValueError"
+    with pytest.raises(RuntimeError):
+        searcher.ensure_ready()
+    assert searcher.health().error_code == "ValueError"

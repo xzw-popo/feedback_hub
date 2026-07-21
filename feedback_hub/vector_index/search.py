@@ -128,8 +128,8 @@ class VectorSearcher:
         self._lock = threading.RLock()
         self._encoder_lock = threading.Lock()
         self._state: _SearchState | None = None
-        self._error_code = "index_unavailable"
-        self._failure_source = "reload"
+        self._reload_error = "index_unavailable"
+        self._model_error = ""
         self._last_metrics = SearchMetrics()
         self.reload_if_changed()
 
@@ -207,34 +207,31 @@ class VectorSearcher:
             identity = self._manifest_identity(active)
             with self._lock:
                 if self._state is not None and self._state.identity == identity:
-                    if self._failure_source == "reload":
-                        self._error_code = ""
-                        self._failure_source = ""
+                    self._reload_error = ""
                     return False
             candidate = self._load_state(active, identity)
         except Exception as error:
             with self._lock:
-                self._error_code = self._error_name(error)
-                self._failure_source = "reload"
+                self._reload_error = self._error_name(error)
             return False
         with self._lock:
             if self._state is not None and self._state.identity == candidate.identity:
                 return False
             self._state = candidate
-            self._error_code = ""
-            self._failure_source = ""
+            self._reload_error = ""
         return True
 
     def _state_or_raise(self) -> _SearchState:
         self.reload_if_changed()
         with self._lock:
             if self._state is None:
-                raise VectorServiceUnavailable(self._error_code or "index_unavailable")
+                raise VectorServiceUnavailable(self._reload_error or self._model_error or "index_unavailable")
             return self._state
 
     def _current_health(self) -> SearchHealth:
         with self._lock:
-            state, error = self._state, self._error_code
+            state, reload_error, model_error = self._state, self._reload_error, self._model_error
+        error = reload_error or model_error
         if state is None:
             return SearchHealth(False, self.config.index_name, 0, None, error or "index_unavailable")
         if error:
@@ -255,8 +252,10 @@ class VectorSearcher:
             self._ensure_encoder_ready(state)
         except Exception as error:
             with self._lock:
-                self._error_code = self._error_name(error)
-                self._failure_source = "model"
+                self._model_error = self._error_name(error)
+        else:
+            with self._lock:
+                self._model_error = ""
         health = self._current_health()
         if not health.ready:
             raise VectorServiceUnavailable(health.error_code)
@@ -352,9 +351,16 @@ class VectorSearcher:
             return vectors
         except Exception as error:
             with self._lock:
-                self._error_code = self._error_name(error)
-                self._failure_source = "model"
-            raise VectorServiceUnavailable(self._error_code) from None
+                self._model_error = self._error_name(error)
+            raise VectorServiceUnavailable(self._model_error) from None
+
+    def validate_request(
+        self, queries: Sequence[Mapping[str, Any]], filters: Mapping[str, Any], limit: int,
+    ) -> tuple[list[dict[str, str]], dict[str, Any]]:
+        """Pure request validation for API precedence before readiness checks."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        return self._validate_queries(queries), self._validate_filters(filters)
 
     def _eligible_shards(self, state: _SearchState, filters: Mapping[str, Any]) -> tuple[list[np.ndarray], SearchMetrics]:
         masks = [np.fromiter((self._eligible(row, filters) for row in shard.rows), dtype=bool, count=len(shard.rows)) for shard in state.shards]
@@ -381,9 +387,7 @@ class VectorSearcher:
         return selected, chunks, max_rows
 
     def search(self, queries: Sequence[Mapping[str, Any]], filters: Mapping[str, Any], limit: int) -> VectorSearchResult:
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-            raise ValueError("limit must be a positive integer")
-        validated_queries, validated_filters = self._validate_queries(queries), self._validate_filters(filters)
+        validated_queries, validated_filters = self.validate_request(queries, filters, limit)
         state = self._state_or_raise()
         if not validated_queries:
             return VectorSearchResult(state.manifest.watermark_ts_ms, ())
