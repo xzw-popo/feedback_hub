@@ -285,7 +285,7 @@ def run_incremental(
                     error_code=type(exc).__name__,
                 )
                 _finish_pipeline_run(connection, failed)
-                raise
+                raise IncrementalPipelineError(failed) from exc
             fetched, inserted, duplicates, generation = _pull_counts(pull_payload)
         finally:
             connection.close()

@@ -165,13 +165,18 @@ def test_pull_failure_never_starts_vector_and_records_failed_pipeline_run(config
         calls.append("vector")
         raise AssertionError("vector must not start")
 
-    with pytest.raises(RuntimeError, match="pull fixture failed"):
+    with pytest.raises(IncrementalPipelineError) as error:
         run_incremental(
             now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
             pull_fn=failing_pull, vector_sync_fn=vector_fn,
         )
 
     assert calls == ["pull"]
+    result = error.value.result
+    assert result.pull_status == "failed"
+    assert result.vector_status == "not_started"
+    assert result.status == "failed"
+    assert result.error_code == "RuntimeError"
     assert _scalar(
         config.db_path,
         "SELECT status FROM embedding_sync_run WHERE run_type = 'incremental_pipeline'",
@@ -363,11 +368,13 @@ def test_pipeline_rejects_application_error_audits_pull_failure_and_never_vector
 
     monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 9, "errMsg": "denied"})
     vectors: list[str] = []
-    with pytest.raises(puller.PullError):
+    with pytest.raises(IncrementalPipelineError) as error:
         run_incremental(
             now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
             vector_sync_fn=lambda: vectors.append("started"),
         )
+    assert error.value.result.pull_status == "failed"
+    assert error.value.result.error_code == "PullError"
 
     assert vectors == []
     assert _scalar(config.db_path, "SELECT COUNT(*) FROM feedback") == 0
@@ -386,11 +393,14 @@ def test_pipeline_rejects_malformed_success_shapes_before_raw_source_or_vector(c
     monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
     monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
     vectors: list[str] = []
-    with pytest.raises(puller.PullError):
+    with pytest.raises(IncrementalPipelineError) as error:
         run_incremental(
             now=fixed_now(), pull_window=timedelta(minutes=30), config=config,
             vector_sync_fn=lambda: vectors.append("started"),
         )
+
+    assert error.value.result.pull_status == "failed"
+    assert error.value.result.error_code == "PullError"
 
     assert vectors == []
     assert not (tmp_path / "raw").exists()

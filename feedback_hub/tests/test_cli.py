@@ -1,6 +1,7 @@
 """轻量 CLI 测试：argparse 路由 + tag 离线模式（不调用真实远端）。"""
 from __future__ import annotations
 
+import builtins
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -119,6 +120,7 @@ def test_incremental_cli_defaults_to_exact_utc_thirty_minutes(monkeypatch, capsy
     payload, stderr = _one_json(capsys)
     assert stderr == ""
     assert payload["window_minutes"] == 30
+    assert payload["window_seconds"] == 1800
     assert payload["status"] == "succeeded"
     assert observed["pull_window"] == timedelta(minutes=30)
     assert observed["now"].tzinfo == timezone.utc
@@ -138,6 +140,7 @@ def test_incremental_cli_serializes_vector_failure_once(monkeypatch, capsys):
     assert payload["ok"] is False
     assert payload["run_id"] == "run-1"
     assert payload["vector_status"] == "failed"
+    assert payload["window_seconds"] == 1800
     assert "incremental pipeline failed" in stderr
 
 
@@ -151,19 +154,35 @@ def test_incremental_cli_marks_an_incomplete_vector_result_nonzero(monkeypatch, 
     assert "incomplete" in stderr
 
 
+@pytest.mark.parametrize(("window", "seconds", "minutes"), [
+    ("90s", 90, 1.5),
+    ("30s", 30, 0.5),
+])
+def test_incremental_cli_reports_exact_non_minute_window_duration(monkeypatch, capsys, window, seconds, minutes):
+    monkeypatch.setattr("feedback_hub.incremental_pipeline.run_incremental", lambda **_kwargs: _incremental_result())
+    assert cli.main(["pipeline", "incremental", "--pull-window", window]) == 0
+    payload, _ = _one_json(capsys)
+    assert payload["window_seconds"] == seconds
+    assert payload["window_minutes"] == minutes
+
+
 def test_incremental_cli_serializes_pull_failure_once(monkeypatch, capsys):
+    from feedback_hub.incremental_pipeline import IncrementalPipelineError
+
+    result = _incremental_result(
+        status="failed", pull_status="failed", vector_status="not_started", error_code="PullError",
+    )
     monkeypatch.setattr(
         "feedback_hub.incremental_pipeline.run_incremental",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("network down")),
+        lambda **_kwargs: (_ for _ in ()).throw(IncrementalPipelineError(result)),
     )
     assert cli.main(["pipeline", "incremental"]) == 1
     payload, stderr = _one_json(capsys)
-    assert payload == {
-        "command": "pipeline incremental", "error": "RuntimeError", "ok": False,
-        "status": "failed",
-    }
-    assert "incremental pipeline failed: RuntimeError" in stderr
-    assert "network down" not in stderr
+    assert payload["run_id"] == "run-1"
+    assert payload["window_start"] == "2026-07-20T23:30:00+00:00"
+    assert payload["pull_status"] == "failed"
+    assert payload["window_seconds"] == 1800
+    assert "incremental pipeline failed: pull stage" in stderr
 
 
 def test_incremental_cli_reports_lock_contention_with_cron_exit_code(monkeypatch, capsys):
@@ -175,7 +194,10 @@ def test_incremental_cli_reports_lock_contention_with_cron_exit_code(monkeypatch
     )
     assert cli.main(["pipeline", "incremental"]) == 75
     payload, stderr = _one_json(capsys)
-    assert payload == {"command": "pipeline incremental", "ok": False, "status": "skipped_locked"}
+    assert payload == {
+        "command": "pipeline incremental", "ok": False, "status": "skipped_locked",
+        "window_minutes": 30, "window_seconds": 1800,
+    }
     assert "already running" in stderr
 
 
@@ -188,7 +210,7 @@ def test_incremental_cli_reports_lock_contention_with_cron_exit_code(monkeypatch
     ["pipeline", "incremental", "--unknown"],
 ])
 def test_new_pipeline_parser_and_duration_errors_are_one_json(argv, capsys):
-    assert cli.main(argv) == 2
+    assert cli.main(argv) == 1
     payload, stderr = _one_json(capsys)
     assert payload["ok"] is False
     assert payload["command"] in {"pipeline incremental", "ingest backfill"}
@@ -220,18 +242,34 @@ def test_ingest_backfill_uses_utc_current_time_and_channel(monkeypatch, capsys):
     assert observed["channel"] == "pc"
 
 
-@pytest.mark.parametrize("argv", [
-    ["ingest", "pull", "--last", "0m"],
-    ["ingest", "pull", "--last", "367d"],
-    ["ingest", "pull", "--channel", "../unsafe"],
-])
-def test_ingest_pull_rejects_unsafe_automation_arguments_before_network(monkeypatch, argv, capsys):
+def test_ingest_pull_is_exactly_the_legacy_pull_route_and_argument_contract(monkeypatch, capsys):
     from feedback_hub import puller
 
-    monkeypatch.setattr(
-        puller, "pull", lambda *_args, **_kwargs: pytest.fail("unsafe ingest pull reached network"),
-    )
-    assert cli.main(argv) == 2
+    legacy = cli.build_parser().parse_args(["pull", "--last", "1h", "--channel", "pc", "--service-vid", "7"])
+    ingest = cli.build_parser().parse_args(["ingest", "pull", "--last", "1h", "--channel", "pc", "--service-vid", "7"])
+    assert legacy.func is cli.cmd_pull
+    assert ingest.func is cli.cmd_pull
+    assert (legacy.last, legacy.channel, legacy.service_vid) == (ingest.last, ingest.channel, ingest.service_vid)
+
+    monkeypatch.setattr(puller, "pull", lambda *_args, **_kwargs: {"fetched_count": 0, "raw_dump": "fixed"})
+    monkeypatch.setattr(cli, "_resolve_window", lambda _args: (datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9)))
+    assert cli.main(["pull", "--last", "1h"]) == 0
+    legacy_out, legacy_err = capsys.readouterr()
+    assert cli.main(["ingest", "pull", "--last", "1h"]) == 0
+    ingest_out, ingest_err = capsys.readouterr()
+    assert (legacy_out, legacy_err) == (ingest_out, ingest_err)
+
+
+def test_backfill_rejects_more_than_one_thousand_windows_before_pipeline_import(monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "feedback_hub.incremental_pipeline":
+            raise AssertionError("unbounded backfill imported pipeline")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    assert cli.main(["ingest", "backfill", "--last", "251d", "--chunk", "6h"]) == 1
     payload, stderr = _one_json(capsys)
-    assert payload == {"command": "ingest pull", "error": "ArgumentError", "ok": False}
-    assert stderr
+    assert payload == {"command": "ingest backfill", "error": "ArgumentError", "ok": False}
+    assert "argument error" in stderr

@@ -45,3 +45,30 @@ def test_incremental_script_handles_space_paths_and_propagates_python_exit(tmp_p
     assert completed.stderr == ""
     log = (log_dir / "feedback_incremental_sync.log").read_text(encoding="utf-8")
     assert "<-m feedback_hub.cli pipeline incremental --pull-window 30m>" in log
+
+
+def test_incremental_script_rotates_only_bounded_log_files_before_running(tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    wrapper = scripts / SCRIPT.name
+    wrapper.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    wrapper.chmod(0o755)
+    fake_python = project / "python"
+    fake_python.write_text("#!/usr/bin/env bash\nprintf 'new-run\\n'\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    log_dir = project / "logs"
+    log_dir.mkdir()
+    log_file = log_dir / "feedback_incremental_sync.log"
+    log_file.write_text("previous-run\n", encoding="utf-8")
+    (log_dir / "feedback_incremental_sync.log.1").write_text("older-run\n", encoding="utf-8")
+    completed = subprocess.run(
+        [str(wrapper)], text=True, capture_output=True,
+        env={**os.environ, "PYTHON_BIN": str(fake_python), "LOG_DIR": str(log_dir),
+             "LOG_MAX_BYTES": "1", "LOG_KEEP": "2"},
+    )
+    assert completed.returncode == 0
+    assert (log_dir / "feedback_incremental_sync.log.1").read_text(encoding="utf-8") == "previous-run\n"
+    assert (log_dir / "feedback_incremental_sync.log.2").read_text(encoding="utf-8") == "older-run\n"
+    assert "new-run" in log_file.read_text(encoding="utf-8")
+    assert not (log_dir / "feedback_incremental_sync.log.3").exists()

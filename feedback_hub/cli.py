@@ -35,6 +35,7 @@ _SAFE_CHANNEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MAX_INCREMENTAL_WINDOW = timedelta(hours=6)
 _MAX_BACKFILL_LOOKBACK = timedelta(days=366)
 _MAX_BACKFILL_CHUNK = timedelta(days=1)
+MAX_BACKFILL_WINDOWS = 1000
 
 
 def _emit_json(payload: dict) -> None:
@@ -79,6 +80,11 @@ def _result_payload(command: str, result, *, ok: bool) -> dict:
     payload = {"ok": ok, "command": command}
     payload.update(asdict(result))
     return payload
+
+
+def _window_payload(pull_window: timedelta) -> dict:
+    seconds = int(pull_window.total_seconds())
+    return {"window_seconds": seconds, "window_minutes": seconds / 60}
 
 
 def _parse_dt_str(s: str) -> datetime:
@@ -146,37 +152,6 @@ def cmd_pull(args) -> int:
     return 0
 
 
-def cmd_ingest_pull(args) -> int:
-    """The modern pull spelling keeps legacy ``pull`` output untouched."""
-    from feedback_hub import puller
-
-    try:
-        if args.last is not None:
-            _safe_duration(args.last, label="--last", maximum=_MAX_BACKFILL_LOOKBACK)
-        _safe_channel(args.channel)
-    except (ValueError, TypeError, OverflowError) as error:
-        print(f"ingest pull argument error: {type(error).__name__}", file=sys.stderr)
-        _emit_json({"ok": False, "command": "ingest pull", "error": "ArgumentError"})
-        return 2
-    try:
-        ensure_dirs()
-        start, end = _resolve_window(args)
-        conn = db.connect()
-        db.init_schema(conn)
-        try:
-            result = puller.pull(start, end, channel=args.channel,
-                                 service_vid=args.service_vid, conn=conn)
-        finally:
-            conn.close()
-    except Exception as error:
-        print(f"ingest pull failed: {type(error).__name__}", file=sys.stderr)
-        _emit_json({"ok": False, "command": "ingest pull", "status": "failed",
-                    "error": type(error).__name__})
-        return 1
-    _emit_json({"ok": True, "command": "ingest pull", **result})
-    return 0
-
-
 def cmd_pipeline_incremental(args) -> int:
     """Run the locked pull-then-vector stage with a cron-safe JSON contract."""
     try:
@@ -193,23 +168,26 @@ def cmd_pipeline_incremental(args) -> int:
             result = run_incremental(now=now, pull_window=pull_window, channel=channel)
         except PipelineAlreadyRunning:
             print("incremental pipeline already running", file=sys.stderr)
-            _emit_json({"ok": False, "command": "pipeline incremental", "status": "skipped_locked"})
+            _emit_json({"ok": False, "command": "pipeline incremental", "status": "skipped_locked",
+                        **_window_payload(pull_window)})
             return 75
         except IncrementalPipelineError as error:
-            print("incremental pipeline failed: vector stage", file=sys.stderr)
-            _emit_json(_result_payload("pipeline incremental", error.result, ok=False))
+            stage = "pull" if error.result.pull_status == "failed" else "vector"
+            print(f"incremental pipeline failed: {stage} stage", file=sys.stderr)
+            _emit_json({**_result_payload("pipeline incremental", error.result, ok=False),
+                        **_window_payload(pull_window)})
             return 1
     except (ValueError, TypeError, OverflowError) as error:
         print(f"incremental pipeline argument error: {type(error).__name__}", file=sys.stderr)
         _emit_json({"ok": False, "command": "pipeline incremental", "error": "ArgumentError"})
-        return 2
+        return 1
     except Exception as error:
         print(f"incremental pipeline failed: {type(error).__name__}", file=sys.stderr)
         _emit_json({"ok": False, "command": "pipeline incremental", "status": "failed",
-                    "error": type(error).__name__})
+                    "error": type(error).__name__, **_window_payload(pull_window)})
         return 1
-    payload = _result_payload("pipeline incremental", result, ok=result.status == "succeeded")
-    payload["window_minutes"] = int(pull_window.total_seconds() // 60)
+    payload = {**_result_payload("pipeline incremental", result, ok=result.status == "succeeded"),
+               **_window_payload(pull_window)}
     _emit_json(payload)
     if result.status != "succeeded":
         print(f"incremental pipeline incomplete: {result.status}", file=sys.stderr)
@@ -222,6 +200,9 @@ def cmd_ingest_backfill(args) -> int:
     try:
         lookback = _safe_duration(args.last, label="--last", maximum=_MAX_BACKFILL_LOOKBACK)
         chunk = _safe_duration(args.chunk, label="--chunk", maximum=_MAX_BACKFILL_CHUNK)
+        windows = -(-int(lookback.total_seconds()) // int(chunk.total_seconds()))
+        if windows > MAX_BACKFILL_WINDOWS:
+            raise ValueError("requested backfill exceeds the maximum window count")
         channel = _safe_channel(args.channel)
         end = datetime.now(timezone.utc)
         start = end - lookback
@@ -230,7 +211,7 @@ def cmd_ingest_backfill(args) -> int:
     except (ValueError, TypeError, OverflowError) as error:
         print(f"ingest backfill argument error: {type(error).__name__}", file=sys.stderr)
         _emit_json({"ok": False, "command": "ingest backfill", "error": "ArgumentError"})
-        return 2
+        return 1
     except Exception as error:
         print(f"ingest backfill failed: {type(error).__name__}", file=sys.stderr)
         _emit_json({"ok": False, "command": "ingest backfill", "status": "failed",
@@ -407,7 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_sub = ingest_parser.add_subparsers(dest="ingest_command", required=True)
     ingest_pull = ingest_sub.add_parser("pull", help="以自动化 JSON 契约拉取反馈")
     add_pull_window_arguments(ingest_pull)
-    ingest_pull.set_defaults(func=cmd_ingest_pull)
+    ingest_pull.set_defaults(func=cmd_pull)
     ingest_backfill = ingest_sub.add_parser("backfill", help="补齐可恢复的原始来源覆盖")
     ingest_backfill.add_argument("--last", required=True)
     ingest_backfill.add_argument("--chunk", default="6h")
@@ -510,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         command = _command_name(values)
         if command and error.code:
             _emit_json({"ok": False, "command": command, "error": "ArgumentError"})
-            return int(error.code)
+            return 1
         raise
     return args.func(args)
 
