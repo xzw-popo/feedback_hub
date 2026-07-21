@@ -52,7 +52,8 @@ fi
 rotate_log() {
   [[ -f "$LOG_FILE" ]] || return 0
   local size
-  size="$(wc -c < "$LOG_FILE" | tr -d '[:space:]')"
+  size="$({ wc -c < "$LOG_FILE"; } 2>/dev/null || printf '0')"
+  size="${size//[[:space:]]/}"
   [[ "$size" =~ ^[0-9]+$ ]] || return 0
   (( size >= LOG_MAX_BYTES )) || return 0
 

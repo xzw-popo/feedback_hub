@@ -24,6 +24,8 @@ def test_incremental_script_is_thin_and_never_runs_tagging_or_owns_a_lock():
     assert "TOKEN" not in body and "SECRET" not in body
     assert "rotate_log || true" in body
     assert "2>/dev/null || true" in body
+    assert "{ wc -c < \"$LOG_FILE\"; } 2>/dev/null || printf '0'" in body
+    assert 'size="${size//[[:space:]]/}"' in body
     assert "LOG_KEEP must be an integer between 1 and 20" in body
     assert "LOG_MAX_BYTES must be an integer between 1 and 1073741824" in body
 
@@ -137,15 +139,19 @@ def test_incremental_script_concurrent_rotation_never_prevents_python_start(tmp_
     fake_python.chmod(0o755)
     log_dir = project / "logs"
     log_dir.mkdir()
-    (log_dir / "feedback_incremental_sync.log").write_text("rotate me\n", encoding="utf-8")
     started = project / "started"
     environment = {
         **os.environ, "PYTHON_BIN": str(fake_python), "LOG_DIR": str(log_dir),
         "LOG_MAX_BYTES": "1", "LOG_KEEP": "0002", "START_DIR": str(started),
     }
-    runs = [subprocess.Popen([str(wrapper)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
-            for _ in range(8)]
-    completed = [run.communicate(timeout=10) for run in runs]
-    assert [run.returncode for run in runs] == [75] * len(runs)
-    assert len(list(started.iterdir())) == len(runs)
-    assert all(stderr == "" for _stdout, stderr in completed)
+    worker_count = 2
+    trials = 50
+    for _trial in range(trials):
+        (log_dir / "feedback_incremental_sync.log").write_text("rotate me\n", encoding="utf-8")
+        runs = [subprocess.Popen(
+            [str(wrapper)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        ) for _ in range(worker_count)]
+        completed = [run.communicate(timeout=10) for run in runs]
+        assert [run.returncode for run in runs] == [75] * worker_count
+        assert all(stderr == "" for _stdout, stderr in completed)
+    assert len(list(started.iterdir())) == worker_count * trials
