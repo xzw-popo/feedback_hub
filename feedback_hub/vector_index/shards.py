@@ -164,6 +164,8 @@ class ShardStore:
         self, shards: Sequence[ShardMetadata], *, watermark_ts_ms: int
     ) -> ShardManifest:
         with self._publication_lock():
+            if len({shard.shard_id for shard in shards}) != len(shards):
+                raise ValueError("manifest contains duplicate shard IDs")
             for shard in shards:
                 self.verify_shard(shard)
             manifest = self.manifest_for(shards, watermark_ts_ms=watermark_ts_ms)
@@ -213,6 +215,8 @@ class ShardStore:
             except Exception:
                 repository.connection.rollback()
                 raise
+            if not self._database_matches_journal(repository, new_manifest, row_remap):
+                raise ValueError("committed database state does not match publication journal")
             self._replace_manifest(new_manifest, expected_previous=old_manifest)
             self._remove_journal()
             return new_manifest
@@ -504,6 +508,7 @@ class ShardStore:
             raise ValueError("publication remap must contain every vector row")
         metadata = {shard.shard_id: shard for shard in manifest.shards}
         identities: set[tuple[str, str, str]] = set()
+        feedback_ids: set[str] = set()
         positions: set[tuple[str, int]] = set()
         for item in remap:
             if not isinstance(item, dict):
@@ -519,7 +524,10 @@ class ShardStore:
                 raise ValueError("invalid publication remap")
             if identity in identities or (shard_id, row_offset) in positions:
                 raise ValueError("publication remap is not one-to-one")
+            if identity[0] in feedback_ids:
+                raise ValueError("publication remap has duplicate feedback_id")
             identities.add(identity)
+            feedback_ids.add(identity[0])
             positions.add((shard_id, row_offset))
 
     def _validate_manifest_for_publication(
@@ -562,7 +570,9 @@ class ShardStore:
 
     def _database_paths(self, repository: VectorRepository) -> set[Path]:
         paths: set[Path] = set()
-        rows = repository.connection.execute("SELECT path FROM embedding_shard").fetchall()
+        rows = repository.connection.execute(
+            "SELECT path FROM embedding_shard WHERE model_version = ?", (self.model_version,)
+        ).fetchall()
         for row in rows:
             paths.add(self.shard_path(ShardMetadata(
                 shard_id="", model_version=self.model_version, path=str(row[0]),

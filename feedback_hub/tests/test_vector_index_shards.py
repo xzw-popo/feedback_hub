@@ -83,6 +83,17 @@ def test_manifest_never_switches_to_an_unverified_shard(tmp_path):
     assert [item.shard_id for item in store.load_manifest().shards] == [first.shard_id]
 
 
+def test_manifest_rejects_duplicate_shard_ids_before_replace(tmp_path):
+    store = ShardStore(tmp_path, dimension=2, model_version="m1")
+    shard = store.write_shard(normalized([[1, 0]]), ["f1"])
+    store.publish_manifest([shard], watermark_ts_ms=1)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        store.publish_manifest([shard, shard], watermark_ts_ms=2)
+
+    assert store.load_manifest().generation == 1
+
+
 def test_write_shard_requires_float32_input(tmp_path):
     store = ShardStore(tmp_path, dimension=2, model_version="m1")
 
@@ -218,6 +229,39 @@ def test_coordinated_publication_requires_the_next_manifest_generation(vector_fi
     assert not store.publication_journal_path.exists()
 
 
+def test_coordinated_publication_checks_committed_database_state_before_manifest(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    replacement = store.write_shard(normalized([[-1, 0]]), ["replacement"])
+    new = store.manifest_for([replacement], watermark_ts_ms=old.watermark_ts_ms)
+    remap = [{
+        "feedback_id": "f1", "model_version": "m1", "content_hash": hashlib.sha256(b"f1").hexdigest(),
+        "shard_id": replacement.shard_id, "row_offset": 0,
+    }]
+
+    with pytest.raises(ValueError, match="database state"):
+        store.publish_with_database(
+            repo, old_manifest=old, new_manifest=new, new_shards=[replacement], row_remap=remap,
+            database_mutation=lambda: repo._insert_shard(replacement),
+        )
+
+    assert store.load_manifest() == old
+    assert store.publication_journal_path.exists()
+
+
+def test_coordinated_publication_rejects_two_active_vectors_for_one_feedback_id(vector_fixture):
+    store, repo = vector_fixture.store, vector_fixture.repo
+    old = store.load_manifest()
+    duplicate = _manifest_mappings(repo, old.shards)
+    duplicate[1] = {**duplicate[1], "feedback_id": "f1", "content_hash": "different"}
+
+    with pytest.raises(ValueError, match="feedback_id"):
+        store.publish_with_database(
+            repo, old_manifest=old, new_manifest=store.manifest_for(old.shards, watermark_ts_ms=10),
+            new_shards=[], row_remap=duplicate, database_mutation=lambda: None,
+        )
+
+
 def test_recovery_requires_complete_mapping_even_when_journal_remap_is_empty(vector_fixture):
     store = vector_fixture.store
     old = store.load_manifest()
@@ -292,6 +336,18 @@ def test_orphan_discovery_refuses_malformed_durable_journal(vector_fixture):
 
     with pytest.raises(ValueError, match="journal"):
         store.find_orphans(vector_fixture.repo)
+
+
+def test_orphan_discovery_ignores_valid_other_model_paths(vector_fixture, tmp_path):
+    repo, store = vector_fixture.repo, vector_fixture.store
+    other_path = tmp_path / "m2" / "shards" / "other.npy"
+    repo.connection.execute(
+        """INSERT INTO embedding_shard VALUES (?, ?, ?, ?, ?, ?, 'active', ?)""",
+        ("other", "m2", str(other_path), 2, 1, "other", 1),
+    )
+    repo.connection.commit()
+
+    assert store.find_orphans(repo) == []
 
 
 def test_compacting_one_healthy_active_shard_is_a_noop(vector_fixture):
