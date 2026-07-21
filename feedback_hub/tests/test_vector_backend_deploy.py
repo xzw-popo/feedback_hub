@@ -54,6 +54,21 @@ def _archive_that_fails_after_code_swap(tmp_path: Path) -> Path:
     return archive
 
 
+def _archive_that_succeeds_and_arms_signal(tmp_path: Path) -> Path:
+    source = tmp_path / "success-source"
+    (source / "scripts").mkdir(parents=True)
+    _write_executable(
+        source / "scripts" / "devcloud_runtime.sh",
+        "#!/bin/sh\ntouch \"${SIGNAL_READY:?}\"\nexit 0\n",
+    )
+    _write_executable(source / "scripts" / "vector_runtime.sh", "#!/bin/sh\nexit 0\n")
+    (source / "new-marker").write_text("new", encoding="utf-8")
+    archive = tmp_path / "success.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(source, arcname=".")
+    return archive
+
+
 def _remote_old_tree(tmp_path: Path) -> Path:
     old = tmp_path / "feedback_hub"
     _write_executable(old / "scripts" / "devcloud_runtime.sh", "#!/bin/sh\nexit 0\n")
@@ -149,7 +164,7 @@ def test_model_manifest_is_staged_and_promotion_has_a_restoring_trap():
     body = VECTOR_DEPLOY.read_text(encoding="utf-8")
 
     assert 'cp -- "$MANIFEST" "$STAGE/.manifest.sha256"' in body
-    assert body.index('cp -- "$MANIFEST" "$STAGE/.manifest.sha256"') < body.index('mv -- "$STAGE" "$MODEL_DIR"')
+    assert body.index('cp -- "$MANIFEST" "$STAGE/.manifest.sha256"') < body.index('critical_model_move "$STAGE" "$MODEL_DIR"')
     assert "restore_previous_model" in body
     assert "PROMOTION_LIVE_MOVED" in body
 
@@ -196,10 +211,60 @@ def test_model_promotion_fault_restores_prior_live_model(tmp_path):
     assert not Path(f"{model}.previous").exists()
 
 
+def test_model_promotion_ignores_term_after_commit_before_previous_delete(tmp_path):
+    remote = tmp_path / "model-finish.sh"
+    remote.write_text(_remote_model_finish_script(), encoding="utf-8")
+    app = tmp_path / "app"
+    model = app / "feedback_hub" / "data" / "models" / "Qwen3-Embedding-0.6B"
+    stage = Path(f"{model}.upload.fixture")
+    manifest = tmp_path / "manifest.sha256"
+    for root, payload in ((model, "old"), (stage, "new")):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "marker").write_text(payload, encoding="utf-8")
+        for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+            (root / filename).write_text(payload + filename, encoding="utf-8")
+    (model / ".manifest.sha256").write_text("old-manifest\n", encoding="utf-8")
+    manifest.write_text(
+        "".join(
+            f"{hashlib.sha256((stage / filename).read_bytes()).hexdigest()}  {filename}\n"
+            for filename in ("config.json", "tokenizer.json", "model.safetensors")
+        ),
+        encoding="utf-8",
+    )
+    _write_executable(app / ".venv" / "bin" / "python", "#!/bin/sh\ntouch \"${SIGNAL_READY:?}\"\nexit 0\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ready = tmp_path / "signal-ready"
+    _write_executable(
+        fake_bin / "rm",
+        "#!/bin/sh\n"
+        "for value in \"$@\"; do\n"
+        "  if [ \"$value\" = \"${TARGET_PREVIOUS}\" ] && [ -e \"${SIGNAL_READY}\" ]; then kill -TERM \"$PPID\"; fi\n"
+        "done\n"
+        "exec /bin/rm \"$@\"\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(remote), str(app), str(model), str(app / "feedback_hub" / "data" / "vector_index"), str(manifest), str(stage), "0"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "TARGET_PREVIOUS": f"{model}.previous",
+            "SIGNAL_READY": str(ready),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (model / "marker").read_text(encoding="utf-8") == "new"
+    assert not Path(f"{model}.previous").exists()
+
+
 def test_regular_deploy_swaps_before_vector_then_app_restart_with_rollback():
     body = REGULAR_DEPLOY.read_text(encoding="utf-8")
 
-    assert body.index('mv "${NEW}" "${OLD}"') < body.index("scripts/vector_runtime.sh restart")
+    assert body.index('critical_move "${NEW}" "${OLD}" NEW_PROMOTED') < body.index("scripts/vector_runtime.sh restart")
     assert body.index("scripts/vector_runtime.sh restart") < body.index("scripts/devcloud_runtime.sh restart")
     assert "rollback" in body.lower()
     assert "feedback_hub/data/vector_index" in body
@@ -310,6 +375,41 @@ def test_remote_deploy_restores_persisted_state_after_new_directory_is_promoted(
     assert (old / "scripts" / "devcloud_runtime.sh").read_text(encoding="utf-8") == "#!/bin/sh\nexit 0\n"
 
 
+def test_remote_deploy_ignores_term_after_commit_before_backup_delete(tmp_path):
+    remote = tmp_path / "remote-deploy.sh"
+    remote.write_text(_remote_deploy_script(), encoding="utf-8")
+    old = _remote_old_tree(tmp_path)
+    archive = _archive_that_succeeds_and_arms_signal(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ready = tmp_path / "signal-ready"
+    _write_executable(
+        fake_bin / "rm",
+        "#!/bin/sh\n"
+        "for value in \"$@\"; do\n"
+        "  if [ \"$value\" = \"${TARGET_BAK}\" ] && [ -e \"${SIGNAL_READY}\" ]; then kill -TERM \"$PPID\"; fi\n"
+        "done\n"
+        "exec /bin/rm \"$@\"\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(remote), str(old), str(archive), "8000"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "TARGET_BAK": f"{old}.bak",
+            "SIGNAL_READY": str(ready),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (old / "new-marker").read_text(encoding="utf-8") == "new"
+    assert (old / ".venv" / "state").read_text(encoding="utf-8") == "venv"
+    assert not Path(f"{old}.bak").exists()
+
+
 def test_runtime_exposes_vector_health_coordination_for_deploys():
     body = RUNTIME.read_text(encoding="utf-8")
 
@@ -404,6 +504,84 @@ def test_vector_deploy_accepts_a_valid_model_manifest_before_first_ssh(tmp_path)
 
     assert result.returncode == 37
     assert "ssh-reached" in result.stderr
+
+
+def test_vector_bootstrap_arms_remote_cleanup_before_first_transport_failure(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model_dir / filename).write_text("fixture", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "ssh-calls"
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/bin/sh\n"
+        "count=$(cat \"${SSH_CALLS}\" 2>/dev/null || echo 0)\n"
+        "count=$((count + 1)); printf '%s' \"$count\" > \"${SSH_CALLS}\"\n"
+        "if [ \"$count\" = 1 ]; then exit 42; fi\n"
+        "exit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(VECTOR_DEPLOY)],
+        env={
+            **os.environ,
+            "MODEL_SOURCE_DIR": str(model_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SSH_CALLS": str(calls),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 42
+    assert calls.read_text(encoding="utf-8") == "2"
+
+
+@pytest.mark.parametrize(("failure", "expected_ssh_calls"), [("manifest-upload", "2"), ("remote-prepare", "3")])
+def test_vector_bootstrap_cleans_remote_temp_artifacts_after_each_transport_creation_failure(tmp_path, failure, expected_ssh_calls):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model_dir / filename).write_text("fixture", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ssh_calls = tmp_path / "ssh-calls"
+    scp_calls = tmp_path / "scp-calls"
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/bin/sh\n"
+        "count=$(cat \"${SSH_CALLS}\" 2>/dev/null || echo 0)\n"
+        "count=$((count + 1)); printf '%s' \"$count\" > \"${SSH_CALLS}\"\n"
+        "if [ \"${FAILURE}\" = remote-prepare ] && [ \"$count\" = 2 ]; then exit 45; fi\n"
+        "exit 0\n",
+    )
+    _write_executable(
+        fake_bin / "scp",
+        "#!/bin/sh\n"
+        "count=$(cat \"${SCP_CALLS}\" 2>/dev/null || echo 0)\n"
+        "count=$((count + 1)); printf '%s' \"$count\" > \"${SCP_CALLS}\"\n"
+        "if [ \"${FAILURE}\" = manifest-upload ] && [ \"$count\" = 1 ]; then exit 44; fi\n"
+        "exit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(VECTOR_DEPLOY)],
+        env={
+            **os.environ,
+            "MODEL_SOURCE_DIR": str(model_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SSH_CALLS": str(ssh_calls),
+            "SCP_CALLS": str(scp_calls),
+            "FAILURE": failure,
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode in (44, 45)
+    assert ssh_calls.read_text(encoding="utf-8") == expected_ssh_calls
 
 
 def test_vector_deploy_runbook_documents_bootstrap_start_health_and_bounded_rollback():

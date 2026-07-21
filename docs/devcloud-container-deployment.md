@@ -238,13 +238,19 @@ MODEL_SOURCE_DIR=/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data
 
 ```bash
 ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  set -e
   cd /opt/feedback_hub &&
   ACTIVE_POINTER=feedback_hub/data/vector_index/active-generation.json &&
   ACTIVE_POINTER_BACKUP=feedback_hub/data/vector_index/backups/active-generation.json.pre-rebuild &&
-  test -s "$ACTIVE_POINTER" &&
+  NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild &&
   mkdir -p feedback_hub/data/vector_index/backups &&
-  cp "$ACTIVE_POINTER" "$ACTIVE_POINTER_BACKUP" &&
-  test -s "$ACTIVE_POINTER_BACKUP" &&
+  if [ -e "$ACTIVE_POINTER" ]; then
+    ./.venv/bin/python -c "import json, sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$ACTIVE_POINTER"
+    cp -- "$ACTIVE_POINTER" "$ACTIVE_POINTER_BACKUP"
+    test -s "$ACTIVE_POINTER_BACKUP"
+  else
+    : > "$NO_PRIOR_POINTER_MARKER"
+  fi
   ./.venv/bin/python -m feedback_hub.cli ingest backfill --last 14d --chunk 6h &&
   ./.venv/bin/python -m feedback_hub.cli vectors rebuild \
     --target-model-version qwen3-embedding-0.6b-document-v2 \
@@ -290,18 +296,28 @@ ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
 '
 ```
 
-若 rebuild 生成了错误活动代际，先停止向量服务，恢复已确认健康的 `active-generation.json`（或其受控备份），再重新启动并检查 loopback health；不要删除模型或覆盖 `feedback_hub/data/`。记录操作后再决定是否恢复 crontab 备份。
+若 rebuild 生成了错误活动代际，先停止向量服务。存在旧指针备份时恢复它；首次 rebuild 没有旧指针时，保留 `no-prior-active-generation.pre-rebuild` 标记、删除新建指针并确认健康端点不可用。不要删除模型或覆盖 `feedback_hub/data/`。记录操作后再决定是否恢复 crontab 备份。
 
 ```bash
 ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  set -e
   cd /opt/feedback_hub &&
   ACTIVE_POINTER=feedback_hub/data/vector_index/active-generation.json &&
   ACTIVE_POINTER_BACKUP=feedback_hub/data/vector_index/backups/active-generation.json.pre-rebuild &&
+  NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild &&
   scripts/vector_runtime.sh stop &&
-  test -s "$ACTIVE_POINTER_BACKUP" &&
-  cp "$ACTIVE_POINTER_BACKUP" "$ACTIVE_POINTER" &&
-  scripts/vector_runtime.sh start &&
-  curl -fsS http://127.0.0.1:8011/health
+  if test -s "$ACTIVE_POINTER_BACKUP"; then
+    cp -- "$ACTIVE_POINTER_BACKUP" "$ACTIVE_POINTER"
+    scripts/vector_runtime.sh start
+    curl -fsS http://127.0.0.1:8011/health
+  elif test -f "$NO_PRIOR_POINTER_MARKER"; then
+    rm -f -- "$ACTIVE_POINTER"
+    test ! -e "$ACTIVE_POINTER"
+    if curl -fsS http://127.0.0.1:8011/health; then exit 1; fi
+  else
+    echo "missing active-generation rollback evidence" >&2
+    exit 1
+  fi
 '
 ```
 

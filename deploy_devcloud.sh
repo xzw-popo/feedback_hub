@@ -82,6 +82,8 @@ NEW_PROMOTED=0
 MOVED_VENV=0
 MOVED_ENV=0
 MOVED_DATA=0
+COMMITTED=0
+ROLLBACK_DONE=0
 
 # 0=valid active index, 1=no index configured, 2=unsafe/broken metadata.
 vector_index_state() {
@@ -116,12 +118,27 @@ PY
   return 2
 }
 
+install_deploy_traps() {
+  trap 'rollback "$?"' ERR
+  trap 'rollback 129' HUP
+  trap 'rollback 130' INT
+  trap 'rollback 143' TERM
+  trap 'on_exit "$?"' EXIT
+}
+
+critical_move() {
+  local source="$1" destination="$2" marker="$3"
+  trap '' HUP INT TERM
+  mv -- "$source" "$destination"
+  printf -v "$marker" '%s' 1
+  install_deploy_traps
+}
+
 move_persisted_item() {
   local item="$1" marker="$2"
   [ -e "${OLD}/${item}" ] || return 0
   mkdir -p -- "$(dirname "${NEW}/${item}")"
-  mv -- "${OLD}/${item}" "${NEW}/${item}"
-  printf -v "$marker" '%s' 1
+  critical_move "${OLD}/${item}" "${NEW}/${item}" "$marker"
 }
 
 restore_persisted_items() {
@@ -153,8 +170,12 @@ persisted_items_restored() {
 
 rollback() {
   local status="$1"
+  [ "$COMMITTED" = "1" ] && return 0
+  [ "$ROLLBACK_DONE" = "1" ] && return 0
+  ROLLBACK_DONE=1
   set +e
-  if [ "$NEW_PROMOTED" = "1" ]; then
+  trap '' HUP INT TERM
+  if [ "$NEW_PROMOTED" = "1" ] || { [ -d "$OLD" ] && [ -d "$BAK" ]; }; then
     if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
       cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
     fi
@@ -179,9 +200,15 @@ rollback() {
   rm -f -- "$REMOTE_ARCHIVE"
   exit "$status"
 }
-trap 'rollback "$?"' ERR
-trap 'rollback 130' INT
-trap 'rollback 143' TERM
+
+on_exit() {
+  local status="$1"
+  [ "$COMMITTED" = "1" ] && return 0
+  [ "$ROLLBACK_DONE" = "1" ] && return 0
+  rollback "$status"
+}
+
+install_deploy_traps
 
 if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
   cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
@@ -208,9 +235,8 @@ move_persisted_item .venv MOVED_VENV
 move_persisted_item .env MOVED_ENV
 move_persisted_item feedback_hub/data MOVED_DATA
 rm -rf -- "$BAK"
-if [ -d "$OLD" ]; then mv -- "$OLD" "$BAK"; OLD_MOVED_TO_BAK=1; fi
-mv "${NEW}" "${OLD}"
-NEW_PROMOTED=1
+if [ -d "$OLD" ]; then critical_move "$OLD" "$BAK" OLD_MOVED_TO_BAK; fi
+critical_move "${NEW}" "${OLD}" NEW_PROMOTED
 
 cd "$OLD"
 chmod +x scripts/devcloud_runtime.sh scripts/vector_runtime.sh
@@ -220,10 +246,10 @@ if [ "$VECTOR_REQUIRED" = "1" ]; then
 fi
 APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh restart
 
-NEW_PROMOTED=0
+COMMITTED=1
 rm -rf -- "$BAK"
 rm -f -- "$REMOTE_ARCHIVE"
-trap - ERR INT TERM
+trap - ERR HUP INT TERM
 REMOTE_DEPLOY
 
 echo "[deploy] Done."

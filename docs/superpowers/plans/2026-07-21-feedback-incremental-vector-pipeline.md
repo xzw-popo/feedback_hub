@@ -391,7 +391,7 @@ Expected: every successful six-hour window has a coverage row, duplicates are sk
 Run:
 
 ```bash
-ssh -p 36000 root@charvelxia-any2.devcloud.woa.com 'cd /opt/feedback_hub && ./.venv/bin/python -m feedback_hub.cli vectors rebuild --target-model-version qwen3-embedding-0.6b-document-v2 --generation-id qwen3-embedding-0.6b-document-v2-20260721 && scripts/vector_runtime.sh start'
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com 'set -e; cd /opt/feedback_hub; ACTIVE_POINTER=feedback_hub/data/vector_index/active-generation.json; ACTIVE_POINTER_BACKUP=feedback_hub/data/vector_index/backups/active-generation.json.pre-rebuild; NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild; mkdir -p feedback_hub/data/vector_index/backups; if [ -e "$ACTIVE_POINTER" ]; then ./.venv/bin/python -c "import json, sys; json.load(open(sys.argv[1], encoding=\"utf-8\"))" "$ACTIVE_POINTER"; cp -- "$ACTIVE_POINTER" "$ACTIVE_POINTER_BACKUP"; test -s "$ACTIVE_POINTER_BACKUP"; else : > "$NO_PRIOR_POINTER_MARKER"; fi; ./.venv/bin/python -m feedback_hub.cli vectors rebuild --target-model-version qwen3-embedding-0.6b-document-v2 --generation-id qwen3-embedding-0.6b-document-v2-20260721 && scripts/vector_runtime.sh start'
 ```
 
 Expected: final status reports `pending_count=0`, `dimension=1024`, an active generation, and a vector watermark equal to the latest fully indexed source generation.

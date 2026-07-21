@@ -16,11 +16,11 @@ CHANGED_FILES="$(mktemp "${TMPDIR:-/tmp}/feedback-vector-model-changed.XXXXXX")"
 RUN_ID="$(date +%s).$$"
 REMOTE_MANIFEST="${REMOTE_DIR}/.vector-model-manifest.${RUN_ID}.sha256.new"
 REMOTE_STAGE="${REMOTE_MODEL_DIR}.upload.${RUN_ID}"
-REMOTE_PREPARED=0
+REMOTE_CLEANUP_ARMED=0
 
 cleanup() {
   local status="$?"
-  if [ "$REMOTE_PREPARED" = "1" ]; then
+  if [ "$REMOTE_CLEANUP_ARMED" = "1" ]; then
     ssh -p "$SSH_PORT" -- "$SSH_TARGET" \
       "rm -rf -- $(printf '%q' "$REMOTE_STAGE"); rm -f -- $(printf '%q' "$REMOTE_MANIFEST")" >/dev/null 2>&1 || true
   fi
@@ -28,6 +28,9 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 usage() {
   echo "Usage: $0 [--start-after-bootstrap]" >&2
@@ -123,6 +126,7 @@ remote_command() {
 
 validate_remote_setting
 create_manifest
+REMOTE_CLEANUP_ARMED=1
 
 echo "[vector-deploy] Uploading deterministic checksum manifest..."
 ssh -p "$SSH_PORT" -- "$SSH_TARGET" "mkdir -p -- $(printf '%q' "$REMOTE_DIR")"
@@ -135,6 +139,7 @@ set -euo pipefail
 MODEL_DIR="$1"
 MANIFEST="$2"
 STAGE="$3"
+PREPARED=0
 
 manifest_is_safe() {
   local digest relative extra
@@ -149,10 +154,14 @@ sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 
 manifest_is_safe || { echo "unsafe checksum manifest" >&2; exit 1; }
 cleanup_partial() {
+  [ "$PREPARED" = "1" ] && return 0
   rm -rf -- "$STAGE"
   rm -f -- "$MANIFEST"
 }
-trap cleanup_partial ERR INT TERM
+trap cleanup_partial EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 rm -rf -- "$STAGE"
 mkdir -p -- "$STAGE"
 while IFS=' ' read -r digest relative; do
@@ -164,9 +173,8 @@ while IFS=' ' read -r digest relative; do
     printf '%s\n' "$relative"
   fi
 done < "$MANIFEST"
-trap - ERR INT TERM
+PREPARED=1
 REMOTE_PREPARE
-REMOTE_PREPARED=1
 
 while IFS= read -r relative; do
   [[ "$relative" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "Remote returned unsafe model filename"
@@ -187,6 +195,24 @@ START_AFTER_BOOTSTRAP="$6"
 BACKUP="${MODEL_DIR}.previous"
 PROMOTION_LIVE_MOVED=0
 PROMOTION_STAGE_LIVE=0
+COMMITTED=0
+ROLLBACK_DONE=0
+
+install_promotion_traps() {
+  trap 'cleanup_promotion "$?"' ERR
+  trap 'cleanup_promotion 129' HUP
+  trap 'cleanup_promotion 130' INT
+  trap 'cleanup_promotion 143' TERM
+  trap 'promotion_exit "$?"' EXIT
+}
+
+critical_model_move() {
+  local source="$1" destination="$2" marker="$3"
+  trap '' HUP INT TERM
+  mv -- "$source" "$destination"
+  printf -v "$marker" '%s' 1
+  install_promotion_traps
+}
 
 restore_previous_model() {
   set +e
@@ -197,19 +223,30 @@ restore_previous_model() {
   if [ "$PROMOTION_LIVE_MOVED" = "1" ] && [ -d "$BACKUP" ]; then
     mv -- "$BACKUP" "$MODEL_DIR" || return 1
   fi
+  rm -rf -- "${STAGE}.failed"
   return 0
 }
 
 cleanup_promotion() {
   local status="$1"
+  [ "$COMMITTED" = "1" ] && return 0
+  [ "$ROLLBACK_DONE" = "1" ] && return 0
+  ROLLBACK_DONE=1
+  trap '' HUP INT TERM
   restore_previous_model || echo "[vector-deploy] Model rollback could not restore previous live model." >&2
   rm -rf -- "$STAGE"
   rm -f -- "$MANIFEST"
   exit "$status"
 }
-trap 'cleanup_promotion "$?"' ERR
-trap 'cleanup_promotion 130' INT
-trap 'cleanup_promotion 143' TERM
+
+promotion_exit() {
+  local status="$1"
+  [ "$COMMITTED" = "1" ] && return 0
+  [ "$ROLLBACK_DONE" = "1" ] && return 0
+  cleanup_promotion "$status"
+}
+
+install_promotion_traps
 
 manifest_is_safe() {
   local digest relative extra
@@ -257,9 +294,8 @@ cmp -s "$MANIFEST" "$STAGE/.manifest.sha256"
 
 if ! cmp -s "$MANIFEST" "${MODEL_DIR}/.manifest.sha256" 2>/dev/null; then
   rm -rf -- "$BACKUP"
-  if [ -d "$MODEL_DIR" ]; then mv -- "$MODEL_DIR" "$BACKUP"; PROMOTION_LIVE_MOVED=1; fi
-  mv -- "$STAGE" "$MODEL_DIR"
-  PROMOTION_STAGE_LIVE=1
+  if [ -d "$MODEL_DIR" ]; then critical_model_move "$MODEL_DIR" "$BACKUP" PROMOTION_LIVE_MOVED; fi
+  critical_model_move "$STAGE" "$MODEL_DIR" PROMOTION_STAGE_LIVE
 else
   rm -rf -- "$STAGE"
 fi
@@ -278,11 +314,12 @@ if [ "$START_AFTER_BOOTSTRAP" = "1" ]; then
     echo "[vector-deploy] No active vector manifest; bootstrap completed without starting the vector API."
   fi
 fi
+COMMITTED=1
 rm -rf -- "$BACKUP"
 PROMOTION_LIVE_MOVED=0
 PROMOTION_STAGE_LIVE=0
-trap - ERR INT TERM
+trap - ERR HUP INT TERM
 REMOTE_FINISH
-REMOTE_PREPARED=0
+REMOTE_CLEANUP_ARMED=0
 
 echo "[vector-deploy] Bootstrap complete. No feedback pull, backfill, tagging, vector rebuild, or cron change was run."
