@@ -9,7 +9,8 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from contextlib import contextmanager
+import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
@@ -30,6 +31,15 @@ class SyncResult:
 
 
 PROMOTION_SCHEMA_VERSION = 1
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class GenerationSpec:
+    logical_model_version: str
+    generation_id: str
+    storage_model_version: str
+    config: VectorIndexConfig
 
 
 @contextmanager
@@ -53,6 +63,32 @@ def source_ingestion_lock(config: VectorIndexConfig) -> Iterator[None]:
     a second line of defence for any normal SQLite writer.
     """
     return process_lock(config.data_dir / ".source-ingestion.lock")
+
+
+def _reject_symlink(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("vector generation path contains a symlink")
+
+
+def _validate_index_root(config: VectorIndexConfig) -> Path:
+    root = config.data_dir.absolute()
+    _reject_symlink(root)
+    return root
+
+
+def _validated_generation_path(base_config: VectorIndexConfig, generation_id: str) -> Path:
+    root = _validate_index_root(base_config)
+    if not generation_id or Path(generation_id).name != generation_id or generation_id in {".", ".."}:
+        raise ValueError("generation_id must be a safe non-empty path component")
+    generations = root / "generations"
+    target = generations / generation_id
+    _reject_symlink(generations)
+    _reject_symlink(target)
+    try:
+        target.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError("rebuild generation escapes active index root") from exc
+    return target
 
 
 def _current_manifest(store: ShardStore) -> ShardManifest | None:
@@ -154,8 +190,13 @@ def _publish_watermark_if_needed(
     )
 
 
-def _atomic_json_replace(path: Path, payload: dict[str, object]) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
+def _atomic_json_replace(
+    path: Path, payload: dict[str, object], *, expected: object = _UNSET,
+) -> None:
+    actual = _read_json(path) if path.exists() else None
+    if expected is not _UNSET and actual != expected:
+        raise RuntimeError("active-generation pointer changed before publication")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     with temporary.open("wb") as handle:
         handle.write(encoded)
@@ -186,14 +227,15 @@ def _pointer_paths(config: VectorIndexConfig) -> tuple[Path, Path]:
     )
 
 
-def _pointer_payload(base_config: VectorIndexConfig, target_config: VectorIndexConfig) -> dict[str, object]:
-    try:
-        relative = target_config.data_dir.resolve().relative_to(base_config.data_dir.resolve())
-    except ValueError as exc:
-        raise ValueError("rebuild generation escapes active index root") from exc
+def _pointer_payload(base_config: VectorIndexConfig, spec: GenerationSpec) -> dict[str, object]:
+    relative = _validated_generation_path(base_config, spec.generation_id).relative_to(
+        _validate_index_root(base_config)
+    )
     return {
         "schema_version": PROMOTION_SCHEMA_VERSION,
-        "model_version": target_config.model_version,
+        "model_version": spec.logical_model_version,
+        "generation_id": spec.generation_id,
+        "storage_model_version": spec.storage_model_version,
         "data_dir": relative.as_posix(),
     }
 
@@ -201,15 +243,24 @@ def _pointer_payload(base_config: VectorIndexConfig, target_config: VectorIndexC
 def _config_from_pointer(base_config: VectorIndexConfig, payload: dict[str, object]) -> VectorIndexConfig:
     if payload.get("schema_version") != PROMOTION_SCHEMA_VERSION:
         raise ValueError("unknown active-generation schema version")
-    model_version, raw_path = payload.get("model_version"), payload.get("data_dir")
-    if not isinstance(model_version, str) or not isinstance(raw_path, str) or Path(raw_path).is_absolute():
+    model_version = payload.get("model_version")
+    generation_id = payload.get("generation_id")
+    storage_model_version = payload.get("storage_model_version")
+    raw_path = payload.get("data_dir")
+    if (not isinstance(model_version, str) or not isinstance(generation_id, str)
+            or not isinstance(storage_model_version, str) or not isinstance(raw_path, str)
+            or Path(raw_path).is_absolute()):
         raise ValueError("invalid active-generation metadata")
-    candidate = (base_config.data_dir / raw_path).resolve()
+    candidate = _validated_generation_path(base_config, generation_id)
+    if candidate.relative_to(_validate_index_root(base_config)).as_posix() != raw_path:
+        raise ValueError("active generation path does not match generation_id")
+    if storage_model_version != _storage_model_version(model_version, generation_id):
+        raise ValueError("active generation storage identity is invalid")
     try:
-        candidate.relative_to(base_config.data_dir.resolve())
+        candidate.resolve().relative_to(_validate_index_root(base_config).resolve())
     except ValueError as exc:
         raise ValueError("active generation escapes index root") from exc
-    return replace(base_config, model_version=model_version, data_dir=candidate)
+    return replace(base_config, model_version=storage_model_version, data_dir=candidate)
 
 
 def _recover_active_generation(base_config: VectorIndexConfig) -> None:
@@ -223,12 +274,17 @@ def _recover_active_generation(base_config: VectorIndexConfig) -> None:
     target_config = _config_from_pointer(base_config, target)
     target_store = ShardStore.from_config(target_config)
     target_store.load_manifest()
-    _atomic_json_replace(pointer_path, target)
+    previous = _read_json(pointer_path) if pointer_path.exists() else None
+    _atomic_json_replace(pointer_path, target, expected=previous)
     journal_path.unlink(missing_ok=True)
 
 
-def active_index_config(config: VectorIndexConfig) -> VectorIndexConfig:
+def active_index_config(config: VectorIndexConfig, *, _lock_held: bool = False) -> VectorIndexConfig:
     """Resolve the crash-safe active-generation pointer, or the root legacy index."""
+    _validate_index_root(config)
+    if not _lock_held:
+        with process_lock(config.data_dir / ".sync.lock"):
+            return active_index_config(config, _lock_held=True)
     _recover_active_generation(config)
     pointer_path, _ = _pointer_paths(config)
     if not pointer_path.exists():
@@ -237,23 +293,24 @@ def active_index_config(config: VectorIndexConfig) -> VectorIndexConfig:
 
 
 def _promote_generation(
-    base_config: VectorIndexConfig, target_config: VectorIndexConfig,
+    base_config: VectorIndexConfig, spec: GenerationSpec,
     repository: VectorRepository, store: ShardStore, *, pending_count: int,
 ) -> None:
     if pending_count != 0:
         raise ValueError("cannot promote an incomplete rebuild")
     # Re-check the exact model while the source-ingestion lock is still held.
-    pending, _ = repository.pending_and_coverage_snapshot(target_config.model_version)
+    pending, _ = repository.pending_and_coverage_snapshot(spec.storage_model_version)
     if pending != 0:
         raise ValueError("cannot promote a rebuild with pending feedback")
     store.load_manifest()
     pointer_path, journal_path = _pointer_paths(base_config)
-    target = _pointer_payload(base_config, target_config)
+    target = _pointer_payload(base_config, spec)
+    previous = _read_json(pointer_path) if pointer_path.exists() else None
     _atomic_json_replace(
         journal_path,
         {"schema_version": PROMOTION_SCHEMA_VERSION, "target": target},
     )
-    _atomic_json_replace(pointer_path, target)
+    _atomic_json_replace(pointer_path, target, expected=previous)
     journal_path.unlink(missing_ok=True)
 
 
@@ -266,10 +323,12 @@ def _sync(
     lock_path: Path | None = None,
     source_lock_config: VectorIndexConfig | None = None,
     on_complete: Callable[[VectorRepository, ShardStore, int], None] | None = None,
+    assume_writer_lock: bool = False,
 ) -> SyncResult:
     if max_items is not None and max_items <= 0:
         raise ValueError("max_items must be positive when supplied")
-    with process_lock(lock_path or config.data_dir / ".sync.lock"):
+    lock = nullcontext() if assume_writer_lock else process_lock(lock_path or config.data_dir / ".sync.lock")
+    with lock:
         repository = VectorRepository(config)
         run_id = ""
         vectorized_count = 0
@@ -349,30 +408,43 @@ def sync_pending(
     max_items: int | None = None,
 ) -> SyncResult:
     """Embed missing exact feedback IDs in shard-sized, restartable chunks."""
-    try:
-        active = active_index_config(config)
-    except Exception as exc:
-        _record_preopen_failure(
-            config, run_type="incremental", model_version=config.model_version, error=exc
+    _validate_index_root(config)
+    with process_lock(config.data_dir / ".sync.lock"):
+        try:
+            active = active_index_config(config, _lock_held=True)
+        except Exception as exc:
+            _record_preopen_failure(
+                config, run_type="incremental", model_version=config.model_version, error=exc
+            )
+            raise
+        return _sync(
+            active, run_type="incremental", encoder=encoder, max_items=max_items,
+            source_lock_config=config, assume_writer_lock=True,
         )
-        raise
-    return _sync(
-        active, run_type="incremental", encoder=encoder, max_items=max_items,
-        lock_path=config.data_dir / ".sync.lock", source_lock_config=config,
-    )
 
 
-def _rebuild_generation_config(config: VectorIndexConfig, target_model_version: str) -> VectorIndexConfig:
+def _storage_model_version(model_version: str, generation_id: str) -> str:
+    return f"{model_version}::generation::{generation_id}"
+
+
+def _rebuild_generation_spec(
+    config: VectorIndexConfig, target_model_version: str, target_generation_id: str | None,
+) -> GenerationSpec:
     model_version = target_model_version.strip()
     if not model_version or Path(model_version).name != model_version or model_version in {".", ".."}:
         raise ValueError("rebuild requires an explicit safe model_version")
-    if active_index_config(config).model_version == model_version:
-        raise ValueError("rebuild requires a model_version distinct from the active index")
-    return replace(config, model_version=model_version, data_dir=config.data_dir / "generations" / model_version)
+    generation_id = target_generation_id or uuid.uuid4().hex
+    data_dir = _validated_generation_path(config, generation_id)
+    return GenerationSpec(
+        logical_model_version=model_version, generation_id=generation_id,
+        storage_model_version=_storage_model_version(model_version, generation_id),
+        config=replace(config, model_version=_storage_model_version(model_version, generation_id), data_dir=data_dir),
+    )
 
 
 def rebuild_index(
     config: VectorIndexConfig, *, target_model_version: str,
+    target_generation_id: str | None = None,
     encoder: EmbeddingEncoder | None = None,
 ) -> SyncResult:
     """Rebuild and atomically promote an explicit, distinct target model.
@@ -381,17 +453,27 @@ def rebuild_index(
     root index remains readable.  Only a fully covered generation is promoted
     through the crash-recoverable active-generation pointer.
     """
-    try:
-        target = _rebuild_generation_config(config, target_model_version)
-    except Exception as exc:
-        _record_preopen_failure(
-            config, run_type="rebuild", model_version=target_model_version, error=exc
+    _validate_index_root(config)
+    spec = _rebuild_generation_spec(config, target_model_version, target_generation_id)
+    with process_lock(config.data_dir / ".sync.lock"):
+        try:
+            pointer_path, _ = _pointer_paths(config)
+            active_logical = (
+                str(_read_json(pointer_path)["model_version"])
+                if pointer_path.exists() else config.model_version
+            )
+            if active_logical == spec.logical_model_version and not pointer_path.exists():
+                raise ValueError("rebuild requires a model_version distinct from the active index")
+            active_index_config(config, _lock_held=True)
+        except Exception as exc:
+            _record_preopen_failure(
+                config, run_type="rebuild", model_version=target_model_version, error=exc
+            )
+            raise
+        return _sync(
+            spec.config, run_type="rebuild", encoder=encoder, max_items=None,
+            source_lock_config=config, assume_writer_lock=True,
+            on_complete=lambda repository, store, pending: _promote_generation(
+                config, spec, repository, store, pending_count=pending
+            ),
         )
-        raise
-    return _sync(
-        target, run_type="rebuild", encoder=encoder, max_items=None,
-        lock_path=config.data_dir / ".sync.lock", source_lock_config=config,
-        on_complete=lambda repository, store, pending: _promote_generation(
-            config, target, repository, store, pending_count=pending
-        ),
-    )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -212,13 +213,12 @@ def test_rebuild_uses_a_separate_generation_without_clearing_active_index(sync_f
         sync_fixture.config, target_model_version="m2", encoder=DeterministicEncoder()
     )
 
-    rebuilt_store = ShardStore.from_config(
-        replace(sync_fixture.config, model_version="m2", data_dir=sync_fixture.config.data_dir / "generations" / "m2")
-    )
+    active = active_index_config(sync_fixture.config)
+    rebuilt_store = ShardStore.from_config(active)
     assert result.pending_count == 0
     assert sync_fixture.shards.load_manifest() == old_manifest
-    assert rebuilt_store.load_manifest().model_version == "m2"
-    assert active_index_config(sync_fixture.config).model_version == "m2"
+    assert rebuilt_store.load_manifest().model_version.startswith("m2::generation::")
+    assert active.model_version.startswith("m2::generation::")
 
 
 def test_rebuild_requires_a_model_version_distinct_from_the_active_index(sync_fixture):
@@ -245,7 +245,7 @@ def test_promotion_crash_recovers_the_completed_target_generation(sync_fixture, 
     sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
     original = sync_module._atomic_json_replace
 
-    def crash_before_pointer(path, payload):
+    def crash_before_pointer(path, payload, **kwargs):
         if path.name == "active-generation.json":
             raise RuntimeError("promotion crash")
         return original(path, payload)
@@ -257,5 +257,62 @@ def test_promotion_crash_recovers_the_completed_target_generation(sync_fixture, 
         )
     monkeypatch.setattr(sync_module, "_atomic_json_replace", original)
 
-    assert active_index_config(sync_fixture.config).model_version == "m2"
+    assert active_index_config(sync_fixture.config).model_version.startswith("m2::generation::")
     assert not (sync_fixture.config.data_dir / "generation-promotion-journal.json").exists()
+
+
+def test_rebuilds_can_promote_m1_then_m2_then_a_new_m1_generation(sync_fixture):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+
+    rebuild_index(
+        sync_fixture.config, target_model_version="m2", target_generation_id="m2-first",
+        encoder=DeterministicEncoder(),
+    )
+    rebuild_index(
+        sync_fixture.config, target_model_version="m1", target_generation_id="m1-second",
+        encoder=DeterministicEncoder(),
+    )
+
+    pointer = (sync_fixture.config.data_dir / "active-generation.json").read_text(encoding="utf-8")
+    assert '"model_version":"m1"' in pointer
+    assert '"generation_id":"m1-second"' in pointer
+    active = active_index_config(sync_fixture.config)
+    assert active.data_dir == sync_fixture.config.data_dir / "generations" / "m1-second"
+    assert active.model_version != "m1"
+
+
+def test_rebuild_rejects_a_generation_path_that_escapes_through_a_symlink(sync_fixture, tmp_path):
+    generations = sync_fixture.config.data_dir / "generations"
+    generations.parent.mkdir(parents=True, exist_ok=True)
+    generations.symlink_to(tmp_path / "outside")
+
+    with pytest.raises(ValueError, match="symlink|escapes"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", target_generation_id="escape",
+            encoder=DeterministicEncoder(),
+        )
+
+    assert not sync_fixture.config.db_path.exists() or sync_fixture.repo.pending_count("m1") == 5
+
+
+def test_concurrent_pointer_recovery_serializes_a_promotion_journal(sync_fixture, monkeypatch):
+    sync_pending(sync_fixture.config, encoder=DeterministicEncoder())
+    original = sync_module._atomic_json_replace
+
+    def crash_before_pointer(path, payload, **kwargs):
+        if path.name == "active-generation.json":
+            raise RuntimeError("promotion crash")
+        return original(path, payload)
+
+    monkeypatch.setattr(sync_module, "_atomic_json_replace", crash_before_pointer)
+    with pytest.raises(RuntimeError, match="promotion crash"):
+        rebuild_index(
+            sync_fixture.config, target_model_version="m2", target_generation_id="m2-race",
+            encoder=DeterministicEncoder(),
+        )
+    monkeypatch.setattr(sync_module, "_atomic_json_replace", original)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: active_index_config(sync_fixture.config).data_dir, range(2)))
+
+    assert results == [sync_fixture.config.data_dir / "generations" / "m2-race"] * 2
