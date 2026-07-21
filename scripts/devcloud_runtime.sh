@@ -2,7 +2,7 @@
 # Manage the Feedback Hub service inside the DevCloud container.
 set -euo pipefail
 
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${APP_DIR}/.venv"
 RUN_DIR="${APP_DIR}/run"
 LOG_DIR="${APP_DIR}/logs"
@@ -14,11 +14,15 @@ VECTOR_DATA_DIR="${VECTOR_DATA_DIR:-${APP_DIR}/feedback_hub/data/vector_index}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "${APP_DIR}/feedback_hub/data"
 
-vector_index_is_active() {
-  if [ -f "${VECTOR_DATA_DIR}/manifest.json" ]; then
-    return 0
+# 0=valid active index, 1=no index configured, 2=unsafe/broken metadata.
+vector_index_state() {
+  if [ -e "${VECTOR_DATA_DIR}/manifest.json" ]; then
+    [ -f "${VECTOR_DATA_DIR}/manifest.json" ] || return 2
+    python3 -c 'import json, sys; assert isinstance(json.load(open(sys.argv[1], encoding="utf-8")), dict)' "${VECTOR_DATA_DIR}/manifest.json" >/dev/null 2>&1 && return 0
+    return 2
   fi
-  python3 - "$VECTOR_DATA_DIR" <<'PY' >/dev/null 2>&1
+  [ -e "${VECTOR_DATA_DIR}/active-generation.json" ] || return 1
+  if python3 - "$VECTOR_DATA_DIR" <<'PY' >/dev/null 2>&1
 import json
 import sys
 from pathlib import Path
@@ -36,13 +40,50 @@ target.relative_to(root)
 assert target.parent == (root / "generations").resolve()
 assert (target / "manifest.json").is_file()
 PY
+  then
+    return 0
+  fi
+  return 2
 }
 
 ensure_vector_runtime_health() {
-  [ -x "$VECTOR_RUNTIME" ] || return 0
-  vector_index_is_active || return 0
+  local index_state
+  if vector_index_state; then
+    index_state=0
+  else
+    index_state="$?"
+  fi
+  if [ "$index_state" = "1" ]; then return 0; fi
+  if [ "$index_state" != "0" ]; then
+    echo "[runtime] invalid active vector index; refusing to start app." >&2
+    return 1
+  fi
+  if [ ! -x "$VECTOR_RUNTIME" ]; then
+    echo "[runtime] active vector index requires ${VECTOR_RUNTIME}" >&2
+    return 1
+  fi
   echo "[runtime] Ensuring vector runtime is healthy on 127.0.0.1:${VECTOR_PORT}..."
   VECTOR_PORT="$VECTOR_PORT" "$VECTOR_RUNTIME" start
+  curl -fsS --max-time 2 "http://127.0.0.1:${VECTOR_PORT}/health" >/dev/null
+}
+
+verify_vector_runtime_health() {
+  local index_state
+  if vector_index_state; then
+    index_state=0
+  else
+    index_state="$?"
+  fi
+  if [ "$index_state" = "1" ]; then return 0; fi
+  if [ "$index_state" != "0" ]; then
+    echo "[runtime] invalid active vector index; app status is unhealthy." >&2
+    return 1
+  fi
+  if [ ! -x "$VECTOR_RUNTIME" ]; then
+    echo "[runtime] active vector index requires ${VECTOR_RUNTIME}" >&2
+    return 1
+  fi
+  VECTOR_PORT="$VECTOR_PORT" "$VECTOR_RUNTIME" status
   curl -fsS --max-time 2 "http://127.0.0.1:${VECTOR_PORT}/health" >/dev/null
 }
 
@@ -122,6 +163,10 @@ start_app() {
 
 status_app() {
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" >/dev/null 2>&1; then
+    if ! verify_vector_runtime_health; then
+      echo "[runtime] app process is running but vector dependency is unhealthy." >&2
+      return 1
+    fi
     echo "[runtime] running pid=$(cat "$PID_FILE") port=${APP_PORT}"
   else
     echo "[runtime] stopped"
@@ -129,25 +174,27 @@ status_app() {
   fi
 }
 
-case "${1:-restart}" in
-  start)
-    start_app
-    ;;
-  stop)
-    stop_app
-    ;;
-  restart)
-    stop_app
-    start_app
-    ;;
-  status)
-    status_app
-    ;;
-  logs)
-    tail -n "${LINES:-120}" "${LOG_DIR}/app.log"
-    ;;
-  *)
-    echo "Usage: $0 {start|stop|restart|status|logs}" >&2
-    exit 2
-    ;;
-esac
+if [ "${DEVCLOUD_RUNTIME_LIBRARY:-0}" != "1" ]; then
+  case "${1:-restart}" in
+    start)
+      start_app
+      ;;
+    stop)
+      stop_app
+      ;;
+    restart)
+      stop_app
+      start_app
+      ;;
+    status)
+      status_app
+      ;;
+    logs)
+      tail -n "${LINES:-120}" "${LOG_DIR}/app.log"
+      ;;
+    *)
+      echo "Usage: $0 {start|stop|restart|status|logs}" >&2
+      exit 2
+      ;;
+  esac
+fi

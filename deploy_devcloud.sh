@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy Feedback Hub code to the CPU DevCloud container without replacing data.
-set -euo pipefail
+set -eEuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_ROOT"
@@ -70,19 +70,29 @@ scp -P "$SSH_PORT" -- "$ARCHIVE" "${SSH_TARGET}:${REMOTE_ARCHIVE}"
 echo "[deploy] Extracting and restarting services..."
 ssh -p "$SSH_PORT" -- "$SSH_TARGET" \
   "$(remote_command "$REMOTE_DIR" "$REMOTE_ARCHIVE" "$APP_PORT")" <<'REMOTE_DEPLOY'
-set -euo pipefail
+set -eEuo pipefail
 OLD="$1"
 REMOTE_ARCHIVE="$2"
 APP_PORT="$3"
 NEW="${OLD}.new"
 BAK="${OLD}.bak"
 FAILED="${OLD}.failed"
-SWAPPED=0
+OLD_MOVED_TO_BAK=0
+NEW_PROMOTED=0
+MOVED_VENV=0
+MOVED_ENV=0
+MOVED_DATA=0
 
-vector_index_is_active() {
+# 0=valid active index, 1=no index configured, 2=unsafe/broken metadata.
+vector_index_state() {
   local data_dir="${OLD}/feedback_hub/data/vector_index"
-  [ -f "${data_dir}/manifest.json" ] && return 0
-  python3 - "$data_dir" <<'PY' >/dev/null 2>&1
+  if [ -e "${data_dir}/manifest.json" ]; then
+    [ -f "${data_dir}/manifest.json" ] || return 2
+    python3 -c 'import json, sys; assert isinstance(json.load(open(sys.argv[1], encoding="utf-8")), dict)' "${data_dir}/manifest.json" >/dev/null 2>&1 && return 0
+    return 2
+  fi
+  [ -e "${data_dir}/active-generation.json" ] || return 1
+  if python3 - "$data_dir" <<'PY' >/dev/null 2>&1
 import json
 import sys
 from pathlib import Path
@@ -100,74 +110,117 @@ target.relative_to(root)
 assert target.parent == (root / "generations").resolve()
 assert (target / "manifest.json").is_file()
 PY
+  then
+    return 0
+  fi
+  return 2
 }
 
-restore_runtime_state() {
-  local item
+move_persisted_item() {
+  local item="$1" marker="$2"
+  [ -e "${OLD}/${item}" ] || return 0
+  mkdir -p -- "$(dirname "${NEW}/${item}")"
+  mv -- "${OLD}/${item}" "${NEW}/${item}"
+  printf -v "$marker" '%s' 1
+}
+
+restore_persisted_items() {
+  local target="$1" item marker source
   for item in .venv .env feedback_hub/data; do
-    if [ -e "${OLD}/${item}" ]; then
-      mkdir -p -- "$(dirname "${BAK}/${item}")"
-      rm -rf -- "${BAK}/${item}"
-      mv -- "${OLD}/${item}" "${BAK}/${item}"
+    case "$item" in
+      .venv) marker="MOVED_VENV" ;;
+      .env) marker="MOVED_ENV" ;;
+      feedback_hub/data) marker="MOVED_DATA" ;;
+    esac
+    [ "${!marker}" = "1" ] || continue
+    source="${NEW}/${item}"
+    # Once NEW has been promoted it is named OLD; this also covers a signal in
+    # the narrow interval immediately after the atomic directory rename.
+    if [ ! -e "$source" ] && [ -e "${OLD}/${item}" ]; then
+      source="${OLD}/${item}"
     fi
+    [ -e "$source" ] || return 1
+    mkdir -p -- "$(dirname "${target}/${item}")"
+    rm -rf -- "${target}/${item}"
+    mv -- "$source" "${target}/${item}"
+    printf -v "$marker" '%s' 0
   done
 }
 
+persisted_items_restored() {
+  [ "$MOVED_VENV" = "0" ] && [ "$MOVED_ENV" = "0" ] && [ "$MOVED_DATA" = "0" ]
+}
+
 rollback() {
-  local status="$?"
+  local status="$1"
   set +e
-  if [ "$SWAPPED" = "1" ] && [ -d "$BAK" ]; then
-    echo "[deploy] Deployment failed; rolling code directory back." >&2
+  if [ "$NEW_PROMOTED" = "1" ]; then
     if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
       cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
     fi
     if [ -x "${OLD}/scripts/vector_runtime.sh" ]; then
       cd "$OLD" && scripts/vector_runtime.sh stop || true
     fi
-    restore_runtime_state
+  fi
+  if [ "$OLD_MOVED_TO_BAK" = "1" ]; then
+    echo "[deploy] Deployment failed; restoring persisted state and previous code." >&2
+    restore_persisted_items "$BAK" || { echo "[deploy] Refusing to remove NEW: persisted state was not restored." >&2; exit "$status"; }
     rm -rf -- "$FAILED"
-    mv -- "$OLD" "$FAILED"
+    [ -d "$OLD" ] && mv -- "$OLD" "$FAILED"
     mv -- "$BAK" "$OLD"
     rm -rf -- "$FAILED"
     echo "[deploy] Rollback restored the previous code; app remains stopped for operator review." >&2
+  else
+    restore_persisted_items "$OLD" || { echo "[deploy] Refusing to remove NEW: persisted state was not restored." >&2; exit "$status"; }
   fi
-  rm -rf -- "$NEW"
+  if persisted_items_restored; then
+    rm -rf -- "$NEW"
+  fi
   rm -f -- "$REMOTE_ARCHIVE"
   exit "$status"
 }
-trap rollback ERR INT TERM
+trap 'rollback "$?"' ERR
+trap 'rollback 130' INT
+trap 'rollback 143' TERM
 
 if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
   cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
 fi
-if [ -x "${OLD}/scripts/vector_runtime.sh" ] && vector_index_is_active; then
+if vector_index_state; then
+  VECTOR_REQUIRED=1
+else
+  VECTOR_INDEX_STATE="$?"
+  if [ "$VECTOR_INDEX_STATE" = "1" ]; then
+    VECTOR_REQUIRED=0
+  else
+    echo "[deploy] invalid active vector index; refusing to stop or swap code." >&2
+    exit 1
+  fi
+fi
+if [ "$VECTOR_REQUIRED" = "1" ] && [ -x "${OLD}/scripts/vector_runtime.sh" ]; then
   cd "$OLD" && scripts/vector_runtime.sh stop
 fi
 
 rm -rf -- "$NEW"
 mkdir -p -- "$NEW"
 tar -xzf "$REMOTE_ARCHIVE" -C "$NEW"
-if [ -d "${OLD}/.venv" ]; then mv -- "${OLD}/.venv" "${NEW}/.venv"; fi
-if [ -f "${OLD}/.env" ]; then mv -- "${OLD}/.env" "${NEW}/.env"; fi
-if [ -d "${OLD}/feedback_hub/data" ]; then
-  mkdir -p -- "${NEW}/feedback_hub"
-  rm -rf -- "${NEW}/feedback_hub/data"
-  mv -- "${OLD}/feedback_hub/data" "${NEW}/feedback_hub/data"
-fi
+move_persisted_item .venv MOVED_VENV
+move_persisted_item .env MOVED_ENV
+move_persisted_item feedback_hub/data MOVED_DATA
 rm -rf -- "$BAK"
-if [ -d "$OLD" ]; then mv -- "$OLD" "$BAK"; fi
+if [ -d "$OLD" ]; then mv -- "$OLD" "$BAK"; OLD_MOVED_TO_BAK=1; fi
 mv "${NEW}" "${OLD}"
-SWAPPED=1
+NEW_PROMOTED=1
 
 cd "$OLD"
 chmod +x scripts/devcloud_runtime.sh scripts/vector_runtime.sh
-if vector_index_is_active; then
+if [ "$VECTOR_REQUIRED" = "1" ]; then
   # vector_runtime waits for loopback /health; app must stay stopped on failure.
   VECTOR_PORT="${VECTOR_PORT:-8011}" scripts/vector_runtime.sh restart
 fi
 APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh restart
 
-SWAPPED=0
+NEW_PROMOTED=0
 rm -rf -- "$BAK"
 rm -f -- "$REMOTE_ARCHIVE"
 trap - ERR INT TERM

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap the persisted Qwen embedding model and vector dependencies on DevCloud.
 # This script deliberately does not pull feedback, tag rows, rebuild vectors, or edit cron.
-set -euo pipefail
+set -eEuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH_TARGET="${SSH_TARGET:-root@charvelxia-any2.devcloud.woa.com}"
@@ -59,31 +59,56 @@ create_manifest() {
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sys
 from pathlib import Path
 
-model_dir = Path(sys.argv[1]).resolve()
+source_root = Path(sys.argv[1])
+if source_root.is_symlink():
+    raise SystemExit(f"[vector-deploy] Model source root must not be a symlink: {source_root}")
+model_dir = source_root.resolve()
 manifest = Path(sys.argv[2])
+if not model_dir.is_dir():
+    raise SystemExit(f"[vector-deploy] Model directory does not exist: {model_dir}")
 required = ("config.json", "tokenizer.json", "model.safetensors")
 for name in required:
     candidate = model_dir / name
-    if not candidate.is_file():
+    if candidate.is_symlink() or not candidate.is_file():
         raise SystemExit(f"[vector-deploy] Missing required model file: {candidate}")
 
-entries: list[str] = []
+entries: list[tuple[str, str]] = []
 safe_path = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
-for path in sorted(model_dir.rglob("*")):
-    if not path.is_file():
-        continue
-    relative = path.relative_to(model_dir).as_posix()
+for directory, dirnames, filenames in os.walk(model_dir, followlinks=False):
+    current = Path(directory)
+    for name in [*dirnames, *filenames]:
+        if (current / name).is_symlink():
+            raise SystemExit(f"[vector-deploy] Model tree must not contain symlink: {current / name}")
+    for filename in filenames:
+        path = current / filename
+        if not path.is_file():
+            raise SystemExit(f"[vector-deploy] Model tree entry is not a regular file: {path}")
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(model_dir).as_posix()
+        except ValueError as exc:
+            raise SystemExit(f"[vector-deploy] Model file escapes source root: {path}") from exc
+        if not safe_path.fullmatch(relative) or "//" in relative or "/../" in f"/{relative}/":
+            raise SystemExit(f"[vector-deploy] Unsafe model filename: {relative!r}")
+        digest = hashlib.sha256()
+        with resolved.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        entries.append((relative, digest.hexdigest()))
+entries.sort()
+lines: list[str] = []
+for relative, digest in entries:
     if not safe_path.fullmatch(relative) or "//" in relative or "/../" in f"/{relative}/":
         raise SystemExit(f"[vector-deploy] Unsafe model filename: {relative!r}")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    entries.append(f"{digest}  {relative}\n")
+    lines.append(f"{digest}  {relative}\n")
 if not entries:
     raise SystemExit("[vector-deploy] Model directory has no files")
-manifest.write_text("".join(entries), encoding="utf-8")
+manifest.write_text("".join(lines), encoding="utf-8")
 PY
 }
 
@@ -152,7 +177,7 @@ done < "$CHANGED_FILES"
 echo "[vector-deploy] Verifying model, promoting it atomically, and installing vector runtime..."
 ssh -p "$SSH_PORT" -- "$SSH_TARGET" \
   "$(remote_command "$REMOTE_DIR" "$REMOTE_MODEL_DIR" "$REMOTE_VECTOR_INDEX_DIR" "$REMOTE_MANIFEST" "$REMOTE_STAGE" "$START_AFTER_BOOTSTRAP")" <<'REMOTE_FINISH'
-set -euo pipefail
+set -eEuo pipefail
 APP_DIR="$1"
 MODEL_DIR="$2"
 VECTOR_INDEX_DIR="$3"
@@ -160,12 +185,31 @@ MANIFEST="$4"
 STAGE="$5"
 START_AFTER_BOOTSTRAP="$6"
 BACKUP="${MODEL_DIR}.previous"
+PROMOTION_LIVE_MOVED=0
+PROMOTION_STAGE_LIVE=0
 
-cleanup_partial() {
+restore_previous_model() {
+  set +e
+  if [ "$PROMOTION_STAGE_LIVE" = "1" ] && [ -d "$MODEL_DIR" ]; then
+    rm -rf -- "${STAGE}.failed"
+    mv -- "$MODEL_DIR" "${STAGE}.failed" || return 1
+  fi
+  if [ "$PROMOTION_LIVE_MOVED" = "1" ] && [ -d "$BACKUP" ]; then
+    mv -- "$BACKUP" "$MODEL_DIR" || return 1
+  fi
+  return 0
+}
+
+cleanup_promotion() {
+  local status="$1"
+  restore_previous_model || echo "[vector-deploy] Model rollback could not restore previous live model." >&2
   rm -rf -- "$STAGE"
   rm -f -- "$MANIFEST"
+  exit "$status"
 }
-trap cleanup_partial ERR INT TERM
+trap 'cleanup_promotion "$?"' ERR
+trap 'cleanup_promotion 130' INT
+trap 'cleanup_promotion 143' TERM
 
 manifest_is_safe() {
   local digest relative extra
@@ -178,7 +222,11 @@ manifest_is_safe() {
 }
 sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 has_safe_active_index() {
-  [ -f "${VECTOR_INDEX_DIR}/manifest.json" ] && return 0
+  if [ -e "${VECTOR_INDEX_DIR}/manifest.json" ]; then
+    [ -f "${VECTOR_INDEX_DIR}/manifest.json" ] || return 1
+    python3 -c 'import json, sys; assert isinstance(json.load(open(sys.argv[1], encoding="utf-8")), dict)' "${VECTOR_INDEX_DIR}/manifest.json" >/dev/null 2>&1 && return 0
+    return 1
+  fi
   python3 - "$VECTOR_INDEX_DIR" <<'PY'
 import json
 import sys
@@ -204,14 +252,14 @@ while IFS=' ' read -r digest relative; do
   [ -f "${STAGE}/${relative}" ] || { echo "missing staged model file: ${relative}" >&2; exit 1; }
   [ "$(sha256_file "${STAGE}/${relative}")" = "$digest" ] || { echo "checksum mismatch: ${relative}" >&2; exit 1; }
 done < "$MANIFEST"
+cp -- "$MANIFEST" "$STAGE/.manifest.sha256"
+cmp -s "$MANIFEST" "$STAGE/.manifest.sha256"
 
 if ! cmp -s "$MANIFEST" "${MODEL_DIR}/.manifest.sha256" 2>/dev/null; then
   rm -rf -- "$BACKUP"
-  if [ -d "$MODEL_DIR" ]; then mv -- "$MODEL_DIR" "$BACKUP"; fi
+  if [ -d "$MODEL_DIR" ]; then mv -- "$MODEL_DIR" "$BACKUP"; PROMOTION_LIVE_MOVED=1; fi
   mv -- "$STAGE" "$MODEL_DIR"
-  cp -- "$MANIFEST" "${MODEL_DIR}/.manifest.sha256.new"
-  mv -- "${MODEL_DIR}/.manifest.sha256.new" "${MODEL_DIR}/.manifest.sha256"
-  rm -rf -- "$BACKUP"
+  PROMOTION_STAGE_LIVE=1
 else
   rm -rf -- "$STAGE"
 fi
@@ -230,6 +278,10 @@ if [ "$START_AFTER_BOOTSTRAP" = "1" ]; then
     echo "[vector-deploy] No active vector manifest; bootstrap completed without starting the vector API."
   fi
 fi
+rm -rf -- "$BACKUP"
+PROMOTION_LIVE_MOVED=0
+PROMOTION_STAGE_LIVE=0
+trap - ERR INT TERM
 REMOTE_FINISH
 REMOTE_PREPARED=0
 
