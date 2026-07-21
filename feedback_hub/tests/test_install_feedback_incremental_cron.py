@@ -35,7 +35,9 @@ case "${1:-}" in
     fi
     if [[ -n "${FAKE_INSTALL_READY:-}" ]]; then : > "$FAKE_INSTALL_READY"; fi
     if [[ -n "${FAKE_INSTALL_DELAY:-}" ]]; then
-      if [[ -z "${FAKE_INSTALL_DELAY_ONCE_MARKER:-}" || ! -e "$FAKE_INSTALL_DELAY_ONCE_MARKER" ]]; then
+      if [[ -n "${FAKE_INSTALL_DELAY_AFTER_MARKER:-}" && ! -e "$FAKE_INSTALL_DELAY_AFTER_MARKER" ]]; then
+        :
+      elif [[ -z "${FAKE_INSTALL_DELAY_ONCE_MARKER:-}" || ! -e "$FAKE_INSTALL_DELAY_ONCE_MARKER" ]]; then
         [[ -z "${FAKE_INSTALL_DELAY_ONCE_MARKER:-}" ]] || : > "$FAKE_INSTALL_DELAY_ONCE_MARKER"
         sleep "$FAKE_INSTALL_DELAY"
       fi
@@ -284,7 +286,7 @@ def test_foreign_global_lock_is_never_removed_or_bypassed(tmp_path):
         lock.unlink(missing_ok=True)
 
 
-def test_definitely_dead_exact_owner_lock_is_reclaimed(tmp_path):
+def test_definitely_dead_global_lock_is_left_for_manual_removal(tmp_path):
     project = tmp_path / "project"
     (project / "feedback_hub" / "data").mkdir(parents=True)
     state = tmp_path / "crontab-state"
@@ -305,8 +307,8 @@ def test_definitely_dead_exact_owner_lock_is_reclaimed(tmp_path):
                 "LOCK_RETRY_DELAY": "0",
             },
         )
-        assert completed.returncode == 0, completed.stderr
-        assert not lock.exists()
+        assert completed.returncode == 75
+        assert lock.read_text(encoding="utf-8") == "99999999 dead-owner\n"
     finally:
         lock.unlink(missing_ok=True)
 
@@ -474,3 +476,42 @@ def test_immediate_signal_after_global_lock_appearance_never_leaves_a_lock(tmp_p
         os.killpg(run.pid, signal.SIGTERM)
         run.communicate(timeout=5)
         assert not lock.exists()
+
+
+def test_second_term_cannot_interrupt_delayed_signal_rollback(tmp_path):
+    project = tmp_path / "project"
+    (project / "feedback_hub" / "data").mkdir(parents=True)
+    existing = "15 4 * * * /opt/other.sh\n"
+    state = tmp_path / "crontab-state"
+    state.write_text(existing, encoding="utf-8")
+    fake = _fake_crontab(tmp_path / "fake-crontab")
+    copied = tmp_path / "candidate-copied"
+    post_marker = tmp_path / "post-copy-marker"
+    run = subprocess.Popen(
+        [str(SCRIPT), "--project-dir", str(project)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "CRONTAB_BIN": str(fake),
+            "FAKE_CRONTAB_STATE": str(state),
+            "FAKE_POST_COPY_READY": str(copied),
+            "FAKE_POST_COPY_DELAY": "10",
+            "FAKE_POST_COPY_DELAY_ONCE_MARKER": str(post_marker),
+            "FAKE_INSTALL_DELAY": "0.3",
+            "FAKE_INSTALL_DELAY_AFTER_MARKER": str(post_marker),
+        },
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while not copied.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert copied.exists()
+    os.killpg(run.pid, signal.SIGTERM)
+    time.sleep(0.05)
+    os.killpg(run.pid, signal.SIGTERM)
+    stdout, stderr = run.communicate(timeout=5)
+
+    assert run.returncode != 0, (stdout, stderr)
+    assert state.read_text(encoding="utf-8") == existing

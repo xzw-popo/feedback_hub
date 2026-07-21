@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Install the local crontab entry for the 20-minute feedback pipeline.
 #
-# A stale global installer lock is reclaimed only after its exact, unchanged
-# owner record names a PID that is definitely no longer alive.
+# A stale global installer lock is never removed automatically.
 set -euo pipefail
 
 MARKER='# feedback-hub: managed incremental sync'
@@ -18,7 +17,7 @@ two-hour /opt/feedback_hub no-sync job. CRONTAB_BIN may inject a
 crontab-compatible binary for tests. This script never connects to a remote.
 
 --dry-run prints the candidate and performs no backup or crontab mutation.
-An unchanged stale global lock is reclaimed only when its owner PID is dead.
+A stale lock must be removed manually only after its owner is confirmed dead.
 EOF
 }
 
@@ -127,7 +126,8 @@ cleanup() {
 }
 
 on_signal() {
-  trap - HUP INT TERM EXIT
+  trap '' HUP INT TERM
+  trap - EXIT
   if [[ "$INSTALL_MAY_HAVE_MUTATED" -eq 1 ]]; then
     rollback_previous || true
     verify_previous || true
@@ -139,34 +139,6 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal HUP INT TERM
 
-recover_stale_lock() {
-  local observed pid token extra quarantine
-  observed="$(mktemp "/tmp/feedback-incremental-crontab-${UID}.observed.XXXXXX")"
-  if ! cp "$LOCK_FILE" "$observed" 2>/dev/null; then rm -f -- "$observed"; return 1; fi
-  read -r pid token extra < "$observed" || { rm -f -- "$observed"; return 1; }
-  [[ "$pid" =~ ^[0-9]+$ && "$token" =~ ^[A-Za-z0-9._-]+$ && -z "$extra" ]] || {
-    rm -f -- "$observed"; return 1;
-  }
-  local kill_error=""
-  if kill -0 "$pid" 2> "$observed.error"; then
-    rm -f -- "$observed" "$observed.error"
-    return 1
-  fi
-  kill_error="$(cat "$observed.error" 2>/dev/null || true)"
-  rm -f -- "$observed.error"
-  [[ "$kill_error" != *"Operation not permitted"* ]] || { rm -f -- "$observed"; return 1; }
-  cmp -s "$LOCK_FILE" "$observed" || { rm -f -- "$observed"; return 1; }
-  quarantine="$LOCK_FILE.stale.$LOCK_TOKEN"
-  if ! mv "$LOCK_FILE" "$quarantine" 2>/dev/null; then rm -f -- "$observed"; return 1; fi
-  if cmp -s "$quarantine" "$observed"; then
-    rm -f -- "$quarantine" "$observed"
-    return 0
-  fi
-  if [[ ! -e "$LOCK_FILE" ]]; then ln "$quarantine" "$LOCK_FILE" 2>/dev/null || true; fi
-  rm -f -- "$observed"
-  return 1
-}
-
 acquire_lock() {
   local attempt
   for ((attempt = 1; attempt <= 10#$LOCK_RETRY_ATTEMPTS; attempt++)); do
@@ -174,10 +146,9 @@ acquire_lock() {
       LOCK_OWNED=1
       return 0
     fi
-    recover_stale_lock || true
     sleep "$LOCK_RETRY_DELAY"
   done
-  echo "Another feedback crontab installer holds $LOCK_FILE" >&2
+  echo "Another feedback crontab installer holds $LOCK_FILE; remove only a confirmed stale lock manually" >&2
   return 75
 }
 
