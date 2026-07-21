@@ -23,9 +23,14 @@ class TopicMiningConfig:
     # Worker recovery policy is backend-owned and intentionally not exposed as
     # a client or deployment input. Tests may construct a shorter lease.
     worker_lease_seconds: int = 3600
-    bm25_top_k: int = 1000
-    vector_top_k: int = 1000
-    candidate_limit: int = 1500
+    standard_channel_top_k: int = 200
+    standard_recall_pool_limit: int = 2000
+    standard_candidate_limit: int = 500
+    exhaustive_channel_top_k: int = 2000
+    exhaustive_recall_pool_limit: int = 5000
+    exhaustive_candidate_limit: int = 5000
+    standard_result_limit: int = 100
+    review_page_limit: int = 50
     rrf_k: int = 60
     classifier_batch_size: int = 20
     classifier_concurrency: int = 8

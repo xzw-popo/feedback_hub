@@ -43,7 +43,13 @@ def valid_topic_spec():
 
 
 def recall_config():
-    return TopicMiningConfig(bm25_top_k=10, vector_top_k=10, candidate_limit=10, rrf_k=60)
+    return TopicMiningConfig(
+        standard_channel_top_k=10,
+        standard_recall_pool_limit=10,
+        exhaustive_channel_top_k=10,
+        exhaustive_recall_pool_limit=10,
+        rrf_k=60,
+    )
 
 
 def test_tokenization_and_bm25_ranking_are_deterministic():
@@ -132,12 +138,12 @@ def test_hybrid_recall_rejects_unknown_or_misspelled_vector_query_id(valid_topic
         )
 
 
-def test_configured_candidate_limit_and_auditable_artifacts(valid_topic_spec, tmp_path):
+def test_configured_recall_pool_limit_and_auditable_artifacts(valid_topic_spec, tmp_path):
     plan = hybrid_recall(
         [{"item_id": "b", "text": "无关"}, {"item_id": "a", "text": "无关"}],
         valid_topic_spec,
         vector_hits=[VectorHit("b", "positive:0", 0.9, 1), VectorHit("a", "positive:0", 0.8, 2)],
-        config=TopicMiningConfig(data_dir=tmp_path, candidate_limit=1),
+        config=TopicMiningConfig(data_dir=tmp_path, standard_recall_pool_limit=1),
         artifact_dir=tmp_path / "artifacts",
         source_watermark_ms=100,
         vector_watermark_ms=100,

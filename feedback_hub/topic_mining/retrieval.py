@@ -67,6 +67,7 @@ class RecallHit:
 @dataclass(frozen=True)
 class RecallPlan:
     candidates: tuple[RecallHit, ...]
+    retrieved_candidate_count: int
     rejected_out_of_scope_ids: tuple[str, ...]
     semantic_queries: tuple[dict[str, str], ...]
     bm25_query: str
@@ -150,6 +151,13 @@ def build_vector_filters(spec: TopicSpec) -> dict[str, Any]:
     return filters
 
 
+def recall_budget(spec: TopicSpec, config: TopicMiningConfig) -> tuple[int, int]:
+    """Return the backend-owned channel depth and total recall pool for a mode."""
+    if spec.mode == "standard":
+        return config.standard_channel_top_k, config.standard_recall_pool_limit
+    return config.exhaustive_channel_top_k, config.exhaustive_recall_pool_limit
+
+
 def verify_vector_watermark(*, source_watermark_ms: int, vector_watermark_ms: int | None, max_lag_seconds: int) -> None:
     if vector_watermark_ms is None:
         raise VectorIndexStaleError("vector index watermark is missing")
@@ -192,6 +200,8 @@ def _write_audit_artifacts(plan: RecallPlan, artifact_dir: Path, config: TopicMi
         "bm25_query": plan.bm25_query,
         "semantic_queries": list(plan.semantic_queries),
         "rejected_out_of_scope_ids": list(plan.rejected_out_of_scope_ids),
+        "retrieved_candidate_count": plan.retrieved_candidate_count,
+        "recall_pool_count": len(plan.candidates),
         "candidate_count": len(plan.candidates),
         "config": config_values,
     }
@@ -221,8 +231,9 @@ def hybrid_recall(
         )
     source_items = _validate_items(items)
     item_by_id = {item["item_id"]: item for item in source_items}
+    channel_top_k, recall_pool_limit = recall_budget(spec, config)
     bm25_query = build_bm25_query(spec)
-    bm25_hits = BM25Index.from_texts(item["text"] for item in source_items).search(bm25_query, top_k=config.bm25_top_k)
+    bm25_hits = BM25Index.from_texts(item["text"] for item in source_items).search(bm25_query, top_k=channel_top_k)
     ranks: dict[str, dict[str, int]] = defaultdict(dict)
     scores: dict[str, dict[str, float]] = defaultdict(dict)
     query_ids: dict[str, set[str]] = defaultdict(set)
@@ -243,7 +254,7 @@ def hybrid_recall(
         if hit.item_id not in item_by_id:
             rejected_out_of_scope.add(hit.item_id)
             continue
-        if hit.rank > config.vector_top_k:
+        if hit.rank > channel_top_k:
             continue
         if query_kind == "negative":
             negative_hits[hit.item_id].add(hit.query_id)
@@ -273,7 +284,8 @@ def hybrid_recall(
         for rank, hit in enumerate(candidates, start=1)
     )
     plan = RecallPlan(
-        candidates=ranked_candidates[:config.candidate_limit],
+        candidates=ranked_candidates[:recall_pool_limit],
+        retrieved_candidate_count=len(ranked_candidates),
         rejected_out_of_scope_ids=tuple(sorted(rejected_out_of_scope)),
         semantic_queries=tuple(build_semantic_queries(spec)),
         bm25_query=bm25_query,

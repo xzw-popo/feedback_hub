@@ -21,8 +21,9 @@ from typing import Any, Mapping, Sequence
 
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
+from .diversity import select_diverse_candidates
 from .contracts import TopicSpec, topic_spec_hash, validate_topic_spec
-from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall
+from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
 from .run_store import RunPublicationConflictError, TopicRunStore
 from .source import DataCoverageError, SourceReadinessError, build_item_contexts, create_source_snapshot, fetch_scoped_items
@@ -207,7 +208,8 @@ def _run_pipeline(
         capabilities = client.capabilities()
         if spec.unit not in capabilities.supported_units:
             raise ValueError("vector_index_unsupported_unit")
-        result = client.search(build_semantic_queries(spec), build_vector_filters(spec), config.vector_top_k)
+        channel_top_k, _recall_pool_limit = recall_budget(spec, config)
+        result = client.search(build_semantic_queries(spec), build_vector_filters(spec), channel_top_k)
         _ensure_worker_active(run_id, store)
         recall_workspace = _stage_workspace(store, artifact_dir, "hybrid_recall")
         plan = hybrid_recall(
@@ -222,7 +224,14 @@ def _run_pipeline(
         manifest.update({
             "vector_watermark_ms": result.watermark_ts_ms,
             "vector_index": result.index,
-            "hybrid_recall": {"candidate_count": len(plan.candidates), "rejected_out_of_scope_ids": list(plan.rejected_out_of_scope_ids)},
+            "hybrid_recall": {
+                "candidate_count": len(plan.candidates),
+                "retrieved_candidate_count": plan.retrieved_candidate_count,
+                "recall_pool_count": len(plan.candidates),
+                "rejected_out_of_scope_ids": list(plan.rejected_out_of_scope_ids),
+            },
+            "retrieved_candidate_count": plan.retrieved_candidate_count,
+            "recall_pool_count": len(plan.candidates),
             "retrieval_config": _safe_config(config),
             "unresolved_vector_items": 0,
         })
@@ -231,6 +240,12 @@ def _run_pipeline(
             [recall_path, recall_manifest_path], output_hashes=recall_hashes,
         )
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
+    candidate_limit = (
+        config.standard_candidate_limit
+        if spec.mode == "standard"
+        else config.exhaustive_candidate_limit
+    )
+    selected_recalls = select_diverse_candidates(recalls, limit=candidate_limit)
 
     classified_path = artifact_dir / "classified.jsonl"
     audit_path = artifact_dir / "classification_audit.jsonl"
@@ -253,7 +268,7 @@ def _run_pipeline(
             ),
         )
         results, stats = classify_candidates(
-            spec, recalls, artifact_dir=classify_workspace, contexts=contexts, routes=classifier_routes,
+            spec, selected_recalls, artifact_dir=classify_workspace, contexts=contexts, routes=classifier_routes,
             config=config, resume=resume_classification, call_fn=classifier_call_fn,
             cancel_check=lambda: _ensure_worker_active(run_id, store),
             progress_callback=lambda: _publish_classification_progress(
@@ -270,8 +285,18 @@ def _run_pipeline(
         )
         manifest["classifier"] = _safe_json(stats)
         manifest["classifier"].update(_classification_quality(audit_path))
-        manifest["funnel"] = {"hard_scope_count": len(items), "candidate_count": len(recalls), "classified_count": len(results)}
-        manifest["unresolved_classifier_items"] = max(0, len(recalls) - len(results))
+        manifest["funnel"] = {
+            "hard_scope_count": len(items),
+            "candidate_count": len(recalls),
+            "retrieved_candidate_count": manifest.get("retrieved_candidate_count", len(recalls)),
+            "recall_pool_count": len(recalls),
+            "selected_candidate_count": len(selected_recalls),
+            "classified_count": len(results),
+        }
+        manifest["recall_pool_count"] = len(recalls)
+        manifest["selected_candidate_count"] = len(selected_recalls)
+        manifest["classified_count"] = len(results)
+        manifest["unresolved_classifier_items"] = max(0, len(selected_recalls) - len(results))
         manifest["unresolved_parser_items"] = int(stats.get("failed", 0))
         # Classification can safely pause; it must never publish review_ready.
         if stats.get("run_status") == "paused_quota_exhausted":

@@ -521,6 +521,68 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
     assert {row["data_cutoff_ms"] for row in final_rows} == {end}
 
 
+def test_standard_service_classifies_at_most_five_hundred(tmp_path):
+    from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
+    from feedback_hub.topic_mining.config import TopicMiningConfig
+    from feedback_hub.topic_mining.service import run_topic_job
+    from feedback_hub.topic_mining.vector_client import VectorCapabilities, VectorHit, VectorSearchResult
+
+    source = tmp_path / "source.db"
+    start, end = _write_source(source)
+    with sqlite3.connect(source) as connection:
+        rows = [
+            (
+                f"bulk-{index:04d}", f"bulk-{index:04d}", 1, start + 2_000 + index,
+                "Win", "1", "pc", "PC", f"u-{index:04d}", 1,
+                f"https://example.test/{index}", "游戏全屏工具栏一直显示",
+            )
+            for index in range(800)
+        ]
+        connection.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    raw_spec = _spec().to_dict()
+    raw_spec["positive_examples"] = ["工具栏遮挡", "全屏工具栏", "工具栏一直显示"]
+    spec = validate_topic_spec(raw_spec)
+    config = TopicMiningConfig(
+        source_db_path=source,
+        data_dir=tmp_path / "data",
+        vector_api_url="https://vector.test",
+        vector_max_lag_seconds=1_000_000,
+        classifier_concurrency=1,
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(spec, end)
+
+    query_ids = ("objective:0", "positive:0", "positive:1", "positive:2")
+    hits = tuple(
+        VectorHit(f"bulk-{index:04d}", query_ids[index // 200], .9, index % 200 + 1)
+        for index in range(800)
+    )
+
+    class Vector:
+        def capabilities(self): return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
+        def search(self, *_args): return VectorSearchResult("feedback-items-v1", end, hits)
+
+    route = ModelRoute("test", "openai_compatible", "https://model.test", "not-a-secret", "test")
+
+    def classify(prompt, **_kwargs):
+        item_ids = [row["item_id"] for row in json.loads(prompt)["candidates"]]
+        return ModelReply(json.dumps({"results": [
+            {"item_id": item_id, "label": "not_matched", "confidence": .9, "evidence": [], "reason": "不符合", "needs_review": False}
+            for item_id in item_ids
+        ]}), "test", "openai_compatible", "test", 1, 1, ())
+
+    outcome = run_topic_job(
+        run["run_id"], store=store, config=config, vector_client=Vector(),
+        classifier_routes=[route], classifier_call_fn=classify,
+    )
+
+    manifest = json.loads(outcome["manifest_json"])
+    assert outcome["status"] == "review_ready"
+    assert manifest["recall_pool_count"] == 800
+    assert manifest["classified_count"] == 500
+    assert manifest["selected_candidate_count"] == 500
+
+
 def test_run_maps_classifier_quota_pause(tmp_path):
     from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute, QuotaExhaustedError
     from feedback_hub.topic_mining.config import TopicMiningConfig
