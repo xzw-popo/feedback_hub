@@ -602,11 +602,10 @@ def test_vector_deploy_runbook_documents_bootstrap_start_health_and_bounded_roll
 
 
 @pytest.mark.parametrize("has_pointer", [True, False])
-def test_bootstrap_runbook_payload_is_shell_valid_and_keeps_pointer_evidence_mutually_exclusive(tmp_path, has_pointer):
+def test_bootstrap_runbook_outer_ssh_command_captures_and_executes_safe_remote_payload(tmp_path, has_pointer):
     docs = RUNBOOK.read_text(encoding="utf-8")
     section = docs.split("首次 bootstrap 默认不启动向量服务", 1)[1].split("`--last 14d`", 1)[0]
     block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
-    payload = block.split("root@charvelxia-any2.devcloud.woa.com '\n", 1)[1].rsplit("\n'", 1)[0]
     app = tmp_path / "feedback_hub"
     backup_dir = app / "feedback_hub" / "data" / "vector_index" / "backups"
     backup_dir.mkdir(parents=True)
@@ -625,14 +624,61 @@ def test_bootstrap_runbook_payload_is_shell_valid_and_keeps_pointer_evidence_mut
         "exit 0\n",
     )
     _write_executable(app / "scripts" / "vector_runtime.sh", "#!/bin/sh\nexit 0\n")
-    runnable = payload.replace("cd /opt/feedback_hub", f"cd {app}", 1)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    captured = tmp_path / "captured-remote-payload"
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/bin/sh\n"
+        "last=\"\"\n"
+        "for value in \"$@\"; do last=\"$value\"; done\n"
+        "printf '%s' \"$last\" > \"${CAPTURED_PAYLOAD:?}\"\n",
+    )
 
-    syntax = subprocess.run(["bash", "-n"], input=runnable, text=True, capture_output=True)
+    outer = subprocess.run(
+        ["bash", "-c", block],
+        env={**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "CAPTURED_PAYLOAD": str(captured)},
+        text=True,
+        capture_output=True,
+    )
+    payload = captured.read_text(encoding="utf-8")
+    runnable = payload.replace("cd /opt/feedback_hub", f"cd {app}", 1)
+    syntax = subprocess.run(["bash", "-n"], input=payload, text=True, capture_output=True)
     result = subprocess.run(["bash", "-c", runnable], text=True, capture_output=True)
 
+    assert outer.returncode == 0, outer.stdout + outer.stderr
     assert syntax.returncode == 0, syntax.stderr
     assert result.returncode == 0, result.stdout + result.stderr
+    assert './.venv/bin/python -m json.tool "$ACTIVE_POINTER" >/dev/null' in payload
     assert (backup.exists(), marker.exists()) == (has_pointer, not has_pointer)
+
+
+def test_fake_ssh_capture_proves_legacy_nested_single_quote_would_be_broken(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    captured = tmp_path / "captured-remote-payload"
+    _write_executable(
+        fake_bin / "ssh",
+        "#!/bin/sh\n"
+        "last=\"\"\n"
+        "for value in \"$@\"; do last=\"$value\"; done\n"
+        "printf '%s' \"$last\" > \"${CAPTURED_PAYLOAD:?}\"\n",
+    )
+    legacy = """ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  ./.venv/bin/python -c "import json, sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$ACTIVE_POINTER"
+'"""
+
+    result = subprocess.run(
+        ["bash", "-c", legacy],
+        env={**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "CAPTURED_PAYLOAD": str(captured)},
+        text=True,
+        capture_output=True,
+    )
+    payload = captured.read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "encoding=utf-8" in payload
+    assert "encoding='utf-8'" not in payload
 
 
 def test_vector_deploy_scripts_parse_without_contacting_remote_hosts():
