@@ -304,7 +304,10 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
     }
     workbook.close()
     assert workbook_ids == {"win-game", "win-paraphrase"}
-    assert "数据截止时间" in headers
+    assert headers == [
+        "反馈时间", "反馈原文", "对应链接", "平台", "版本", "设备",
+        "Feedback ID", "判定理由", "证据",
+    ]
     final_results = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["data_cutoff_ms"] for row in final_results} == {int(end.timestamp() * 1000)}
     quality_report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))

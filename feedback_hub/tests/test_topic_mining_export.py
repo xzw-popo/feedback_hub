@@ -154,13 +154,19 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, read_only=False, data_only=False)
     ws = wb["反馈清单"]
-    assert [cell.value for cell in ws[1]][:6] == ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据"]
-    assert ws["D2"].hyperlink.target.startswith("https://")
+    headers = [cell.value for cell in ws[1]]
+    assert headers == [
+        "反馈时间", "反馈原文", "对应链接", "平台", "版本", "设备",
+        "Feedback ID", "判定理由", "证据",
+    ]
+    assert not {
+        "命中分类", "Conversation ID", "Run ID", "数据截止时间",
+    } & set(headers)
+    assert ws["C2"].hyperlink.target.startswith("https://")
+    assert ws.cell(2, headers.index("判定理由") + 1).value == "全屏仍显示"
+    assert ws.cell(2, headers.index("证据") + 1).value == "工具栏一直显示"
     assert (artifact_dir / "final_results.jsonl").exists()
     assert (artifact_dir / "quality_report.json").exists()
-    headers = [cell.value for cell in ws[1]]
-    assert "数据截止时间" in headers
-    assert ws.cell(2, headers.index("数据截止时间") + 1).value == "2023-11-14T22:13:20+00:00"
     final_rows = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["data_cutoff_ms"] for row in final_rows] == [CUTOFF_MS]
     assert [
@@ -400,7 +406,7 @@ def test_export_escapes_formula_like_user_text(tmp_path, text):
     )
     path = export_topic_run(run["run_id"], "xlsx", store=store)
     wb = openpyxl.load_workbook(path, data_only=False)
-    assert wb["反馈清单"]["C2"].value.startswith("'")
+    assert wb["反馈清单"]["B2"].value.startswith("'")
 
 
 def test_export_blocks_unverified_run(tmp_path):

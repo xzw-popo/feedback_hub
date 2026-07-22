@@ -13,7 +13,10 @@ from .contracts import load_persisted_topic_spec
 from feedback_hub.jsonl_io import load_jsonl_objects
 
 
-HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID", "数据截止时间"]
+HEADERS = [
+    "反馈时间", "反馈原文", "对应链接", "平台", "版本", "设备",
+    "Feedback ID", "判定理由", "证据",
+]
 
 
 def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | None = None) -> Path:
@@ -155,18 +158,19 @@ def _xlsx_bytes(
         item = row["source_item"]
         url = str(item["source_url"])
         values = [
-            row["label"], _format_time(item.get("ts_ms")), item["text"], _safe_cell(url), row["reason"],
-            "\n".join(row["evidence"]), item.get("platform", ""), item.get("appversion", ""),
-            item.get("device_name", ""), item.get("feedback_id", ""), item.get("conversation_id", ""), row["run_id"],
-            _format_time(row["data_cutoff_ms"]),
+            _format_time(item.get("ts_ms")), item["text"], _safe_cell(url),
+            item.get("platform", ""), item.get("appversion", ""),
+            item.get("device_name", ""), item.get("feedback_id", ""),
+            row["reason"], "\n".join(row["evidence"]),
         ]
         sheet.append([_safe_cell(value) for value in values])
-        link = sheet.cell(sheet.max_row, 4)
+        link = sheet.cell(sheet.max_row, 3)
         link.hyperlink = url
         link.style = "Hyperlink"
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:M{max(sheet.max_row, 1)}"
-    widths = [14, 20, 48, 42, 28, 32, 12, 16, 20, 18, 20, 18, 28]
+    last_column = openpyxl.utils.get_column_letter(len(HEADERS))
+    sheet.auto_filter.ref = f"A1:{last_column}{max(sheet.max_row, 1)}"
+    widths = [20, 48, 42, 12, 16, 20, 18, 28, 32]
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[openpyxl.utils.get_column_letter(index)].width = width
     for row in sheet.iter_rows(min_row=2):
