@@ -108,6 +108,6 @@ Run: `python3 -m pytest feedback_hub/tests/test_topic_mining*.py feedback_hub/te
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Validate and forward-test**
+- [x] **Step 5: Validate and forward-test**
 
 Run the skill validator and a fresh Agent preparation scenario. Expected: the prepared end equals advertised `available_through`, with no live Run creation.
