@@ -211,6 +211,28 @@ def test_exhaustive_export_keeps_all_reviewed_matches(tmp_path):
     }
 
 
+def test_exhaustive_export_reports_possible_matches_beyond_5000_candidate_safety_limit(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(mode="exhaustive"), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 130)),
+        encoding="utf-8",
+    )
+    manifest = _persist_verified_manifest(store, run, final)
+    manifest.update({"retrieved_candidate_count": 5_001, "classified_count": 5_000})
+    store.update_manifest(run["run_id"], manifest, stage="verified", status="verified")
+    (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    path = export_topic_run(run["run_id"], "jsonl", store=store)
+
+    assert len(_read_jsonl(path)) == 130
+    report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["mode"] == "exhaustive"
+    assert report["possibly_more_matches"] is True
+
+
 def test_export_uses_terminal_manifest_cas(tmp_path, monkeypatch):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), CUTOFF_MS)

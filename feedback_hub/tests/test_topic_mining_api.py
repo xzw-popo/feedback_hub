@@ -81,6 +81,28 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     assert payload["authentication"] == "internal_network_boundary"
 
 
+def test_legacy_exhaustive_run_reports_possible_matches_beyond_5000_candidate_safety_limit(tmp_path):
+    from feedback_hub.tests.test_topic_mining_export import _spec as shared_spec
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data")
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(shared_spec(mode="exhaustive"), 123)
+    legacy_manifest = {
+        "verified": {"matched_count": 130},
+        "retrieved_candidate_count": 5_001,
+        "classified_count": 5_000,
+    }
+    store.update_manifest(run["run_id"], legacy_manifest, stage="verified", status="verified")
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    payload = TestClient(app).get(f"/api/topic-mining/runs/{run['run_id']}").json()
+
+    assert payload["mode"] == "exhaustive"
+    assert payload["result_scope"] == "reviewed"
+    assert payload["possibly_more_matches"] is True
+
+
 def test_review_queue_pages_at_most_fifty_rows_and_reports_continuation(tmp_path):
     client, run, _ = _artifact_client(
         tmp_path,

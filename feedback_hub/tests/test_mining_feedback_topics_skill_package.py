@@ -462,6 +462,8 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
     assert "follow the returned `next_offset` and stop only when it is null" in backend
     assert "including queues of 51 or more items" in review
     assert "call `apply-overrides` only once" in review
+    assert "retrieved_candidate_count > classified_count" in backend
+    assert "possibly_more_matches=true in either mode" in backend
 
 
 def test_references_have_no_stdout_only_default_time_preparation_command():

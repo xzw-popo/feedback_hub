@@ -579,9 +579,10 @@ def _result_scope(
         "matched_total": matched_total,
         "returned_feedback": returned_feedback,
         "possibly_more_matches": (
-            spec.mode == "standard" and (
-                retrieved > manifest_classified
-                or matched_total > returned_feedback
+            retrieved > manifest_classified
+            or (
+                spec.mode == "standard"
+                and matched_total > returned_feedback
             )
         ),
     }

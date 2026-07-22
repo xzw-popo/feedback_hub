@@ -466,9 +466,10 @@ def _public_result_scope(
         "matched_total": matched_total,
         "returned_feedback": returned_feedback,
         "possibly_more_matches": (
-            spec.mode == "standard" and (
-                retrieved_count > classified_count
-                or matched_total > returned_feedback
+            retrieved_count > classified_count
+            or (
+                spec.mode == "standard"
+                and matched_total > returned_feedback
             )
         ),
     }
