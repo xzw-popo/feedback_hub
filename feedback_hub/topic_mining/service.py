@@ -19,13 +19,13 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .budgets import candidate_budget
+from .budgets import candidate_budget, review_sample_budget
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates, select_representative_results
 from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
-from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
+from .review import apply_review_overrides, persist_review_artifacts, plan_review_queue
 from .run_store import RunPublicationConflictError, TopicRunStore
 from .source import DataCoverageError, SourceReadinessError, build_item_contexts, create_source_snapshot, fetch_scoped_items
 from .vector_client import HttpVectorSearchClient
@@ -335,20 +335,37 @@ def _run_pipeline(
     overrides_path = artifact_dir / "review_overrides.jsonl"
     if classifications_rebuilt or not _stage_valid(manifest, "review_queue", artifact_dir):
         _ensure_worker_active(run_id, store)
-        queue = build_review_queue(
+        persisted_review_budget = manifest.get("review_budget")
+        if not isinstance(persisted_review_budget, Mapping):
+            persisted_review_budget = review_sample_budget(spec, config)
+        sample_limit = persisted_review_budget.get("sample_limit")
+        if (
+            isinstance(sample_limit, bool)
+            or not isinstance(sample_limit, int)
+            or sample_limit < 0
+        ):
+            persisted_review_budget = review_sample_budget(spec, config)
+            sample_limit = persisted_review_budget["sample_limit"]
+        review_plan = plan_review_queue(
             run_id, classifications, {row.item_id: row for row in recalls},
-            contexts=contexts,
+            contexts=contexts, sample_limit=sample_limit,
         )
         review_workspace = _stage_workspace(store, artifact_dir, "review_queue")
         persist_review_artifacts(
-            review_workspace, queue,
+            review_workspace, review_plan.rows,
             _read_jsonl(overrides_path) if overrides_path.exists() else [],
         )
         review_hashes = _promote_stage_files(
             run_id, store, artifact_dir, review_workspace,
             [queue_path.name, overrides_path.name],
         )
-        manifest["review_queue"] = {"item_count": len(queue)}
+        manifest["review_budget"] = {
+            **dict(persisted_review_budget),
+            "mandatory_count": review_plan.mandatory_count,
+            "sampled_count": review_plan.sampled_count,
+            "queue_count": len(review_plan.rows),
+        }
+        manifest["review_queue"] = {"item_count": len(review_plan.rows)}
         _checkpoint(
             run_id, store, artifact_dir, manifest, "review_queue",
             [queue_path, overrides_path], output_hashes=review_hashes,

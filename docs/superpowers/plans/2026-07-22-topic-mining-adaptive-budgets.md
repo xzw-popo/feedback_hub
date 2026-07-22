@@ -215,7 +215,7 @@ git commit -m "feat: scale topic candidates by time range"
 - Produces: `plan_review_queue(run_id, classifications, recall_by_id, *, contexts, sample_limit) -> ReviewQueuePlan`.
 - Persists: completed `manifest.review_budget` counts and `manifest.review_queue.item_count`.
 
-- [ ] **Step 1: Write failing review-plan tests**
+- [x] **Step 1: Write failing review-plan tests**
 
 Cover these exact properties:
 
@@ -243,13 +243,13 @@ def test_review_plan_is_stable_for_same_run_and_changes_hash_order_for_other_run
 
 Also assert an item in vector-only and negative-conflict strata appears once, unused quota is redistributed, and context/source fields remain unchanged.
 
-- [ ] **Step 2: Run review tests and confirm RED**
+- [x] **Step 2: Run review tests and confirm RED**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_mining_review.py -q`
 
 Expected: import or assertion failures because `ReviewQueuePlan` and `plan_review_queue` do not exist.
 
-- [ ] **Step 3: Implement deterministic stratified planning**
+- [x] **Step 3: Implement deterministic stratified planning**
 
 Add:
 
@@ -272,7 +272,7 @@ def _sample_key(run_id: str, item_id: str, stratum: str) -> tuple[str, str]:
 
 Allocate one item per non-empty stratum in round-robin order until `sample_limit` is exhausted or no new ID remains. This naturally redistributes unused capacity and deduplicates overlaps. A sampled row retains every applicable `review_reason`, not only the stratum that selected it.
 
-- [ ] **Step 4: Wire service persistence and compatibility**
+- [x] **Step 4: Wire service persistence and compatibility**
 
 When building a new review queue, call `plan_review_queue` with the persisted sample limit, persist `plan.rows`, and update:
 
@@ -286,7 +286,7 @@ manifest["review_budget"].update({
 
 If the existing review-queue stage is valid, do not invoke the planner and do not replace its artifact or obligations. For legacy manifests without `review_budget`, compute the policy once from the persisted spec and current config only when no valid queue exists.
 
-- [ ] **Step 5: Run focused Task 2 tests and confirm GREEN**
+- [x] **Step 5: Run focused Task 2 tests and confirm GREEN**
 
 Run:
 

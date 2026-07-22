@@ -586,6 +586,12 @@ def test_two_day_standard_service_classifies_at_most_one_hundred_sixty(tmp_path)
     assert manifest["recall_pool_count"] == 800
     assert manifest["classified_count"] == 160
     assert manifest["selected_candidate_count"] == 160
+    assert manifest["review_budget"] == {
+        "effective_days": 2, "per_day": 20, "maximum": 80,
+        "sample_limit": 40, "mandatory_count": 0,
+        "sampled_count": 40, "queue_count": 40,
+    }
+    assert manifest["funnel"]["review_queue_count"] == 40
     _review_every_queue_item(outcome, store)
 
     valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])

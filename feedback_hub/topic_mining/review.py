@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -12,17 +12,32 @@ from .classifier import ClassificationResult
 from .retrieval import RecallHit
 
 
-def build_review_queue(
+@dataclass(frozen=True)
+class ReviewQueuePlan:
+    rows: tuple[dict[str, Any], ...]
+    mandatory_count: int
+    sample_limit: int
+    sampled_count: int
+
+
+def plan_review_queue(
     run_id: str,
     classifications: Sequence[ClassificationResult],
     recall_by_id: Mapping[str, RecallHit],
     *,
     contexts: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-    per_label_sample: int = 20,
-) -> list[dict[str, Any]]:
-    if per_label_sample < 0 or per_label_sample > 20:
-        raise ValueError("per_label_sample must be between 0 and 20")
+    sample_limit: int,
+) -> ReviewQueuePlan:
+    if sample_limit < 0:
+        raise ValueError("sample_limit must not be negative")
     rows: dict[str, dict[str, Any]] = {}
+    mandatory_ids: set[str] = set()
+    strata: dict[str, list[str]] = {
+        "vector_only_match": [],
+        "negative_query_conflict": [],
+        "deterministic_label_sample": [],
+        "high_confidence_reject_sample": [],
+    }
     for result in classifications:
         if result.item_id in rows:
             raise ValueError(f"duplicate classification item_id: {result.item_id}")
@@ -32,31 +47,65 @@ def build_review_queue(
             raise ValueError(f"missing recall source for classification item_id: {result.item_id}")
         if result.needs_review:
             reasons.add("classifier_requested_review")
+            mandatory_ids.add(result.item_id)
         if result.label == "matched":
             if result.confidence < 0.75:
                 reasons.add("low_confidence_match")
-            if not any(channel in {"bm25", "lexical"} for channel in hit.channels):
+                mandatory_ids.add(result.item_id)
+            vector_only = not any(
+                channel in {"bm25", "lexical"} for channel in hit.channels
+            )
+            negative_conflict = bool(hit.negative_query_hits)
+            if vector_only:
                 reasons.add("vector_only_match")
-            if hit.negative_query_hits:
+                strata["vector_only_match"].append(result.item_id)
+            if negative_conflict:
                 reasons.add("negative_query_conflict")
+                strata["negative_query_conflict"].append(result.item_id)
+            if not vector_only and not negative_conflict:
+                reasons.add("deterministic_label_sample")
+                strata["deterministic_label_sample"].append(result.item_id)
+        elif result.confidence >= 0.85:
+            reasons.add("high_confidence_reject_sample")
+            strata["high_confidence_reject_sample"].append(result.item_id)
         rows[result.item_id] = _queue_row(
             result, hit, reasons,
             () if contexts is None else contexts.get(result.item_id, ()),
         )
-    for label in sorted({result.label for result in classifications}):
-        selected = _hash_select(run_id, [result for result in classifications if result.label == label], "deterministic_label_sample", per_label_sample)
-        for result in selected:
-            rows[result.item_id]["review_reasons"].append("deterministic_label_sample")
-    rejects = [result for result in classifications if result.label == "not_matched" and result.confidence >= 0.85]
-    for result in _hash_select(run_id, rejects, "high_confidence_reject_sample", 20):
-        rows[result.item_id]["review_reasons"].append("high_confidence_reject_sample")
-    queue = []
-    for item_id in sorted(rows):
-        row = rows[item_id]
-        row["review_reasons"] = sorted(set(row["review_reasons"]))
-        if row["review_reasons"]:
-            queue.append(row)
-    return queue
+
+    selected_ids: set[str] = set()
+    ordered: dict[str, list[str]] = {}
+    for name, item_ids in strata.items():
+        ordered[name] = sorted(
+            (item_id for item_id in item_ids if item_id not in mandatory_ids),
+            key=lambda item_id: _sample_key(run_id, item_id, name),
+        )
+    positions = {name: 0 for name in ordered}
+    while len(selected_ids) < sample_limit:
+        selected_this_round = False
+        for name, item_ids in ordered.items():
+            position = positions[name]
+            while position < len(item_ids) and item_ids[position] in selected_ids:
+                position += 1
+            positions[name] = position
+            if position >= len(item_ids):
+                continue
+            selected_ids.add(item_ids[position])
+            positions[name] += 1
+            selected_this_round = True
+            if len(selected_ids) == sample_limit:
+                break
+        if not selected_this_round:
+            break
+
+    queue_ids = mandatory_ids | selected_ids
+    queue = tuple(rows[item_id] for item_id in sorted(queue_ids))
+    return ReviewQueuePlan(
+        rows=queue,
+        mandatory_count=len(mandatory_ids),
+        sample_limit=sample_limit,
+        sampled_count=len(selected_ids),
+    )
 
 
 def apply_review_overrides(
@@ -150,8 +199,11 @@ def _queue_row(
     }
 
 
-def _hash_select(run_id: str, values: Sequence[ClassificationResult], reason: str, limit: int) -> list[ClassificationResult]:
-    return sorted(values, key=lambda value: (hashlib.sha256(f"{run_id}:{value.item_id}:{reason}".encode("utf-8")).hexdigest(), value.item_id))[:limit]
+def _sample_key(run_id: str, item_id: str, stratum: str) -> tuple[str, str]:
+    digest = hashlib.sha256(
+        f"{run_id}:{item_id}:{stratum}".encode("utf-8")
+    ).hexdigest()
+    return digest, item_id
 
 
 def _required_override_text(value: Any, field: str) -> str:
