@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 from .run_store import TopicRunStore
 from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
 from .contracts import load_persisted_topic_spec
-from .jsonl_io import load_jsonl_objects
+from feedback_hub.jsonl_io import load_jsonl_objects
 
 
 HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID", "数据截止时间"]

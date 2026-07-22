@@ -1,4 +1,4 @@
-"""Shared LF-delimited JSONL parsing for topic-mining artifacts."""
+"""Shared LF-delimited JSONL parsing for Feedback Hub artifacts."""
 from __future__ import annotations
 
 import json

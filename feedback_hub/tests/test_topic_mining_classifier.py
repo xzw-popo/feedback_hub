@@ -14,7 +14,7 @@ from feedback_hub.topic_mining.classifier import (
 )
 from feedback_hub.topic_mining.config import TopicMiningConfig
 from feedback_hub.topic_mining.contracts import validate_topic_spec
-from feedback_hub.topic_mining.jsonl_io import load_jsonl_objects
+from feedback_hub.jsonl_io import load_jsonl_objects
 from feedback_hub.topic_mining.retrieval import RecallHit
 
 

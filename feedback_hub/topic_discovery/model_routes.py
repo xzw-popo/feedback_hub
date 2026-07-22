@@ -12,6 +12,8 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from feedback_hub.jsonl_io import jsonl_text_records
+
 
 @dataclass(frozen=True)
 class ModelRoute:
@@ -444,7 +446,7 @@ def _load_checkpoint(path: Path, expected: dict[int, str]) -> dict[int, dict[str
     if not path.exists():
         return {}
     records: dict[int, dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in jsonl_text_records(path.read_bytes()):
         if not line.strip():
             continue
         record = json.loads(line)

@@ -172,6 +172,46 @@ def test_pauseable_scheduler_resume_skips_validated_checkpoint_rows(tmp_path) ->
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 3
 
 
+def test_pauseable_scheduler_resume_preserves_unicode_separator_in_checkpoint_reply(tmp_path) -> None:
+    jobs = [(0, "j0", {"value": 0})]
+    output_path = tmp_path / "rows.jsonl"
+    raw_reply = "第一段\u2028第二段"
+    calls: list[str] = []
+
+    def worker(index, key, payload, route):
+        calls.append(key)
+        return {
+            "key": key,
+            "raw_reply": raw_reply,
+            "route_source": route.name,
+        }, None
+
+    first_rows, first_stats = run_pauseable_model_jobs(
+        jobs,
+        worker,
+        routes=[_route()],
+        output_path=output_path,
+        concurrency_per_route=1,
+    )
+    calls.clear()
+
+    resumed_rows, resumed_stats = run_pauseable_model_jobs(
+        jobs,
+        worker,
+        routes=[_route()],
+        output_path=output_path,
+        concurrency_per_route=1,
+        resume=True,
+    )
+
+    assert first_stats["run_status"] == "completed"
+    assert calls == []
+    assert resumed_stats["run_status"] == "completed"
+    assert resumed_stats["resumed"] == 1
+    assert first_rows == resumed_rows
+    assert resumed_rows[0]["raw_reply"] == raw_reply
+
+
 def test_pauseable_scheduler_publishes_each_safe_checkpoint_before_more_work(tmp_path) -> None:
     jobs = [(index, f"j{index}", {"value": index}) for index in range(3)]
     output_path = tmp_path / "rows.jsonl"

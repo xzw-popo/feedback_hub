@@ -21,7 +21,7 @@ from feedback_hub.topic_discovery.model_routes import (
 
 from .config import TopicMiningConfig
 from .contracts import TopicSpec
-from .jsonl_io import jsonl_text_records
+from feedback_hub.jsonl_io import jsonl_text_records
 from .retrieval import RecallHit
 
 

@@ -24,7 +24,7 @@ from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates
 from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
-from .jsonl_io import load_jsonl_objects
+from feedback_hub.jsonl_io import load_jsonl_objects
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, persist_review_artifacts, plan_review_queue
 from .run_store import RunPublicationConflictError, TopicRunStore

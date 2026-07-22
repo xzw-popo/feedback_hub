@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every production JSONL reader in topic mining treat only LF (`\n`) as a record delimiter, while preserving each caller's existing error and recovery behavior.
+**Goal:** Make every production JSONL reader in topic mining, plus the user-authorized shared resumable checkpoint scheduler, treat only LF (`\n`) as a record delimiter while preserving each caller's existing error and recovery behavior.
 
-**Architecture:** Add a focused `jsonl_io.py` module with one LF-only text-record decoder and one strict JSON-object loader. Service, Export, and review API use the strict loader and retain their domain error mapping; classifier recovery code uses the text-record decoder so malformed-record tolerance remains unchanged.
+**Architecture:** Add a focused root-level `feedback_hub/jsonl_io.py` module with one LF-only text-record decoder and one strict JSON-object loader. Service, Export, and review API use the strict loader and retain their domain error mapping; classifier recovery and the authorized `topic_discovery/model_routes.py` checkpoint loader use the text-record decoder so their existing malformed-record behavior remains unchanged. The package-root placement prevents `topic_discovery` from depending on `topic_mining`.
 
 **Tech Stack:** Python 3.11, standard-library `json`, pytest, FastAPI TestClient, openpyxl
 
@@ -14,7 +14,7 @@
 - Treat only LF (`\n`) as the JSONL record delimiter.
 - Preserve `invalid_artifact` and `invalid review queue artifact` public error contracts.
 - Preserve classifier checkpoint/audit tolerance for individually malformed records.
-- Do not modify non-topic packages or human-authored text/configuration readers.
+- Do not modify non-topic packages or human-authored text/configuration readers, except the user-authorized shared checkpoint reader in `feedback_hub/topic_discovery/model_routes.py`.
 - Do not stage or modify the user-owned untracked root `WORKSPACE_GUIDE.md`.
 
 ---
@@ -22,7 +22,7 @@
 ### Task 1: Shared LF-only JSONL parser
 
 **Files:**
-- Create: `feedback_hub/topic_mining/jsonl_io.py`
+- Create: `feedback_hub/jsonl_io.py`
 - Create: `feedback_hub/tests/test_topic_mining_jsonl_io.py`
 
 **Interfaces:**
@@ -36,7 +36,7 @@ import json
 
 import pytest
 
-from feedback_hub.topic_mining.jsonl_io import (
+from feedback_hub.jsonl_io import (
     jsonl_text_records,
     load_jsonl_objects,
 )
@@ -73,12 +73,12 @@ Run:
 python3 -m pytest feedback_hub/tests/test_topic_mining_jsonl_io.py -q
 ```
 
-Expected: collection fails with `ModuleNotFoundError: feedback_hub.topic_mining.jsonl_io`.
+Expected: collection fails with `ModuleNotFoundError: feedback_hub.jsonl_io`.
 
 - [ ] **Step 3: Implement the shared parser**
 
 ```python
-"""Shared LF-delimited JSONL parsing for topic-mining artifacts."""
+"""Shared LF-delimited JSONL parsing for Feedback Hub artifacts."""
 from __future__ import annotations
 
 import json
@@ -109,7 +109,7 @@ Expected: `6 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add feedback_hub/topic_mining/jsonl_io.py feedback_hub/tests/test_topic_mining_jsonl_io.py
+git add feedback_hub/jsonl_io.py feedback_hub/tests/test_topic_mining_jsonl_io.py
 git commit -m "feat: add shared topic JSONL parser"
 ```
 
@@ -387,24 +387,26 @@ git commit -m "fix: unify classifier JSONL recovery parsing"
 
 ---
 
-### Task 5: Full regression and reader audit
+### Task 5: Full regression and reader audit, including the authorized shared scheduler
 
 **Files:**
-- Modify only if a failing regression exposes an in-scope omission.
+- Modify: `feedback_hub/topic_discovery/model_routes.py:443-458` only if the shared scheduler audit exposes the authorized omission.
+- Modify: `feedback_hub/tests/test_topic_model_routes.py` to cover a real scheduler resume from a checkpoint containing U+2028 in `row.raw_reply`.
+- Modify only if a failing regression exposes another in-scope omission.
 
 **Interfaces:**
 - Consumes: all code and tests from Tasks 1-4.
-- Produces: verified topic-mining suite and confirmation that all topic JSONL production readers use the shared LF-only boundary.
+- Produces: verified topic-mining suite and confirmation that all topic JSONL production readers plus the authorized shared scheduler checkpoint reader use the shared LF-only boundary.
 
 - [ ] **Step 1: Confirm no production JSONL reader still uses `splitlines()`**
 
 Run:
 
 ```bash
-rg -n "splitlines\(\)" feedback_hub/topic_mining
+rg -n "splitlines\(\)" feedback_hub/topic_mining feedback_hub/topic_discovery/model_routes.py
 ```
 
-Expected: no JSONL production reader matches. Any remaining match must be demonstrated to parse a non-JSONL text format or replaced with the shared helper and covered by a focused test.
+Expected: no topic JSONL or shared scheduler checkpoint reader matches. Any remaining match must be demonstrated to parse a non-JSONL text format or replaced with the shared helper and covered by a focused test.
 
 - [ ] **Step 2: Run the complete topic-mining suite**
 
@@ -412,6 +414,7 @@ Run:
 
 ```bash
 python3 -m pytest \
+  feedback_hub/tests/test_topic_model_routes.py \
   feedback_hub/tests/test_topic_mining_jsonl_io.py \
   feedback_hub/tests/test_topic_mining_service.py \
   feedback_hub/tests/test_topic_mining_export.py \

@@ -8,7 +8,7 @@ The first repair changed the two readers in `topic_mining/service.py`, but Expor
 
 ## Chosen approach
 
-Create a small `topic_mining/jsonl_io.py` module as the only authority for JSONL record boundaries in the topic-mining package.
+Create a small `feedback_hub/jsonl_io.py` module as the only authority for JSONL record boundaries used by topic mining and its user-authorized shared checkpoint scheduler. Keeping the helper at the package root lets `topic_discovery/model_routes.py` consume it without taking a reverse dependency on `topic_mining`.
 
 It provides two layers:
 
@@ -26,7 +26,9 @@ Replace JSONL parsing in all production code under `feedback_hub/topic_mining`:
 - review-queue API file/byte readers;
 - classifier batch checkpoint, partial audit, and audit-history readers.
 
-Do not replace `splitlines()` where the input is intentionally a human-authored text format, configuration file, CLI output, or test assertion. Non-topic packages are outside this repair.
+Also replace the JSONL checkpoint boundary in `feedback_hub/topic_discovery/model_routes.py`. This is a deliberately narrow shared-scheduler inclusion authorized after the topic-mining audit: its resumable checkpoint files carry topic-classifier model replies, and it must use the same LF-only boundary while retaining its existing malformed-record behavior.
+
+Do not replace `splitlines()` where the input is intentionally a human-authored text format, configuration file, CLI output, or test assertion. Other non-topic packages remain outside this repair.
 
 ## Error behavior
 
@@ -42,5 +44,6 @@ Do not replace `splitlines()` where the input is intentionally a human-authored 
 - Export tests reproduce the production failure from a separator inside a recall item and prove both JSONL and XLSX exports succeed without changing the text.
 - Review-queue API tests prove separators survive both file and byte parsing paths.
 - Classifier resume/audit tests prove separators inside stored model replies do not create phantom records.
+- The real `run_pauseable_model_jobs` resume path proves a completed checkpoint row containing U+2028 in `raw_reply` resumes without reprocessing or text mutation.
 - Existing malformed-JSON tests continue to fail with their original public errors.
 - The complete topic-mining test suite passes.

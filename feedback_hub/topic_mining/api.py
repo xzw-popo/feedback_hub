@@ -18,7 +18,7 @@ from fastapi.responses import Response
 from .budgets import candidate_budget, review_sample_budget
 from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
-from .jsonl_io import load_jsonl_objects
+from feedback_hub.jsonl_io import load_jsonl_objects
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (

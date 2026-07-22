@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from feedback_hub.topic_mining.jsonl_io import (
+from feedback_hub.jsonl_io import (
     jsonl_text_records,
     load_jsonl_objects,
 )

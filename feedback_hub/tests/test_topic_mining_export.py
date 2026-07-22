@@ -10,7 +10,7 @@ import hashlib
 
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.export import export_topic_run
-from feedback_hub.topic_mining.jsonl_io import load_jsonl_objects
+from feedback_hub.jsonl_io import load_jsonl_objects
 from feedback_hub.topic_mining.run_store import TopicRunStore
 from feedback_hub.topic_mining.service import RunVerificationError
 
