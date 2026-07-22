@@ -153,8 +153,12 @@
         },
         "platforms": {
           "items": {
-            "minLength": 1,
-            "type": "string"
+            "enum": [
+              "Win",
+              "Android",
+              "iOS",
+              "Mac"
+            ]
           },
           "type": "array"
         },

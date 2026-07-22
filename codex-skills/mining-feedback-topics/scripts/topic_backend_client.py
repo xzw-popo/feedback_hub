@@ -157,6 +157,18 @@ def _positive_days(value: str) -> int:
     return days
 
 
+def _platform_contract(capabilities: Any) -> dict[str, Any]:
+    if not isinstance(capabilities, dict):
+        raise LocalError("backend platform contract is missing")
+    scope_filters = capabilities.get("scope_filters")
+    if not isinstance(scope_filters, dict):
+        raise LocalError("backend platform contract is missing")
+    platforms = scope_filters.get("platforms")
+    if not isinstance(platforms, dict):
+        raise LocalError("backend platform contract is missing")
+    return platforms
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _ClientArgumentParser(description=__doc__)
     parser.add_argument("--base-url", help="Override FEEDBACK_TOPIC_API_URL")
@@ -196,12 +208,15 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         if isinstance(default_days, bool) or not isinstance(default_days, int) or default_days < 1:
             raise LocalError("backend default_time_days is invalid")
         window_days = arguments.window_days or default_days
+        platform_contract = _platform_contract(capabilities)
         validator = Path(__file__).with_name("validate_topic_spec.py")
         completed = subprocess.run(
             [
                 sys.executable, str(validator), arguments.spec,
                 "--default-now", available_through,
                 "--default-days", str(window_days),
+                "--platform-contract-json",
+                json.dumps(platform_contract, ensure_ascii=False, separators=(",", ":")),
                 "--output", arguments.output,
             ],
             text=True,

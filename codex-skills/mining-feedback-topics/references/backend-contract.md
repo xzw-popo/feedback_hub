@@ -4,8 +4,8 @@ Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). The client 
 
 | Command | Purpose |
 | --- | --- |
-| `capabilities` | Check supported schema, formats, read-only mode, statuses, `supported_units=["feedback"]`, `default_time_days`, `run_modes`, authentication policy, and `source_freshness`. Current standard policy: minimum 100 candidates, 80 per effective day, maximum 500; review QA samples 20 per effective day with maximum 80; `result_limit=null`. Exhaustive retains a 5000-candidate safety limit. |
-| `prepare-spec --spec FILE --output FILE [--window-days DAYS]` | Validate and atomically materialize a spec, anchoring absent times to the backend's latest complete `available_through`. |
+| `capabilities` | Check supported schema, formats, read-only mode, statuses, `supported_units=["feedback"]`, `scope_filters.platforms`, `default_time_days`, `run_modes`, authentication policy, and `source_freshness`. Current standard policy: minimum 100 candidates, 80 per effective day, maximum 500; review QA samples 20 per effective day with maximum 80; `result_limit=null`. Exhaustive retains a 5000-candidate safety limit. |
+| `prepare-spec --spec FILE --output FILE [--window-days DAYS]` | Validate and atomically materialize a spec, canonicalizing advertised platform aliases and anchoring absent times to the backend's latest complete `available_through`. |
 | `create-run --spec FILE` | Create or reuse an idempotent run. |
 | `get-run RUN_ID` | Poll status, stage, funnel, cutoff, watermark, and unresolved quality fields. |
 | `resume RUN_ID` | Resume a recoverable original run after repairing its blocker. |
@@ -36,6 +36,8 @@ python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output O
 ```
 
 `source_freshness.ready` must be true. Its `available_through` is the exclusive safe endpoint shared by all recorded source channels; it is distinct from `source_generation_ms`, which records when ingestion completed. `prepare-spec` always fetches this value. Never substitute the Agent's system or local clock. For “最近 N 天”, omit both boundaries and pass `--window-days N`. A complete explicit pair is validated unchanged and is never silently clamped; a one-sided pair remains invalid.
+
+`scope_filters.platforms` is the backend authority for platform spellings. `prepare-spec` consumes its canonical values and aliases before schema validation; never bypass the prepared file or manually substitute a different platform. Missing or malformed platform capabilities are a local configuration blocker. Unsupported or ambiguous values must be clarified or corrected before creating a run, never silently dropped from hard scope.
 
 Never infer paging offsets from `total`: follow the returned `next_offset` and stop only when it is null. `OVERRIDES_PATH` must contain one explicit decision for every item across all pages, even when confirming the existing label. Submit only after merging the complete queue. A decision that sets an evidence-free item to `matched` must include a non-empty `evidence` list whose strings are exact substrings of the returned `source_item.text` or `context_items` text. Partial or extra decision IDs keep verification blocked.
 

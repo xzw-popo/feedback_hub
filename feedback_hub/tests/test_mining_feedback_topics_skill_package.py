@@ -23,6 +23,19 @@ VALIDATOR = SKILL_ROOT / "scripts" / "validate_topic_spec.py"
 CLIENT = SKILL_ROOT / "scripts" / "topic_backend_client.py"
 
 
+def _platform_contract():
+    return {
+        "canonical_values": ["Win", "Android", "iOS", "Mac"],
+        "aliases": {
+            "Win": "Win", "Windows": "Win", "Win端": "Win", "Windows端": "Win",
+            "Android": "Android", "安卓": "Android", "Android端": "Android", "安卓端": "Android",
+            "iOS": "iOS", "iOS端": "iOS",
+            "Mac": "Mac", "macOS": "Mac", "Mac端": "Mac", "macOS端": "Mac",
+        },
+        "matching": "case_insensitive_ignore_whitespace",
+    }
+
+
 def _run_validator(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(VALIDATOR), *arguments, str(path)],
@@ -71,6 +84,30 @@ def _parse_frontmatter(path: Path) -> dict[str, object]:
 def test_skill_schema_matches_backend_contract():
     bundled = json.loads((SKILL_ROOT / "references/topic-spec.schema.json").read_text(encoding="utf-8"))
     assert bundled == topic_spec_json_schema()
+
+
+def test_skill_documents_platform_canonicalization_contract():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(
+        encoding="utf-8",
+    )
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(
+        encoding="utf-8",
+    )
+    schema = json.loads(
+        (SKILL_ROOT / "references" / "topic-spec.schema.json").read_text(
+            encoding="utf-8",
+        )
+    )
+
+    assert "Windows -> Win" in topic_spec
+    assert "安卓 -> Android" in topic_spec
+    assert "unsupported or ambiguous" in topic_spec
+    assert "scope_filters.platforms" in backend
+    assert "canonical platform" in skill
+    assert schema["properties"]["scope"]["properties"]["platforms"]["items"] == {
+        "enum": ["Win", "Android", "iOS", "Mac"],
+    }
 
 
 def test_validator_accepts_valid_json_and_rejects_bottom_layer_parameter(tmp_path):
@@ -269,6 +306,7 @@ def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path
     raw = valid_spec()
     raw["scope"].pop("start_time")
     raw["scope"].pop("end_time")
+    raw["scope"]["platforms"] = ["Windows", "WIN"]
     source = tmp_path / "source.json"
     prepared = tmp_path / "prepared.json"
     source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
@@ -283,6 +321,7 @@ def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path
                 "ready": True,
                 "available_through": "2026-07-22T16:40:01+08:00",
             },
+            "scope_filters": {"platforms": _platform_contract()},
         }, b"")
 
     monkeypatch.setattr(module, "_request", request)
@@ -296,6 +335,7 @@ def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path
     normalized = json.loads(stdout)
     assert normalized["scope"]["start_time"] == "2026-07-15T16:40:01+08:00"
     assert normalized["scope"]["end_time"] == "2026-07-22T16:40:01+08:00"
+    assert normalized["scope"]["platforms"] == ["Win"]
     assert json.loads(prepared.read_text(encoding="utf-8")) == normalized
     assert "start_time" not in json.loads(source.read_text(encoding="utf-8"))["scope"]
 
@@ -311,6 +351,7 @@ def test_client_prepare_spec_preserves_complete_explicit_time_pair(tmp_path, mon
             "ready": True,
             "available_through": "2026-07-22T16:40:01+08:00",
         },
+        "scope_filters": {"platforms": _platform_contract()},
     }, b""))
 
     code, stdout, stderr = _run_client(module, [
@@ -319,6 +360,68 @@ def test_client_prepare_spec_preserves_complete_explicit_time_pair(tmp_path, mon
 
     assert code == 0, stderr
     assert json.loads(stdout)["scope"] == valid_spec()["scope"]
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"), [("Windows", "Win"), ("安卓", "Android")],
+)
+def test_validator_requires_contract_to_prepare_platform_alias(
+    tmp_path, alias, canonical,
+):
+    raw = valid_spec()
+    raw["scope"]["platforms"] = [alias]
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    without_contract = _run_validator(source)
+    with_contract = _run_validator(
+        source,
+        "--platform-contract-json", json.dumps(_platform_contract(), ensure_ascii=False),
+    )
+
+    assert without_contract.returncode == 2
+    assert "scope.platforms" in without_contract.stderr
+    assert with_contract.returncode == 0, with_contract.stderr
+    assert json.loads(with_contract.stdout)["scope"]["platforms"] == [canonical]
+
+
+@pytest.mark.parametrize(
+    "platform_contract",
+    [
+        None,
+        {"canonical_values": ["Win"], "aliases": {"Win": "Win"}, "matching": "case_insensitive_ignore_whitespace"},
+        {"canonical_values": ["Win", "Android", "iOS", "Mac"], "aliases": {"Win": "Linux"}, "matching": "case_insensitive_ignore_whitespace"},
+    ],
+)
+def test_client_prepare_spec_fails_closed_on_missing_or_malformed_platform_contract(
+    tmp_path, monkeypatch, platform_contract,
+):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    prepared.write_text("old", encoding="utf-8")
+    capabilities = {
+        "default_time_days": 14,
+        "source_freshness": {
+            "ready": True,
+            "available_through": "2026-07-22T16:40:01+08:00",
+        },
+    }
+    if platform_contract is not None:
+        capabilities["scope_filters"] = {"platforms": platform_contract}
+    module = _load_client_module()
+    monkeypatch.setattr(
+        module, "_request", lambda *_args, **_kwargs: (capabilities, b""),
+    )
+
+    code, _, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 2
+    assert "platform" in stderr.lower()
+    assert "Traceback" not in stderr
+    assert prepared.read_text(encoding="utf-8") == "old"
 
 
 def test_client_prepare_spec_rejects_unready_source_without_output(tmp_path, monkeypatch):

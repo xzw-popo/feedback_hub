@@ -189,6 +189,99 @@ def _prepare_default_scope_times(
     scope["start_time"] = (end_time - timedelta(days=default_days)).isoformat()
 
 
+def _platform_key(value: str) -> str:
+    return "".join(value.split()).casefold()
+
+
+def _parse_platform_contract(raw: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise _error("--platform-contract-json", "must be valid JSON") from error
+    if not isinstance(value, dict):
+        raise _error("--platform-contract-json", "must be an object")
+    canonical_raw = value.get("canonical_values")
+    expected = ("Win", "Android", "iOS", "Mac")
+    if (
+        not isinstance(canonical_raw, list)
+        or tuple(canonical_raw) != expected
+        or any(not isinstance(item, str) for item in canonical_raw)
+    ):
+        raise _error(
+            "--platform-contract-json.canonical_values",
+            "must equal Win, Android, iOS, Mac in canonical order",
+        )
+    if value.get("matching") != "case_insensitive_ignore_whitespace":
+        raise _error(
+            "--platform-contract-json.matching",
+            "must equal case_insensitive_ignore_whitespace",
+        )
+    aliases_raw = value.get("aliases")
+    if not isinstance(aliases_raw, dict) or not aliases_raw:
+        raise _error(
+            "--platform-contract-json.aliases", "must be a non-empty object",
+        )
+    aliases: dict[str, str] = {}
+    for alias, target in aliases_raw.items():
+        if (
+            not isinstance(alias, str)
+            or not alias.strip()
+            or not isinstance(target, str)
+        ):
+            raise _error(
+                "--platform-contract-json.aliases",
+                "must map non-empty strings to canonical platform strings",
+            )
+        if target not in expected:
+            raise _error(
+                f"--platform-contract-json.aliases.{alias}",
+                "must target a canonical platform",
+            )
+        key = _platform_key(alias)
+        if key in aliases and aliases[key] != target:
+            raise _error(
+                "--platform-contract-json.aliases",
+                "contains conflicting normalized aliases",
+            )
+        aliases[key] = target
+    for canonical in expected:
+        if aliases.get(_platform_key(canonical)) != canonical:
+            raise _error(
+                "--platform-contract-json.aliases",
+                f"must contain the canonical self-alias: {canonical}",
+            )
+    return expected, aliases
+
+
+def _prepare_platform_scope(value: Any, raw_contract: str | None) -> None:
+    if raw_contract is None or not isinstance(value, dict):
+        return
+    canonical_values, aliases = _parse_platform_contract(raw_contract)
+    scope = value.get("scope")
+    if not isinstance(scope, dict):
+        return
+    platforms = scope.get("platforms", [])
+    if (
+        not isinstance(platforms, list)
+        or any(not isinstance(item, str) for item in platforms)
+    ):
+        return
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for index, platform in enumerate(platforms):
+        canonical = aliases.get(_platform_key(platform))
+        if canonical is None:
+            supported = ", ".join(canonical_values)
+            raise _error(
+                f"$.scope.platforms[{index}]",
+                f"unsupported platform: {platform}; supported platforms: {supported}",
+            )
+        if canonical not in seen:
+            seen.add(canonical)
+            normalized.append(canonical)
+    scope["platforms"] = normalized
+
+
 def _write_prepared_spec(path: Path, source_path: Path, raw: bytes) -> None:
     if path.suffix.lower() != ".json":
         raise _error("--output", "prepared topic spec path must end in .json")
@@ -221,6 +314,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--default-now", metavar="RFC3339")
     parser.add_argument("--default-days", type=int, metavar="DAYS")
+    parser.add_argument("--platform-contract-json", metavar="JSON")
     parser.add_argument("--output", metavar="PREPARED_SPEC_PATH")
     parser.add_argument("topic_spec_path", metavar="TOPIC_SPEC_PATH")
     args = parser.parse_args(arguments)
@@ -228,6 +322,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         value = _load_input(path)
         _prepare_default_scope_times(value, args.default_now, args.default_days)
+        _prepare_platform_scope(value, args.platform_contract_json)
         _validate(value, _load_schema(), "$")
         _validate_scope_time_order(value)
         rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
