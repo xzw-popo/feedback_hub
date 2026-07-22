@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
+from .platforms import CANONICAL_PLATFORMS, normalize_platforms
+
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -151,6 +153,7 @@ def _aware_datetime(value: Any, field: str) -> datetime:
 
 def _validate_topic_spec(
     raw: Mapping[str, Any], *, allow_legacy_conversation: bool,
+    canonicalize_platforms: bool,
 ) -> TopicSpec:
     raw = _require_mapping(raw, "topic_spec")
     _reject_unknown(raw, _TOP_LEVEL_FIELDS, "topic_spec")
@@ -171,10 +174,13 @@ def _validate_topic_spec(
     end_time = _aware_datetime(scope_raw["end_time"], "scope.end_time")
     if start_time >= end_time:
         raise ValueError("scope.end_time must be after scope.start_time")
+    platforms = _string_list(scope_raw.get("platforms", []), "scope.platforms")
+    if canonicalize_platforms:
+        platforms = normalize_platforms(platforms)
     scope = TopicScope(
         start_time=start_time,
         end_time=end_time,
-        platforms=_string_list(scope_raw.get("platforms", []), "scope.platforms"),
+        platforms=platforms,
         products=_string_list(scope_raw.get("products", []), "scope.products"),
         channels=_string_list(scope_raw.get("channels", []), "scope.channels"),
         versions=_string_list(scope_raw.get("versions", []), "scope.versions"),
@@ -252,12 +258,16 @@ def _validate_topic_spec(
 
 def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     """Validate a new untrusted spec against currently supported units."""
-    return _validate_topic_spec(raw, allow_legacy_conversation=False)
+    return _validate_topic_spec(
+        raw, allow_legacy_conversation=False, canonicalize_platforms=True,
+    )
 
 
 def load_persisted_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     """Load a previously accepted spec without reopening legacy units to new runs."""
-    return _validate_topic_spec(raw, allow_legacy_conversation=True)
+    return _validate_topic_spec(
+        raw, allow_legacy_conversation=True, canonicalize_platforms=False,
+    )
 
 
 def topic_spec_hash(spec: TopicSpec) -> str:
@@ -285,7 +295,10 @@ def topic_spec_json_schema() -> dict[str, Any]:
                 "properties": {
                     "start_time": {"type": "string", "format": "date-time"},
                     "end_time": {"type": "string", "format": "date-time"},
-                    "platforms": string_array,
+                    "platforms": {
+                        "type": "array",
+                        "items": {"enum": list(CANONICAL_PLATFORMS)},
+                    },
                     "products": string_array,
                     "channels": string_array,
                     "versions": string_array,

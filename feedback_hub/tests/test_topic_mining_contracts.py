@@ -77,6 +77,57 @@ def test_schema_allows_duplicate_list_values_that_normalizer_deduplicates():
     assert "uniqueItems" not in str(topic_spec_json_schema())
 
 
+@pytest.mark.parametrize(
+    ("raw_values", "expected"),
+    [
+        (["Win", "Android", "iOS", "Mac"], ("Win", "Android", "iOS", "Mac")),
+        ([" windows ", "WIN端"], ("Win",)),
+        (["安卓", "A N D R O I D端"], ("Android",)),
+        (["ios端"], ("iOS",)),
+        (["macOS", "M A C端"], ("Mac",)),
+    ],
+)
+def test_new_topic_spec_canonicalizes_platform_aliases(raw_values, expected):
+    raw = valid_spec()
+    raw["scope"]["platforms"] = raw_values
+
+    assert validate_topic_spec(raw).scope.platforms == expected
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["Linux", "PC", "电脑", "苹果", "iPhone", "iPad"],
+)
+def test_new_topic_spec_rejects_unsupported_or_ambiguous_platform(unsupported):
+    raw = valid_spec()
+    raw["scope"]["platforms"] = [unsupported]
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unsupported platform: {unsupported}; supported platforms: Win, Android, iOS, Mac",
+    ):
+        validate_topic_spec(raw)
+
+
+def test_alias_and_canonical_platform_have_same_new_run_hash():
+    alias = valid_spec()
+    alias["scope"]["platforms"] = ["Windows"]
+    canonical = valid_spec()
+
+    assert topic_spec_hash(validate_topic_spec(alias)) == topic_spec_hash(
+        validate_topic_spec(canonical),
+    )
+
+
+def test_persisted_topic_spec_preserves_legacy_noncanonical_platform_identity():
+    raw = valid_spec()
+    raw["scope"]["platforms"] = ["Windows"]
+
+    persisted = contracts.load_persisted_topic_spec(raw)
+
+    assert persisted.scope.platforms == ("Windows",)
+    assert persisted.to_dict()["scope"]["platforms"] == ["Windows"]
+
+
 def test_validate_topic_spec_rejects_unknown_lexical_hint_keys():
     raw = valid_spec()
     raw["lexical_hints"]["symptoms"] = ["遮挡"]
