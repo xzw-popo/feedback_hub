@@ -1,6 +1,6 @@
 # Review Policy
 
-Review a queue item for every listed reason:
+The backend returns every mandatory uncertainty plus a bounded deterministic QA sample. Review every returned queue item for each listed reason:
 
 | Reason | Check |
 | --- | --- |

@@ -506,6 +506,19 @@ def test_skill_guidance_does_not_embed_topic_rules_or_backend_tuning():
         assert value not in body
 
 
+def test_skill_uses_backend_owned_dynamic_budgets_and_uncapped_confirmed_exports():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8").lower()
+
+    assert "candidate tuning remains backend-owned" in body
+    assert "all verified matched rows" in backend
+    assert "result_limit=null" in backend
+    for value in ("minimum 100", "80 per effective day", "maximum 500"):
+        assert value in backend
+    assert "standard classification is always 500" not in body
+    assert "export at 100" not in body
+
+
 def test_skill_guidance_keeps_unverified_or_plan_only_work_inside_the_backend_contract():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "do not query source databases or vector tools directly" in body
@@ -682,7 +695,7 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
     assert "`mode: standard`" in topic_spec
     assert "`mode: exhaustive`" in topic_spec
     assert "prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH" in topic_spec
-    for value in ("500 candidates", "100 confirmed rows", "result_scope=representative", "possibly_more_matches=true"):
+    for value in ("minimum 100", "80 per effective day", "maximum 500", "result_scope=representative", "possibly_more_matches=true"):
         assert value in backend
     assert "authentication=internal_network_boundary" in backend
     for field in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):

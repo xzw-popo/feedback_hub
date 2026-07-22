@@ -427,7 +427,7 @@ git commit -m "feat: export every confirmed topic match"
 - Consumes: capabilities dynamic budget fields and uncapped result metadata.
 - Produces: Skill guidance that treats backend budgets as read-only policy and delivers every returned confirmed row.
 
-- [ ] **Step 1: Write failing Skill contract assertions**
+- [x] **Step 1: Write failing Skill contract assertions**
 
 Require the Skill and backend reference to say:
 
@@ -444,19 +444,19 @@ assert "export at 100" not in body
 
 Update the capabilities fixture expectation in package tests to include the dynamic policy object exactly.
 
-- [ ] **Step 2: Run package tests and confirm RED**
+- [x] **Step 2: Run package tests and confirm RED**
 
 Run: `python3 -m pytest feedback_hub/tests/test_mining_feedback_topics_skill_package.py -q`
 
 Expected: failures on old fixed-500/fixed-100 wording.
 
-- [ ] **Step 3: Update concise Skill workflow and references**
+- [x] **Step 3: Update concise Skill workflow and references**
 
 Document that standard scales from 100 to 500 based on backend-computed effective days; seven days and longer reach the 500 maximum. State that the Agent reviews every returned queue page but the backend bounds sampled QA and always retains mandatory review. State that export returns all confirmed matches and that `representative/possibly_more_matches=true` still discloses unclassified retrieved candidates.
 
 Do not expose `minimum`, `per_day`, `maximum`, or review sampling as topic-spec fields or CLI flags. Keep `SKILL.md` under its existing 500-word test limit by placing numeric detail in `references/backend-contract.md`.
 
-- [ ] **Step 4: Run full topic-mining regression and Skill validation**
+- [x] **Step 4: Run full topic-mining regression and Skill validation**
 
 Run:
 
