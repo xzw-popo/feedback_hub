@@ -23,4 +23,3 @@ Update `SKILL.md` and `references/backend-contract.md` to describe the packaged 
 - Reject an explicitly supplied blank or malformed override rather than silently falling back.
 - Assert Skill and backend-contract text no longer require configuration.
 - Run the Skill package suite and `quick_validate.py`.
-
