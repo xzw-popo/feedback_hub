@@ -103,6 +103,19 @@ def test_snapshot_and_scope_do_not_modify_source(tmp_path, source_db, valid_topi
     assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
 
 
+def test_windows_alias_filters_canonical_win_source_rows(tmp_path, source_db, valid_topic_spec):
+    raw = valid_topic_spec.to_dict()
+    raw["scope"]["platforms"] = ["Windows"]
+    spec = validate_topic_spec(raw)
+
+    snapshot = create_source_snapshot(source_db, tmp_path / "windows-snapshot.db")
+    items = fetch_scoped_items(snapshot.path, spec)
+
+    assert spec.scope.platforms == ("Win",)
+    assert {item["platform"] for item in items} == {"Win"}
+    assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
+
+
 def test_source_freshness_uses_latest_common_continuous_interval(tmp_path):
     path = tmp_path / "freshness.db"
     with sqlite3.connect(path) as connection:

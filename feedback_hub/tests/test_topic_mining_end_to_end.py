@@ -37,7 +37,7 @@ def _topic_spec(start: datetime, end: datetime):
         "scope": {
             "start_time": start.isoformat(),
             "end_time": end.isoformat(),
-            "platforms": ["Win"],
+            "platforms": ["Windows"],
             "products": ["微信输入法"],
         },
         "unit": "feedback",

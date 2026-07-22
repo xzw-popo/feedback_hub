@@ -85,6 +85,16 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     }
     assert payload["authentication"] == "internal_network_boundary"
     assert payload["supported_units"] == ["feedback"]
+    assert payload["scope_filters"]["platforms"] == {
+        "canonical_values": ["Win", "Android", "iOS", "Mac"],
+        "aliases": {
+            "Win": "Win", "Windows": "Win", "Win端": "Win", "Windows端": "Win",
+            "Android": "Android", "安卓": "Android", "Android端": "Android", "安卓端": "Android",
+            "iOS": "iOS", "iOS端": "iOS",
+            "Mac": "Mac", "macOS": "Mac", "Mac端": "Mac", "macOS端": "Mac",
+        },
+        "matching": "case_insensitive_ignore_whitespace",
+    }
     freshness = payload["source_freshness"]
     assert freshness["ready"] is True
     assert freshness["available_from"] == "2023-11-14T00:00:00+00:00"
@@ -108,6 +118,23 @@ def test_create_run_rejects_conversation_before_scheduling_worker(tmp_path, monk
 
     assert response.status_code == 422
     assert response.json()["detail"] == "unit must be feedback; conversation is not supported"
+    assert scheduled == []
+
+
+def test_create_run_rejects_unsupported_platform_before_scheduling_worker(tmp_path, monkeypatch):
+    import feedback_hub.topic_mining.api as api
+
+    scheduled = []
+    monkeypatch.setattr(
+        api, "start_run_async", lambda run_id, **_kwargs: scheduled.append(run_id),
+    )
+    payload = _spec()
+    payload["scope"]["platforms"] = ["Linux"]
+
+    response = _client(tmp_path).post("/api/topic-mining/runs", json=payload)
+
+    assert response.status_code == 422
+    assert "unsupported platform: Linux" in response.json()["detail"]
     assert scheduled == []
 
 

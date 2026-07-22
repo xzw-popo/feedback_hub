@@ -19,6 +19,7 @@ from .budgets import candidate_budget, review_sample_budget
 from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
 from feedback_hub.jsonl_io import load_jsonl_objects
+from .platforms import platform_capability
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (
@@ -212,6 +213,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             "run_statuses": ["pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted"],
             "read_only_source": True, "formal_label_writeback": False,
             "supported_units": ["feedback"],
+            "scope_filters": {"platforms": platform_capability()},
             "default_time_days": 14,
             "run_modes": {
                 "standard": {
