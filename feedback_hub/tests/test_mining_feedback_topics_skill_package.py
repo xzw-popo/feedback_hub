@@ -464,6 +464,17 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
     assert "call `apply-overrides` only once" in review
 
 
+def test_references_have_no_stdout_only_default_time_preparation_command():
+    for name in ("topic-spec.md", "backend-contract.md"):
+        text = (SKILL_ROOT / "references" / name).read_text(encoding="utf-8")
+        commands = [
+            line for line in text.splitlines()
+            if "python3 scripts/validate_topic_spec.py" in line and "--default-now" in line
+        ]
+        assert commands, name
+        assert all("--output PREPARED_SPEC_PATH" in command for command in commands), (name, commands)
+
+
 def test_review_contract_requires_complete_context_grounded_decisions():
     skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     contract = (
