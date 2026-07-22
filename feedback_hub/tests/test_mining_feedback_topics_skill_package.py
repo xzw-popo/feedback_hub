@@ -295,6 +295,47 @@ def test_client_uses_packaged_default_url_without_configuration(monkeypatch):
     )]
 
 
+def test_client_whitespace_environment_url_uses_packaged_default(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "   \t")
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, _, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 0, stderr
+    assert requested == [
+        "http://charvelxia-any2.devcloud.woa.com:8000/api/topic-mining/capabilities",
+    ]
+
+
+def test_client_rejects_nonempty_malformed_environment_url_without_request(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "not-a-url")
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 2
+    assert "absolute HTTP(S) URL" in stderr
+    assert not requested
+
+
 def test_client_cli_url_takes_precedence_over_environment(monkeypatch):
     monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://environment.internal")
     module = _load_client_module()
