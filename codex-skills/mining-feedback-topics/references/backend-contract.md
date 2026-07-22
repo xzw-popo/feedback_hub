@@ -4,7 +4,8 @@ Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). The client 
 
 | Command | Purpose |
 | --- | --- |
-| `capabilities` | Check supported schema, formats, read-only mode, statuses, `supported_units=["feedback"]`, `default_time_days`, `run_modes`, and authentication policy. Current policy: 14 days; standard candidate/result limits 500/100; exhaustive candidate safety limit 5000 and no ordinary result limit. |
+| `capabilities` | Check supported schema, formats, read-only mode, statuses, `supported_units=["feedback"]`, `default_time_days`, `run_modes`, authentication policy, and `source_freshness`. Current policy: 14 days; standard candidate/result limits 500/100; exhaustive candidate safety limit 5000 and no ordinary result limit. |
+| `prepare-spec --spec FILE --output FILE [--window-days DAYS]` | Validate and atomically materialize a spec, anchoring absent times to the backend's latest complete `available_through`. |
 | `create-run --spec FILE` | Create or reuse an idempotent run. |
 | `get-run RUN_ID` | Poll status, stage, funnel, cutoff, watermark, and unresolved quality fields. |
 | `resume RUN_ID` | Resume a recoverable original run after repairing its blocker. |
@@ -18,9 +19,9 @@ Run from the Skill directory and copy this complete sequence. Keep the override 
 
 ```bash
 python3 scripts/topic_backend_client.py capabilities
-# Materialize the advertised default only when both times are absent; complete pairs pass unchanged.
-# This atomically writes a distinct canonical JSON file and leaves TOPIC_SPEC_PATH unchanged:
-python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH
+# Add --window-days DAYS for an explicit whole-day relative range. Otherwise the advertised default applies.
+# Complete explicit pairs pass unchanged. This atomically writes a distinct file and leaves the source unchanged:
+python3 scripts/topic_backend_client.py prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH
 python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH
 python3 scripts/topic_backend_client.py get-run RUN_ID
 # Run only after repairing a pending-orphan, paused, or repairable failed run:
@@ -33,6 +34,8 @@ python3 scripts/topic_backend_client.py verify RUN_ID
 python3 scripts/topic_backend_client.py export RUN_ID --format xlsx
 python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH
 ```
+
+`source_freshness.ready` must be true. Its `available_through` is the exclusive safe endpoint shared by all recorded source channels; it is distinct from `source_generation_ms`, which records when ingestion completed. `prepare-spec` always fetches this value. Never substitute the Agent's system or local clock. For “最近 N 天”, omit both boundaries and pass `--window-days N`. A complete explicit pair is validated unchanged and is never silently clamped; a one-sided pair remains invalid.
 
 Never infer paging offsets from `total`: follow the returned `next_offset` and stop only when it is null. `OVERRIDES_PATH` must contain one explicit decision for every item across all pages, even when confirming the existing label. Submit only after merging the complete queue. A decision that sets an evidence-free item to `matched` must include a non-empty `evidence` list whose strings are exact substrings of the returned `source_item.text` or `context_items` text. Partial or extra decision IDs keep verification blocked.
 

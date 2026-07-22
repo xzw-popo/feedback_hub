@@ -265,6 +265,81 @@ def test_client_uses_environment_url_and_redacts_token(monkeypatch):
     assert "[REDACTED]" in stderr
 
 
+def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path, monkeypatch):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    requests = []
+
+    def request(base_url, token, method, path, payload=None, *, expect_json=True):
+        requests.append((method, path))
+        return ({
+            "default_time_days": 14,
+            "source_freshness": {
+                "ready": True,
+                "available_through": "2026-07-22T16:40:01+08:00",
+            },
+        }, b"")
+
+    monkeypatch.setattr(module, "_request", request)
+    code, stdout, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+        "--window-days", "7",
+    ])
+
+    assert code == 0, stderr
+    assert requests == [("GET", "/capabilities")]
+    normalized = json.loads(stdout)
+    assert normalized["scope"]["start_time"] == "2026-07-15T16:40:01+08:00"
+    assert normalized["scope"]["end_time"] == "2026-07-22T16:40:01+08:00"
+    assert json.loads(prepared.read_text(encoding="utf-8")) == normalized
+    assert "start_time" not in json.loads(source.read_text(encoding="utf-8"))["scope"]
+
+
+def test_client_prepare_spec_preserves_complete_explicit_time_pair(tmp_path, monkeypatch):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "default_time_days": 14,
+        "source_freshness": {
+            "ready": True,
+            "available_through": "2026-07-22T16:40:01+08:00",
+        },
+    }, b""))
+
+    code, stdout, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 0, stderr
+    assert json.loads(stdout)["scope"] == valid_spec()["scope"]
+
+
+def test_client_prepare_spec_rejects_unready_source_without_output(tmp_path, monkeypatch):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "default_time_days": 14,
+        "source_freshness": {"ready": False, "available_through": None},
+    }, b""))
+
+    code, _, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 2
+    assert "source freshness is not ready" in stderr
+    assert not prepared.exists()
+
+
 def test_client_uses_packaged_default_url_without_configuration(monkeypatch):
     monkeypatch.delenv("FEEDBACK_TOPIC_API_URL", raising=False)
     module = _load_client_module()
@@ -475,7 +550,7 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     commands = (
         "`capabilities`",
-        "validate_topic_spec.py",
+        "`prepare-spec --spec topic_spec_path --output prepared_spec_path`",
         "`create-run --spec prepared_spec_path`",
         "`get-run run_id`",
         "`resume run_id`",
@@ -569,14 +644,23 @@ def test_skill_current_internal_deployment_uses_default_with_optional_overrides(
 def test_skill_guidance_resolves_explicit_relative_time_without_questioning():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "treat an explicit relative time range as supplied scope" in body
-    assert "resolve it from the current date and timezone without asking again" in body
+    assert "resolve whole-day relative ranges from `available_through`" in body
+    assert "system or local current time" in body
+
+
+def test_skill_anchors_default_and_relative_windows_to_backend_waterline():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "source_freshness.available_through" in body
+    assert "`prepare-spec --spec topic_spec_path --output prepared_spec_path`" in body
+    assert "`--window-days days`" in body
+    assert "never use the agent's system or local current time" in body
 
 
 def test_backend_contract_has_one_copyable_complete_command_sequence():
     text = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
     commands = (
         "python3 scripts/topic_backend_client.py capabilities",
-        "python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH",
         "python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH",
         "python3 scripts/topic_backend_client.py get-run RUN_ID",
         "python3 scripts/topic_backend_client.py resume RUN_ID",
@@ -597,7 +681,7 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
 
     assert "`mode: standard`" in topic_spec
     assert "`mode: exhaustive`" in topic_spec
-    assert "--default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH" in topic_spec
+    assert "prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH" in topic_spec
     for value in ("500 candidates", "100 confirmed rows", "result_scope=representative", "possibly_more_matches=true"):
         assert value in backend
     assert "authentication=internal_network_boundary" in backend
@@ -610,15 +694,16 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
     assert "possibly_more_matches=true in either mode" in backend
 
 
-def test_references_have_no_stdout_only_default_time_preparation_command():
+def test_references_use_backend_anchored_atomic_time_preparation_command():
     for name in ("topic-spec.md", "backend-contract.md"):
         text = (SKILL_ROOT / "references" / name).read_text(encoding="utf-8")
         commands = [
             line for line in text.splitlines()
-            if "python3 scripts/validate_topic_spec.py" in line and "--default-now" in line
+            if "python3 scripts/topic_backend_client.py prepare-spec" in line
         ]
         assert commands, name
         assert all("--output PREPARED_SPEC_PATH" in command for command in commands), (name, commands)
+        assert "--default-now NOW" not in text
 
 
 def test_review_contract_requires_complete_context_grounded_decisions():

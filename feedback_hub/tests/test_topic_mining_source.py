@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from feedback_hub import db
+from feedback_hub.topic_mining import source as source_module
 from feedback_hub.topic_mining.contracts import load_persisted_topic_spec, validate_topic_spec
 from feedback_hub.topic_mining.source import (
     DataCoverageError,
@@ -100,6 +101,65 @@ def test_snapshot_and_scope_do_not_modify_source(tmp_path, source_db, valid_topi
     assert snapshot.coverage_watermark_ms == _ms(5)
     assert {item["platform"] for item in items} == {"Win"}
     assert [item["feedback_id"] for item in items] == ["f1", "f2", "f3"]
+
+
+def test_source_freshness_uses_latest_common_continuous_interval(tmp_path):
+    path = tmp_path / "freshness.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            [
+                ("a", _ms(0), _ms(1), _ms(1, 1)),
+                ("a", _ms(2), _ms(3), _ms(3, 1)),
+                ("a", _ms(3), _ms(5), _ms(5, 1)),
+                ("b", _ms(1), _ms(4), _ms(4, 1)),
+            ],
+        )
+
+    freshness = source_module.source_freshness(
+        path, observed_at_ms=_ms(6), sync_interval_seconds=1_200,
+    )
+
+    assert freshness == {
+        "ready": True,
+        "available_from_ms": _ms(2),
+        "available_through_ms": _ms(4),
+        "source_generation_ms": _ms(5, 1),
+        "observed_at_ms": _ms(6),
+        "freshness_lag_seconds": 7_200,
+        "sync_interval_seconds": 1_200,
+    }
+
+
+def test_source_freshness_reports_unavailable_without_coverage(tmp_path):
+    path = tmp_path / "empty.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+
+    freshness = source_module.source_freshness(
+        path, observed_at_ms=_ms(6), sync_interval_seconds=1_200,
+    )
+
+    assert freshness == {
+        "ready": False,
+        "available_from_ms": None,
+        "available_through_ms": None,
+        "source_generation_ms": None,
+        "observed_at_ms": _ms(6),
+        "freshness_lag_seconds": None,
+        "sync_interval_seconds": 1_200,
+    }
 
 
 def test_snapshot_can_be_frozen_at_the_run_watermark(tmp_path, source_db):

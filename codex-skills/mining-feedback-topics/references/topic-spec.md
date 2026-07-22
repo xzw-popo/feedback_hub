@@ -18,7 +18,7 @@ Build one JSON or YAML object with these required fields:
 | `classification_labels` | Exactly `matched` and `not_matched`, each with `id` and `meaning`. |
 | `output` | `preferred_format` (`xlsx` or `jsonl`) and a non-empty subset of the supported required fields: `feedback_text`, `feedback_time`, and `source_url`. The backend rejects every other field name. |
 
-Treat scope as a hard metadata filter; treat criteria, examples, and hints as semantic guidance. Populate every hard-scope list only from values explicit in the current request; leave unstated lists empty unless one material question is required. Never infer scope from the workspace, examples, prior runs, or likely product context. When both time boundaries are absent, read `default_time_days` from capabilities and prepare an exact window ending at a fixed timezone-aware current time; the current policy is 14 days. Use the prepared-file command below. When exactly one boundary is present, or a timezone cannot be resolved, ask one direct question for start, end, and timezone instead of inventing the missing value. Resolve an explicit relative range without asking.
+Treat scope as a hard metadata filter; treat criteria, examples, and hints as semantic guidance. Populate every hard-scope list only from values explicit in the current request; leave unstated lists empty unless one material question is required. Never infer scope from the workspace, examples, prior runs, or likely product context. When both time boundaries are absent, `prepare-spec` reads `default_time_days` and anchors the exact window to the backend's latest complete `source_freshness.available_through`; the current policy is 14 days. Never use the Agent's system or local current time. For an explicit whole-day relative range, omit both boundaries and add `--window-days DAYS`. When exactly one boundary is present, or a timezone cannot be resolved, ask one direct question for start, end, and timezone instead of inventing the missing value. A complete explicit pair passes unchanged and is never silently clamped.
 
 Use `mode: standard` for ordinary requests, including long ranges such as six months. Use `mode: exhaustive` only when the user explicitly asks for all, complete, or exhaustive results. Standard bounds cost and returns a representative list when limits apply; exhaustive increases coverage but still obeys backend safety limits, which must be disclosed.
 
@@ -29,7 +29,7 @@ For example, `语音输入结束后文字不上屏` can include “speech ends b
 Prepare a separate canonical JSON file before creating a run:
 
 ```bash
-python3 scripts/validate_topic_spec.py --default-now NOW --default-days 14 --output PREPARED_SPEC_PATH TOPIC_SPEC_PATH
+python3 scripts/topic_backend_client.py prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH
 ```
 
 The validator leaves `TOPIC_SPEC_PATH` unchanged, atomically writes `PREPARED_SPEC_PATH`, and prints the same canonical JSON to stdout for compatibility. It rejects using the source path as output and removes temporary files after write errors. Pass only `PREPARED_SPEC_PATH` to `create-run`. Read the bundled [schema](topic-spec.schema.json) when exact structure is needed.

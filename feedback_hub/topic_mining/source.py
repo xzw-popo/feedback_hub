@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -46,6 +47,64 @@ class SourceReadinessError(ValueError):
 
 
 _FIXED_SOURCE_PRODUCT = "微信输入法"
+
+
+def source_freshness(
+    source_path: Path,
+    *,
+    observed_at_ms: int | None = None,
+    sync_interval_seconds: int = 1_200,
+) -> dict[str, int | bool | None]:
+    """Describe the newest complete interval shared by all recorded channels."""
+    observed = int(time.time() * 1000) if observed_at_ms is None else int(observed_at_ms)
+    unavailable: dict[str, int | bool | None] = {
+        "ready": False,
+        "available_from_ms": None,
+        "available_through_ms": None,
+        "source_generation_ms": None,
+        "observed_at_ms": observed,
+        "freshness_lag_seconds": None,
+        "sync_interval_seconds": int(sync_interval_seconds),
+    }
+    try:
+        with _readonly_connection(Path(source_path)) as connection:
+            rows = connection.execute(
+                """SELECT channel, start_ts_ms, end_ts_ms, completed_at_ms
+                   FROM feedback_source_coverage
+                   WHERE TRIM(channel) <> '' AND end_ts_ms > start_ts_ms
+                   ORDER BY channel, start_ts_ms, end_ts_ms"""
+            ).fetchall()
+    except sqlite3.Error:
+        return unavailable
+    if not rows:
+        return unavailable
+
+    by_channel: dict[str, list[tuple[int, int]]] = {}
+    generation_ms = max(int(row[3]) for row in rows)
+    for channel, start_ms, end_ms, _completed_at_ms in rows:
+        intervals = by_channel.setdefault(str(channel), [])
+        start, end = int(start_ms), int(end_ms)
+        if intervals and start <= intervals[-1][1]:
+            previous_start, previous_end = intervals[-1]
+            intervals[-1] = (previous_start, max(previous_end, end))
+        else:
+            intervals.append((start, end))
+
+    latest_segments = [intervals[-1] for intervals in by_channel.values() if intervals]
+    common_start = max(start for start, _end in latest_segments)
+    common_end = min(end for _start, end in latest_segments)
+    if common_start >= common_end:
+        unavailable["source_generation_ms"] = generation_ms
+        return unavailable
+    return {
+        "ready": True,
+        "available_from_ms": common_start,
+        "available_through_ms": common_end,
+        "source_generation_ms": generation_ms,
+        "observed_at_ms": observed,
+        "freshness_lag_seconds": max(0, (observed - common_end) // 1000),
+        "sync_interval_seconds": int(sync_interval_seconds),
+    }
 
 
 def _validate_source_filters(spec: TopicSpec) -> None:

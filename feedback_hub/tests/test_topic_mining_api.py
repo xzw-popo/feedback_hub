@@ -80,6 +80,15 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     }
     assert payload["authentication"] == "internal_network_boundary"
     assert payload["supported_units"] == ["feedback"]
+    freshness = payload["source_freshness"]
+    assert freshness["ready"] is True
+    assert freshness["available_from"] == "2023-11-14T00:00:00+00:00"
+    assert freshness["available_through"] == "2023-11-16T00:00:00+00:00"
+    assert freshness["available_from_ms"] < freshness["available_through_ms"]
+    assert freshness["source_generation_ms"] >= freshness["available_through_ms"]
+    assert freshness["observed_at_ms"] >= freshness["source_generation_ms"]
+    assert freshness["freshness_lag_seconds"] >= 0
+    assert freshness["sync_interval_seconds"] == 1_200
 
 
 def test_create_run_rejects_conversation_before_scheduling_worker(tmp_path, monkeypatch):

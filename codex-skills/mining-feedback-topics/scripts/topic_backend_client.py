@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -146,11 +147,25 @@ def _review_limit(value: str) -> int:
     return limit
 
 
+def _positive_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("window days must be an integer") from error
+    if days < 1:
+        raise argparse.ArgumentTypeError("window days must be at least 1")
+    return days
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _ClientArgumentParser(description=__doc__)
     parser.add_argument("--base-url", help="Override FEEDBACK_TOPIC_API_URL")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("capabilities")
+    prepare = subparsers.add_parser("prepare-spec")
+    prepare.add_argument("--spec", required=True)
+    prepare.add_argument("--output", required=True)
+    prepare.add_argument("--window-days", type=_positive_days)
     create = subparsers.add_parser("create-run"); create.add_argument("--spec", required=True)
     get = subparsers.add_parser("get-run"); get.add_argument("run_id")
     resume = subparsers.add_parser("resume"); resume.add_argument("run_id")
@@ -169,6 +184,39 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
     if command == "capabilities":
         response, _ = _request(base_url, token, "GET", "/capabilities")
         return response
+    if command == "prepare-spec":
+        capabilities, _ = _request(base_url, token, "GET", "/capabilities")
+        freshness = capabilities.get("source_freshness") if isinstance(capabilities, dict) else None
+        if not isinstance(freshness, dict) or freshness.get("ready") is not True:
+            raise LocalError("source freshness is not ready")
+        available_through = freshness.get("available_through")
+        if not isinstance(available_through, str) or not available_through.strip():
+            raise LocalError("source freshness has no valid available_through")
+        default_days = capabilities.get("default_time_days")
+        if isinstance(default_days, bool) or not isinstance(default_days, int) or default_days < 1:
+            raise LocalError("backend default_time_days is invalid")
+        window_days = arguments.window_days or default_days
+        validator = Path(__file__).with_name("validate_topic_spec.py")
+        completed = subprocess.run(
+            [
+                sys.executable, str(validator), arguments.spec,
+                "--default-now", available_through,
+                "--default-days", str(window_days),
+                "--output", arguments.output,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise LocalError(completed.stderr.strip() or "topic spec preparation failed")
+        try:
+            prepared = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise LocalError("topic spec preparation returned invalid JSON") from error
+        if not isinstance(prepared, dict):
+            raise LocalError("topic spec preparation returned invalid JSON")
+        return prepared
     if command == "create-run":
         response, _ = _request(base_url, token, "POST", "/runs", _read_json(arguments.spec))
         return response

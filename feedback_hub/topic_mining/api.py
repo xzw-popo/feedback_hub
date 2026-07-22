@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from fastapi.responses import Response
 from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
-from .source import create_source_snapshot, validate_source_coverage
+from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (
     RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
@@ -188,6 +189,22 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
 
     @router.get("/capabilities", dependencies=[Depends(require_token)])
     def capabilities() -> dict[str, Any]:
+        freshness = source_freshness(
+            config.source_db_path,
+            sync_interval_seconds=config.source_sync_interval_seconds,
+        )
+        freshness["available_from"] = (
+            datetime.fromtimestamp(
+                freshness["available_from_ms"] / 1000, tz=timezone.utc,
+            ).isoformat()
+            if freshness["available_from_ms"] is not None else None
+        )
+        freshness["available_through"] = (
+            datetime.fromtimestamp(
+                freshness["available_through_ms"] / 1000, tz=timezone.utc,
+            ).isoformat()
+            if freshness["available_through_ms"] is not None else None
+        )
         return {
             "schema_versions": [1], "preferred_formats": ["xlsx", "jsonl"],
             "run_statuses": ["pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted"],
@@ -205,6 +222,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
                 },
             },
             "authentication": "internal_network_boundary",
+            "source_freshness": freshness,
         }
 
     @router.post("/runs", dependencies=[Depends(require_token)])

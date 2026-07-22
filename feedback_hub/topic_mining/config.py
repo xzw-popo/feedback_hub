@@ -19,6 +19,9 @@ class TopicMiningConfig:
     vector_api_token: str = os.environ.get("TOPIC_VECTOR_API_TOKEN", "")
     vector_index: str = os.environ.get("TOPIC_VECTOR_INDEX", "feedback-items-v1")
     vector_max_lag_seconds: int = int(os.environ.get("TOPIC_VECTOR_MAX_LAG_SECONDS", "21600"))
+    source_sync_interval_seconds: int = int(os.environ.get(
+        "TOPIC_SOURCE_SYNC_INTERVAL_SECONDS", "1200"
+    ))
     api_token: str = os.environ.get("TOPIC_MINING_API_TOKEN", "")
     # Worker recovery policy is backend-owned and intentionally not exposed as
     # a client or deployment input. Tests may construct a shorter lease.
