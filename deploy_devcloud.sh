@@ -209,9 +209,6 @@ on_exit() {
 
 install_deploy_traps
 
-if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
-  cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
-fi
 if vector_index_state; then
   VECTOR_REQUIRED=1
 else
@@ -222,6 +219,9 @@ else
     echo "[deploy] invalid active vector index; refusing to stop or swap code." >&2
     exit 1
   fi
+fi
+if [ -x "${OLD}/scripts/devcloud_runtime.sh" ]; then
+  cd "$OLD" && APP_PORT="$APP_PORT" scripts/devcloud_runtime.sh stop || true
 fi
 if [ "$VECTOR_REQUIRED" = "1" ] && [ -x "${OLD}/scripts/vector_runtime.sh" ]; then
   cd "$OLD" && scripts/vector_runtime.sh stop

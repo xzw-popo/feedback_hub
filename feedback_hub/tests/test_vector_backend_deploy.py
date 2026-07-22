@@ -336,6 +336,40 @@ def test_remote_deploy_treats_malformed_active_pointer_as_hard_error_before_swap
     assert "unexpected-mv" not in result.stderr
 
 
+def test_remote_deploy_invalid_index_preflight_does_not_stop_running_services_or_move_code(tmp_path):
+    remote = tmp_path / "remote-deploy.sh"
+    remote.write_text(_remote_deploy_script(), encoding="utf-8")
+    old = _remote_old_tree(tmp_path)
+    calls = tmp_path / "runtime-calls"
+    for runtime in ("devcloud_runtime.sh", "vector_runtime.sh"):
+        _write_executable(
+            old / "scripts" / runtime,
+            "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"${RUNTIME_CALLS:?}\"\n",
+        )
+    pointer = old / "feedback_hub" / "data" / "vector_index" / "active-generation.json"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text('{"generation_id":"../unsafe"}', encoding="utf-8")
+    archive = _archive_for_remote_deploy(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "mv", "#!/bin/sh\nprintf 'mv\\n' >> \"${RUNTIME_CALLS:?}\"\nexit 88\n")
+
+    result = subprocess.run(
+        ["bash", str(remote), str(old), str(archive), "8000"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "RUNTIME_CALLS": str(calls),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "invalid active vector index" in result.stderr
+    assert not calls.exists(), calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
 def test_remote_deploy_treats_malformed_root_manifest_as_hard_error_before_swap(tmp_path):
     remote = tmp_path / "remote-deploy.sh"
     remote.write_text(_remote_deploy_script(), encoding="utf-8")
