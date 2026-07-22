@@ -10,6 +10,7 @@ import hashlib
 
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.export import export_topic_run
+from feedback_hub.topic_mining.jsonl_io import load_jsonl_objects
 from feedback_hub.topic_mining.run_store import TopicRunStore
 from feedback_hub.topic_mining.service import RunVerificationError
 
@@ -102,6 +103,44 @@ def _persist_verified_manifest(
         json.dumps(manifest), encoding="utf-8",
     )
     return manifest
+
+
+@pytest.mark.parametrize("export_format", ["jsonl", "xlsx"])
+def test_export_preserves_unicode_separator_in_recall_pool(tmp_path, export_format):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), CUTOFF_MS)
+    artifact_dir = Path(run["artifact_dir"])
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(
+        json.dumps(_row(run["run_id"]), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    recall_rows = []
+    for item_id, text in (
+        ("f-1", "游戏全屏工具栏一直显示"),
+        ("f-2", "第一段\u2028第二段"),
+    ):
+        item = dict(_row(run["run_id"], item_id)["source_item"])
+        item["text"] = text
+        recall_rows.append({
+            "item_id": item_id, "item": item, "channels": ["bm25"],
+            "fused_score": 1.0, "fused_rank": len(recall_rows) + 1,
+            "channel_ranks": {"bm25": len(recall_rows) + 1},
+            "raw_scores": {"bm25": 1.0}, "query_ids": ["q1"],
+            "negative_query_hits": [],
+        })
+    recalls = artifact_dir / "recall_candidates.jsonl"
+    recalls.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in recall_rows),
+        encoding="utf-8",
+    )
+    _persist_verified_manifest(store, run, final, recalls)
+
+    exported = export_topic_run(run["run_id"], export_format, store=store)
+
+    assert exported.is_file()
+    persisted = load_jsonl_objects(recalls.read_bytes())
+    assert persisted[1]["item"]["text"] == "第一段\u2028第二段"
 
 
 def test_export_has_unique_ids_links_and_evidence(tmp_path):

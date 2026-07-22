@@ -24,6 +24,7 @@ from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates
 from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
+from .jsonl_io import load_jsonl_objects
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, persist_review_artifacts, plan_review_queue
 from .run_store import RunPublicationConflictError, TopicRunStore
@@ -1546,15 +1547,8 @@ def _snapshot_row_count(artifact_dir: Path) -> int:
 def _read_required_jsonl(path: Path, manifest: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     raw = read_verified_artifact_bytes(manifest, path) if manifest is not None else _read_verified_bytes_from_path(path)
     try:
-        values = []
-        for line in raw.decode("utf-8").split("\n"):
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError("not object")
-                values.append(value)
-        return values
-    except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        return load_jsonl_objects(raw)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
 
 
@@ -1691,18 +1685,10 @@ def _jsonl_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
-    values: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").split("\n")
-        for line in lines:
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise RunVerificationError("invalid_artifact")
-                values.append(value)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return load_jsonl_objects(path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
-    return values
 
 
 def _read_json(path: Path, default: Any) -> Any:

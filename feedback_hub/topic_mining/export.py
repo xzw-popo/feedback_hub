@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from .run_store import TopicRunStore
 from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
 from .contracts import load_persisted_topic_spec
+from .jsonl_io import load_jsonl_objects
 
 
 HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID", "数据截止时间"]
@@ -34,8 +35,10 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     )
     _validate_run_identity(run, spec, data_cutoff_ms)
     try:
-        rows = [json.loads(line) for line in read_verified_artifact_bytes(manifest, final_path).decode("utf-8").splitlines() if line.strip()]
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        rows = load_jsonl_objects(
+            read_verified_artifact_bytes(manifest, final_path),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
     _validate_final_rows(
         rows, spec, expected_run_id=run_id,
@@ -104,9 +107,9 @@ def _verified_recall_by_id(
     try:
         recalls = [
             _recall_from_dict(row)
-            for line in read_verified_artifact_bytes(manifest, recall_path).decode("utf-8").splitlines()
-            if line.strip()
-            for row in [json.loads(line)]
+            for row in load_jsonl_objects(
+                read_verified_artifact_bytes(manifest, recall_path),
+            )
         ]
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
