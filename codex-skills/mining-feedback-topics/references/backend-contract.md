@@ -1,6 +1,6 @@
 # Backend Contract
 
-Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). Configure `FEEDBACK_TOPIC_API_URL`. The current internal-network/VPN deployment advertises `authentication=internal_network_boundary`, so `FEEDBACK_TOPIC_API_TOKEN` is unused; preserve the optional client support only for a future deployment that explicitly requires authorization. Do not place either value in a topic spec, artifact, or transcript.
+Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). The client defaults to `http://charvelxia-any2.devcloud.woa.com:8000`. Both URL overrides are optional: pass `--base-url` or set non-empty `FEEDBACK_TOPIC_API_URL`. The current internal-network/VPN deployment advertises `authentication=internal_network_boundary`, so `FEEDBACK_TOPIC_API_TOKEN` is unused; preserve the optional client support only for a future deployment that explicitly requires authorization. Do not place either value in a topic spec, artifact, or transcript.
 
 | Command | Purpose |
 | --- | --- |

@@ -265,6 +265,77 @@ def test_client_uses_environment_url_and_redacts_token(monkeypatch):
     assert "[REDACTED]" in stderr
 
 
+def test_client_uses_packaged_default_url_without_configuration(monkeypatch):
+    monkeypatch.delenv("FEEDBACK_TOPIC_API_URL", raising=False)
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"authentication":"internal_network_boundary"}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append((request.full_url, timeout))
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, stdout, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 0, stderr
+    assert json.loads(stdout) == {"authentication": "internal_network_boundary"}
+    assert requested == [(
+        "http://charvelxia-any2.devcloud.woa.com:8000/api/topic-mining/capabilities",
+        30,
+    )]
+
+
+def test_client_cli_url_takes_precedence_over_environment(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://environment.internal")
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, _, stderr = _run_client(
+        module, ["--base-url", "https://command.internal", "capabilities"],
+    )
+
+    assert code == 0, stderr
+    assert requested == ["https://command.internal/api/topic-mining/capabilities"]
+
+
+def test_client_rejects_explicit_blank_url_instead_of_falling_back(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://environment.internal")
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(module, ["--base-url", "   ", "capabilities"])
+
+    assert code == 2
+    assert "base URL must not be blank" in stderr
+    assert not requested
+
+
 def test_skill_frontmatter_has_only_name_and_description():
     metadata = _parse_frontmatter(SKILL_ROOT / "SKILL.md")
     assert set(metadata) == {"name", "description"}
@@ -439,11 +510,19 @@ def test_skill_uses_only_backend_returned_result_scope_values():
     assert "never invent a result_scope value" in body
 
 
-def test_skill_current_internal_deployment_requires_only_url():
+def test_skill_current_internal_deployment_uses_default_with_optional_overrides():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2]
     assert "FEEDBACK_TOPIC_API_URL" in body
     assert "FEEDBACK_TOPIC_API_TOKEN" in body
+    assert "packaged internal default" in body
+    assert "optional override" in body
+    assert "Require `FEEDBACK_TOPIC_API_URL`" not in body
     assert "unused for the current internal deployment" in body
+
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    assert "http://charvelxia-any2.devcloud.woa.com:8000" in backend
+    assert "Both URL overrides are optional" in backend
+    assert "Configure `FEEDBACK_TOPIC_API_URL`" not in backend
 
 
 def test_skill_guidance_resolves_explicit_relative_time_without_questioning():

@@ -5,9 +5,9 @@ description: Use when a user needs to mine, collect, or audit a one-off feedback
 
 # Mining Feedback Topics
 
-Let the backend do data work; use AI judgment for topic boundaries.
+Let backend do data work; use AI judgment for topic boundaries.
 
-Use only the bundled client. Do not query source databases or vector tools directly. Require `FEEDBACK_TOPIC_API_URL`; `FEEDBACK_TOPIC_API_TOKEN` is unused for the current internal deployment. For plan-only requests, do not claim artifacts, results, or validation. Do not expand the user's named object into a different object or product. Keep each user-named target object and behavior as required inclusion conditions; use only meaning-preserving paraphrases. Put unrequested adjacent objects or behaviors only in exclusion criteria.
+Use the bundled client. Do not query source databases or vector tools directly. Use the packaged internal default on company network/VPN; `FEEDBACK_TOPIC_API_URL` is an optional override. `FEEDBACK_TOPIC_API_TOKEN` is unused for the current internal deployment. For plan-only requests, do not claim artifacts, results, or validation. Do not expand the user's named object into a different object or product. Keep each user-named target object and behavior as required inclusion conditions; use only meaning-preserving paraphrases. Put unrequested adjacent objects or behaviors only in exclusion criteria.
 
 A blocked pre-run response contains four slots: proposed inclusion, proposed exclusion, one material scope question when needed, and the service or configuration blocker. Treat an explicit relative time range as supplied scope; resolve it from the current date and timezone without asking again. With neither boundary, default to the most recent 14 days from capabilities `default_time_days=14`; never default to all history. When exactly one boundary is supplied or timezone is unknowable, ask: “What start time, end time, and timezone should this run use?”
 

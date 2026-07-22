@@ -17,6 +17,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
 TIMEOUT_SECONDS = 30
+DEFAULT_BASE_URL = "http://charvelxia-any2.devcloud.woa.com:8000"
 
 
 class LocalError(Exception):
@@ -42,9 +43,13 @@ def _redact(text: str, token: str) -> str:
 
 
 def _base_url(value: str | None) -> str:
-    base_url = value or os.environ.get("FEEDBACK_TOPIC_API_URL", "")
-    if not base_url.strip():
-        raise LocalError("FEEDBACK_TOPIC_API_URL or --base-url is required")
+    if value is not None:
+        if not value.strip():
+            raise LocalError("API base URL must not be blank")
+        base_url = value
+    else:
+        environment_url = os.environ.get("FEEDBACK_TOPIC_API_URL", "")
+        base_url = environment_url if environment_url.strip() else DEFAULT_BASE_URL
     try:
         parsed = urlsplit(base_url)
         # Accessing port forces urllib to validate malformed netloc values.
