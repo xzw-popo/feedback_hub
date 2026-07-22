@@ -75,7 +75,12 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
 
     assert payload["default_time_days"] == 14
     assert payload["run_modes"] == {
-        "standard": {"candidate_limit": 500, "result_limit": 100},
+        "standard": {
+            "candidate_limit": 500,
+            "result_limit": None,
+            "candidate_budget": {"minimum": 100, "per_day": 80, "maximum": 500},
+            "review_sample_budget": {"per_day": 20, "maximum": 80},
+        },
         "exhaustive": {"candidate_limit": 5000, "result_limit": None},
     }
     assert payload["authentication"] == "internal_network_boundary"
@@ -213,6 +218,15 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert first["scheduled"] is True
     assert second["scheduled"] is False
     assert started == [first["run_id"]]
+    assert first["quality"]["candidate_budget"] == {
+        "mode": "standard", "effective_days": 2,
+        "minimum": 100, "per_day": 80, "maximum": 500,
+        "effective_limit": 160,
+    }
+    assert first["quality"]["review_budget"] == {
+        "effective_days": 2, "per_day": 20, "maximum": 80,
+        "sample_limit": 40,
+    }
 
 
 def test_missing_snapshot_cannot_rebind_a_run_to_changed_live_source(

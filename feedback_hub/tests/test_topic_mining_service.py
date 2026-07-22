@@ -525,7 +525,7 @@ def test_run_maps_data_coverage_and_stale_vector_to_stable_status(tmp_path):
     assert {row["data_cutoff_ms"] for row in final_rows} == {end}
 
 
-def test_standard_service_classifies_at_most_five_hundred(tmp_path):
+def test_two_day_standard_service_classifies_at_most_one_hundred_sixty(tmp_path):
     from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
     from feedback_hub.topic_mining.config import TopicMiningConfig
     from feedback_hub.topic_mining.export import export_topic_run
@@ -584,14 +584,14 @@ def test_standard_service_classifies_at_most_five_hundred(tmp_path):
     manifest = json.loads(outcome["manifest_json"])
     assert outcome["status"] == "review_ready"
     assert manifest["recall_pool_count"] == 800
-    assert manifest["classified_count"] == 500
-    assert manifest["selected_candidate_count"] == 500
+    assert manifest["classified_count"] == 160
+    assert manifest["selected_candidate_count"] == 160
     _review_every_queue_item(outcome, store)
 
     valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
     tampered_manifest = json.loads(json.dumps(valid_manifest))
-    tampered_manifest["classified_count"] = 499
-    tampered_manifest["funnel"]["classified_count"] = 499
+    tampered_manifest["classified_count"] = 159
+    tampered_manifest["funnel"]["classified_count"] = 159
     store.update_manifest(run["run_id"], tampered_manifest, stage="review_ready")
     artifact_dir = Path(run["artifact_dir"])
     (artifact_dir / "manifest.json").write_text(

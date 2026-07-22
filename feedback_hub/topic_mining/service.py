@@ -19,6 +19,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .budgets import candidate_budget
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates, select_representative_results
@@ -220,7 +221,7 @@ def _run_pipeline(
         )
         selected_plan = select_diverse_candidates(
             plan.candidates,
-            limit=_classification_candidate_limit(spec, config),
+            limit=_classification_candidate_limit(spec, config, manifest),
         )
         _write_jsonl(
             recall_workspace / selected_path.name,
@@ -605,13 +606,16 @@ def _final_row(
 
 
 def _classification_candidate_limit(
-    spec: TopicSpec, config: TopicMiningConfig,
+    spec: TopicSpec,
+    config: TopicMiningConfig,
+    manifest: Mapping[str, Any],
 ) -> int:
-    return (
-        config.standard_candidate_limit
-        if spec.mode == "standard"
-        else config.exhaustive_candidate_limit
-    )
+    persisted = manifest.get("candidate_budget")
+    if isinstance(persisted, Mapping):
+        value = persisted.get("effective_limit")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return int(candidate_budget(spec, config)["effective_limit"])
 
 
 def _classification_candidates(

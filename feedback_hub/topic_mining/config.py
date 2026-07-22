@@ -28,11 +28,14 @@ class TopicMiningConfig:
     worker_lease_seconds: int = 3600
     standard_channel_top_k: int = 200
     standard_recall_pool_limit: int = 2000
-    standard_candidate_limit: int = 500
+    standard_candidate_min: int = 100
+    standard_candidates_per_day: int = 80
+    standard_candidate_max: int = 500
     exhaustive_channel_top_k: int = 2000
     exhaustive_recall_pool_limit: int = 5000
     exhaustive_candidate_limit: int = 5000
-    standard_result_limit: int = 100
+    review_samples_per_day: int = 20
+    review_sample_max: int = 80
     review_page_limit: int = 50
     rrf_k: int = 60
     classifier_batch_size: int = 20

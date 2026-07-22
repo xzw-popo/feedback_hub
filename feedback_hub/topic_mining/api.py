@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 
+from .budgets import candidate_budget, review_sample_budget
 from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
@@ -213,8 +214,17 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             "default_time_days": 14,
             "run_modes": {
                 "standard": {
-                    "candidate_limit": config.standard_candidate_limit,
-                    "result_limit": config.standard_result_limit,
+                    "candidate_limit": config.standard_candidate_max,
+                    "result_limit": None,
+                    "candidate_budget": {
+                        "minimum": config.standard_candidate_min,
+                        "per_day": config.standard_candidates_per_day,
+                        "maximum": config.standard_candidate_max,
+                    },
+                    "review_sample_budget": {
+                        "per_day": config.review_samples_per_day,
+                        "maximum": config.review_sample_max,
+                    },
                 },
                 "exhaustive": {
                     "candidate_limit": config.exhaustive_candidate_limit,
@@ -265,6 +275,8 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
                 "source_snapshot": snapshot_data,
                 "source_watermark_ms": watermark,
                 "source_sha256": snapshot.sha256,
+                "candidate_budget": candidate_budget(spec, config),
+                "review_budget": review_sample_budget(spec, config),
             }
             run = store.create_or_get(
                 spec,
@@ -438,6 +450,8 @@ def _public_run(run: dict[str, Any]) -> dict[str, Any]:
         "quality": {
             "funnel": manifest.get("funnel", {}), "source_watermark_ms": source_watermark_ms,
             "vector_watermark_ms": manifest.get("vector_watermark_ms"),
+            "candidate_budget": manifest.get("candidate_budget"),
+            "review_budget": manifest.get("review_budget"),
             "unresolved": {key: manifest.get(key, 0) for key in ("unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids", "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items")},
             "models": classifier.get("models", []), "retry_total": classifier.get("retry_total", 0),
         },

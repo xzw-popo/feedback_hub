@@ -54,7 +54,7 @@
 - Persists: `manifest.candidate_budget` and `manifest.review_budget` when a Run snapshot is created.
 - Consumes: persisted `manifest.candidate_budget.effective_limit` during hybrid recall selection.
 
-- [ ] **Step 1: Write failing duration and mode budget tests**
+- [x] **Step 1: Write failing duration and mode budget tests**
 
 Create parameterized tests with exact boundaries:
 
@@ -82,13 +82,13 @@ def test_exhaustive_budget_keeps_5000_safety_limit():
     assert budget["effective_limit"] == 5000
 ```
 
-- [ ] **Step 2: Run the budget tests and confirm RED**
+- [x] **Step 2: Run the budget tests and confirm RED**
 
 Run: `python3 -m pytest feedback_hub/tests/test_topic_mining_budgets.py -q`
 
 Expected: collection fails because `feedback_hub.topic_mining.budgets` does not exist.
 
-- [ ] **Step 3: Implement the immutable budget module and configuration**
+- [x] **Step 3: Implement the immutable budget module and configuration**
 
 Add these configuration fields and remove `standard_result_limit`:
 
@@ -141,7 +141,7 @@ def review_sample_budget(spec: TopicSpec, config: TopicMiningConfig) -> dict[str
     }
 ```
 
-- [ ] **Step 4: Add failing API and service integration assertions**
+- [x] **Step 4: Add failing API and service integration assertions**
 
 Update capabilities expectations so standard retains the compatible maximum but advertises dynamic policy and no result cap:
 
@@ -156,7 +156,7 @@ assert payload["run_modes"]["standard"] == {
 
 Add one-day and seven-day service cases asserting selected counts 100 and 500. Assert the snapshot manifest contains the exact persisted budget before asynchronous work starts, and assert a changed config cannot alter a Run that already has a valid `selected_candidates.jsonl` artifact.
 
-- [ ] **Step 5: Persist budgets at Run creation and consume them in service**
+- [x] **Step 5: Persist budgets at Run creation and consume them in service**
 
 In `create_run`, add both budget dictionaries to the initial manifest. Replace `_classification_candidate_limit(spec, config)` with:
 
@@ -176,7 +176,7 @@ def _classification_candidate_limit(
 
 Pass the manifest at candidate selection. Preserve the selected artifact path and stage-validity behavior unchanged. Record `candidate_budget` in the funnel-facing Run response without accepting it from clients.
 
-- [ ] **Step 6: Run focused Task 1 tests and confirm GREEN**
+- [x] **Step 6: Run focused Task 1 tests and confirm GREEN**
 
 Run:
 
