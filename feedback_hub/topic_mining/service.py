@@ -1544,7 +1544,7 @@ def _read_required_jsonl(path: Path, manifest: Mapping[str, Any] | None = None) 
     raw = read_verified_artifact_bytes(manifest, path) if manifest is not None else _read_verified_bytes_from_path(path)
     try:
         values = []
-        for line in raw.decode("utf-8").splitlines():
+        for line in raw.decode("utf-8").split("\n"):
             if line.strip():
                 value = json.loads(line)
                 if not isinstance(value, dict):
@@ -1690,7 +1690,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         return []
     values: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").split("\n")
         for line in lines:
             if line.strip():
                 value = json.loads(line)

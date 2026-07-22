@@ -800,6 +800,37 @@ def test_read_jsonl_normalizes_malformed_json(tmp_path):
         _read_jsonl(path)
 
 
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_read_jsonl_preserves_unicode_separator(tmp_path, separator):
+    from feedback_hub.topic_mining.service import _read_jsonl
+
+    path = tmp_path / "feedback.jsonl"
+    expected = {"item_id": "f1", "text": f"第一段{separator}第二段"}
+    path.write_text(
+        json.dumps(expected, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _read_jsonl(path) == [expected]
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_read_required_jsonl_preserves_unicode_separator(tmp_path, separator):
+    from feedback_hub.topic_mining.service import _read_required_jsonl
+
+    path = tmp_path / "feedback.jsonl"
+    expected = {"item_id": "f1", "text": f"第一段{separator}第二段"}
+    path.write_text(
+        json.dumps(expected, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()}
+    }
+
+    assert _read_required_jsonl(path, manifest) == [expected]
+
+
 def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
     from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
     from feedback_hub.topic_mining.config import TopicMiningConfig
