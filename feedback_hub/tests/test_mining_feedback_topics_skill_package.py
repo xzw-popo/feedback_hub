@@ -233,6 +233,18 @@ def test_skill_validator_rejects_only_one_time_boundary(tmp_path):
     assert "both start_time and end_time" in result.stderr
 
 
+def test_skill_validator_rejects_conversation_unit_before_create_run(tmp_path):
+    raw = valid_spec()
+    raw["unit"] = "conversation"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+
+    assert result.returncode == 2
+    assert "$.unit: must be one of: feedback" in result.stderr
+
+
 def test_client_uses_environment_url_and_redacts_token(monkeypatch):
     monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://topic.internal")
     monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", "secret-value")
@@ -381,6 +393,18 @@ def test_skill_uses_exhaustive_only_for_explicit_completeness_intent():
     assert "all, complete, or exhaustive" in body
     assert "mode: exhaustive" in body
     assert "mode: standard" in body
+
+
+def test_skill_and_references_advertise_only_feedback_units():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(encoding="utf-8").lower()
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8").lower()
+    schema = json.loads((SKILL_ROOT / "references" / "topic-spec.schema.json").read_text(encoding="utf-8"))
+
+    assert "`unit: feedback`" in body
+    assert "only `feedback` is supported" in topic_spec
+    assert "supported_units=[\"feedback\"]" in backend
+    assert schema["properties"]["unit"] == {"enum": ["feedback"]}
 
 
 def test_skill_exhausts_review_pagination_before_submitting_one_override_set():

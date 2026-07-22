@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from feedback_hub import db
-from feedback_hub.topic_mining.contracts import validate_topic_spec
+from feedback_hub.topic_mining.contracts import load_persisted_topic_spec, validate_topic_spec
 from feedback_hub.topic_mining.source import (
     DataCoverageError,
     UnsupportedSourceFilterError,
@@ -132,7 +132,7 @@ def test_feedback_scope_uses_half_open_time_bounds_and_stable_item_keys(source_d
 
 
 def test_conversation_items_aggregate_in_msg_sequence_order_and_fallback_source_url(source_db, valid_topic_spec):
-    conversation_spec = validate_topic_spec({**valid_topic_spec.to_dict(), "unit": "conversation"})
+    conversation_spec = load_persisted_topic_spec({**valid_topic_spec.to_dict(), "unit": "conversation"})
 
     items = fetch_scoped_items(source_db, conversation_spec)
 
@@ -193,7 +193,7 @@ def test_conversation_unit_rejects_placeholder_conversation_ids(
                 ),
             ],
         )
-    conversation_spec = validate_topic_spec({
+    conversation_spec = load_persisted_topic_spec({
         **valid_topic_spec.to_dict(), "unit": "conversation",
     })
 

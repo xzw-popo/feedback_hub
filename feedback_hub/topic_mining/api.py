@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from .config import TopicMiningConfig
-from .contracts import topic_spec_hash, validate_topic_spec
+from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, validate_source_coverage
 from .service import (
@@ -192,6 +192,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             "schema_versions": [1], "preferred_formats": ["xlsx", "jsonl"],
             "run_statuses": ["pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted"],
             "read_only_source": True, "formal_label_writeback": False,
+            "supported_units": ["feedback"],
             "default_time_days": 14,
             "run_modes": {
                 "standard": {
@@ -446,7 +447,7 @@ def _public_result_scope(
     if isinstance(matched_total, bool) or not isinstance(matched_total, int):
         return {key: None for key in _RESULT_SCOPE_KEYS}
     try:
-        spec = validate_topic_spec(json.loads(run["spec_json"]))
+        spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return {key: None for key in _RESULT_SCOPE_KEYS}
     classified_count = manifest.get("classified_count", matched_total)

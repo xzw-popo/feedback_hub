@@ -8,7 +8,7 @@ Build one JSON or YAML object with these required fields:
 | `topic_name` | Short human-readable topic name. |
 | `objective` | Decision or output the topic supports. |
 | `scope` | Hard boundary: required `start_time`, required `end_time` (RFC3339 with timezone), and optional `platforms`, `products`, `channels`, `versions`. |
-| `unit` | `feedback` or `conversation`. |
+| `unit` | Set to `feedback`; only `feedback` is supported for new runs. |
 | `mode` | Optional canonical run policy: `standard` (default) or `exhaustive`. Always emit the chosen canonical value. |
 | `inclusion_criteria` | Observable facts required for a match. |
 | `exclusion_criteria` | Adjacent concepts that must not match. |

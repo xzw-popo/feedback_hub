@@ -22,7 +22,7 @@ from typing import Any, Mapping, Sequence
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates, select_representative_results
-from .contracts import TopicSpec, topic_spec_hash, validate_topic_spec
+from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, build_review_queue, persist_review_artifacts
 from .run_store import RunPublicationConflictError, TopicRunStore
@@ -111,7 +111,7 @@ def _run_pipeline(
     classifier_call_fn: Any | None = None,
 ) -> None:
     run = _require_run(run_id, store)
-    spec = validate_topic_spec(json.loads(run["spec_json"]))
+    spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
     artifact_dir = Path(run["artifact_dir"])
     artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(run, artifact_dir)
@@ -400,7 +400,7 @@ def submit_review_overrides(
         manifest, artifact_dir, recalls, selected_recalls, classifications,
     )
     contexts = _read_required_json(artifact_dir / "item_contexts.json", manifest)
-    spec = validate_topic_spec(json.loads(run["spec_json"]))
+    spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
     evidence_sources = _authoritative_evidence_sources(recalls, contexts)
     # Validate before touching the persistent file. Overrides may supply only
     # evidence copied from hash-verified source text or persisted contexts.
@@ -452,7 +452,7 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     artifact_dir = Path(run["artifact_dir"])
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
-    spec = validate_topic_spec(json.loads(run["spec_json"]))
+    spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
     data_cutoff_ms = _effective_data_cutoff(
         run, manifest, require_snapshot=True,
     )

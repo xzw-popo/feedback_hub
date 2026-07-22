@@ -149,8 +149,9 @@ def _aware_datetime(value: Any, field: str) -> datetime:
     return parsed
 
 
-def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
-    """Validate untrusted input and return its normalized canonical representation."""
+def _validate_topic_spec(
+    raw: Mapping[str, Any], *, allow_legacy_conversation: bool,
+) -> TopicSpec:
     raw = _require_mapping(raw, "topic_spec")
     _reject_unknown(raw, _TOP_LEVEL_FIELDS, "topic_spec")
     missing = _REQUIRED_TOP_LEVEL_FIELDS - set(raw)
@@ -180,8 +181,8 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     )
 
     unit = _required_string(raw["unit"], "unit")
-    if unit not in {"feedback", "conversation"}:
-        raise ValueError("unit must be 'feedback' or 'conversation'")
+    if unit != "feedback" and not (allow_legacy_conversation and unit == "conversation"):
+        raise ValueError("unit must be feedback; conversation is not supported")
     mode = raw.get("mode", "standard")
     if mode not in {"standard", "exhaustive"}:
         raise ValueError("mode must be standard or exhaustive")
@@ -249,6 +250,16 @@ def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
     )
 
 
+def validate_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
+    """Validate a new untrusted spec against currently supported units."""
+    return _validate_topic_spec(raw, allow_legacy_conversation=False)
+
+
+def load_persisted_topic_spec(raw: Mapping[str, Any]) -> TopicSpec:
+    """Load a previously accepted spec without reopening legacy units to new runs."""
+    return _validate_topic_spec(raw, allow_legacy_conversation=True)
+
+
 def topic_spec_hash(spec: TopicSpec) -> str:
     """Return the stable SHA-256 identity for a canonical topic specification."""
     encoded = json.dumps(spec.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -280,7 +291,7 @@ def topic_spec_json_schema() -> dict[str, Any]:
                     "versions": string_array,
                 },
             },
-            "unit": {"enum": ["feedback", "conversation"]},
+            "unit": {"enum": ["feedback"]},
             "mode": {"enum": ["standard", "exhaustive"]},
             "inclusion_criteria": {**string_array, "minItems": 1},
             "exclusion_criteria": {**string_array, "minItems": 1},

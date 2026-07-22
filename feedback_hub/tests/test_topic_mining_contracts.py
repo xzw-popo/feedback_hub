@@ -7,6 +7,7 @@ from feedback_hub.topic_mining.contracts import (
     topic_spec_json_schema,
     validate_topic_spec,
 )
+import feedback_hub.topic_mining.contracts as contracts
 
 
 def valid_spec():
@@ -50,6 +51,18 @@ def test_topic_spec_defaults_mode_to_standard():
     raw.pop("mode", None)
 
     assert validate_topic_spec(raw).mode == "standard"
+
+
+def test_new_topic_specs_reject_conversation_but_persisted_loader_keeps_history_readable():
+    raw = valid_spec()
+    raw["unit"] = "conversation"
+
+    with pytest.raises(ValueError, match="unit must be feedback"):
+        validate_topic_spec(raw)
+
+    persisted = contracts.load_persisted_topic_spec(raw)
+    assert persisted.unit == "conversation"
+    assert topic_spec_json_schema()["properties"]["unit"] == {"enum": ["feedback"]}
 
 
 def test_schema_allows_duplicate_list_values_that_normalizer_deduplicates():

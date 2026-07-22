@@ -79,6 +79,45 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
         "exhaustive": {"candidate_limit": 5000, "result_limit": None},
     }
     assert payload["authentication"] == "internal_network_boundary"
+    assert payload["supported_units"] == ["feedback"]
+
+
+def test_create_run_rejects_conversation_before_scheduling_worker(tmp_path, monkeypatch):
+    import feedback_hub.topic_mining.api as api
+
+    scheduled = []
+    monkeypatch.setattr(api, "start_run_async", lambda run_id, **_kwargs: scheduled.append(run_id))
+    payload = _spec()
+    payload["unit"] = "conversation"
+
+    response = _client(tmp_path).post("/api/topic-mining/runs", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unit must be feedback; conversation is not supported"
+    assert scheduled == []
+
+
+def test_legacy_conversation_run_remains_readable(tmp_path):
+    import feedback_hub.topic_mining.contracts as contracts
+    from feedback_hub.tests.test_topic_mining_export import _spec as shared_spec
+
+    config = TopicMiningConfig(data_dir=tmp_path / "data")
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    raw = shared_spec().to_dict()
+    raw["unit"] = "conversation"
+    run = store.create_or_get(contracts.load_persisted_topic_spec(raw), 123)
+    store.update_manifest(
+        run["run_id"], {"verified": {"matched_count": 2}},
+        stage="verified", status="verified",
+    )
+    app = FastAPI()
+    app.include_router(make_router(config=config, store=store))
+
+    response = TestClient(app).get(f"/api/topic-mining/runs/{run['run_id']}")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "standard"
+    assert response.json()["returned_feedback"] == 2
 
 
 def test_legacy_exhaustive_run_reports_possible_matches_beyond_5000_candidate_safety_limit(tmp_path):

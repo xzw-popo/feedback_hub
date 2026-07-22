@@ -189,8 +189,7 @@
     },
     "unit": {
       "enum": [
-        "feedback",
-        "conversation"
+        "feedback"
       ]
     }
   },

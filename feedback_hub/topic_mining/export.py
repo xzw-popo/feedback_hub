@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 from .run_store import TopicRunStore
 from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
 from .diversity import select_representative_results
-from .contracts import validate_topic_spec
+from .contracts import load_persisted_topic_spec
 
 
 HEADERS = ["命中分类", "反馈时间", "反馈原文", "对应链接", "判定理由", "证据", "平台", "版本", "设备", "Feedback ID", "Conversation ID", "Run ID", "数据截止时间"]
@@ -26,7 +26,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     if run["status"] != "verified":
         raise RunVerificationError("run_not_verified")
     artifact_dir = Path(run["artifact_dir"])
-    spec = validate_topic_spec(json.loads(run["spec_json"]))
+    spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
     final_path = artifact_dir / "final_reviewed.jsonl"
     manifest = _load_manifest(run, artifact_dir)
     _verify_manifest(manifest, artifact_dir)
