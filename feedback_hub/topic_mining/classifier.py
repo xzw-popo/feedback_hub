@@ -21,6 +21,7 @@ from feedback_hub.topic_discovery.model_routes import (
 
 from .config import TopicMiningConfig
 from .contracts import TopicSpec
+from .jsonl_io import jsonl_text_records
 from .retrieval import RecallHit
 
 
@@ -440,7 +441,7 @@ def _retain_successful_checkpoints(output_path: Path) -> None:
     if not checkpoint.exists():
         return
     good = []
-    for line in checkpoint.read_text(encoding="utf-8").splitlines():
+    for line in jsonl_text_records(checkpoint.read_bytes()):
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -489,7 +490,7 @@ def _clear_partial_audit(directory: Path) -> None:
 def _next_audit_generation(audit_path: Path, partial_directory: Path) -> int:
     generations: list[int] = []
     if audit_path.exists():
-        for line in audit_path.read_text(encoding="utf-8").splitlines():
+        for line in jsonl_text_records(audit_path.read_bytes()):
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
@@ -510,7 +511,7 @@ def _next_audit_generation(audit_path: Path, partial_directory: Path) -> int:
 def _write_audit(path: Path, rows: Sequence[Mapping[str, Any]], *, append: bool, secrets: Sequence[str]) -> None:
     existing: list[dict[str, Any]] = []
     if append and path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in jsonl_text_records(path.read_bytes()):
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:

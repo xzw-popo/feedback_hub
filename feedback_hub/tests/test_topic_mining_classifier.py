@@ -14,6 +14,7 @@ from feedback_hub.topic_mining.classifier import (
 )
 from feedback_hub.topic_mining.config import TopicMiningConfig
 from feedback_hub.topic_mining.contracts import validate_topic_spec
+from feedback_hub.topic_mining.jsonl_io import load_jsonl_objects
 from feedback_hub.topic_mining.retrieval import RecallHit
 
 
@@ -267,3 +268,34 @@ def test_claim_cancellation_stops_new_model_calls_and_final_artifact_write(
 
     assert calls == ["classifier"]
     assert not (tmp_path / "classified.jsonl").exists()
+
+
+def test_checkpoint_and_audit_readers_preserve_unicode_separator(tmp_path):
+    from feedback_hub.topic_mining.classifier import (
+        _next_audit_generation,
+        _retain_successful_checkpoints,
+        _write_audit,
+    )
+
+    batches = tmp_path / "classification_batches.jsonl"
+    checkpoint = batches.with_suffix(batches.suffix + ".checkpoint.jsonl")
+    checkpoint_row = {"ok": True, "raw_reply": "第一段\u2028第二段"}
+    checkpoint.write_text(
+        json.dumps(checkpoint_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    _retain_successful_checkpoints(batches)
+    assert load_jsonl_objects(checkpoint.read_bytes()) == [checkpoint_row]
+
+    audit = tmp_path / "classification_audit.jsonl"
+    existing = {
+        "audit_id": "g1:a", "audit_generation": 1,
+        "raw_replies": ["第一段\u2028第二段"],
+    }
+    audit.write_text(
+        json.dumps(existing, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    assert _next_audit_generation(audit, tmp_path / "partials") == 2
+    _write_audit(audit, [], append=True, secrets=())
+    assert load_jsonl_objects(audit.read_bytes()) == [existing]
