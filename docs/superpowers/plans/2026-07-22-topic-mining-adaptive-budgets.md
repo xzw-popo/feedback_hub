@@ -469,7 +469,7 @@ python3 /Users/charvel/.codex/skills/.system/skill-creator/scripts/quick_validat
 
 Expected: all tests pass and validator prints `Skill is valid!`.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add codex-skills/mining-feedback-topics/SKILL.md \
@@ -479,7 +479,7 @@ git add codex-skills/mining-feedback-topics/SKILL.md \
 git commit -m "docs: teach skill adaptive topic budgets"
 ```
 
-- [ ] **Step 6: Deploy and perform non-destructive production verification**
+- [x] **Step 6: Deploy and perform non-destructive production verification**
 
 Run:
 
@@ -491,7 +491,7 @@ curl -fsS http://charvelxia-any2.devcloud.woa.com:8000/api/topic-mining/capabili
 
 Verify capabilities reports standard maximum 500, minimum 100, 80 per effective day, review sampling 20 per day capped at 80, and `result_limit=null`. Run deterministic fixture tests against deployed code or a copied Run artifact. Do not create or mutate a production Run solely for smoke testing.
 
-- [ ] **Step 7: Final audit**
+- [x] **Step 7: Final audit**
 
 Run:
 
