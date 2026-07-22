@@ -1075,3 +1075,16 @@ def test_review_queue_malformed_or_tampered_is_conflict(tmp_path):
     store.update_manifest(run["run_id"], {"artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()}}, stage="review_ready", status="review_ready")
     app = FastAPI(); app.include_router(make_router(config=config, store=store))
     assert TestClient(app).get(f"/api/topic-mining/runs/{run['run_id']}/review-queue").status_code == 409
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_review_queue_jsonl_readers_preserve_unicode_separators(tmp_path, separator):
+    from feedback_hub.topic_mining.api import _parse_jsonl_bytes, _read_jsonl
+
+    expected = {"item_id": "f1", "text": f"第一段{separator}第二段"}
+    raw = (json.dumps(expected, ensure_ascii=False) + "\n").encode("utf-8")
+    path = tmp_path / "review_queue.jsonl"
+    path.write_bytes(raw)
+
+    assert _read_jsonl(path) == [expected]
+    assert _parse_jsonl_bytes(raw) == [expected]

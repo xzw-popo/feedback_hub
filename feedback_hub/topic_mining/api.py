@@ -18,6 +18,7 @@ from fastapi.responses import Response
 from .budgets import candidate_budget, review_sample_budget
 from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
+from .jsonl_io import load_jsonl_objects
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (
@@ -515,23 +516,13 @@ def _manifest(run: dict[str, Any]) -> dict[str, Any]:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    import json
     if not path.is_file():
         return []
     try:
-        values = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError("invalid review queue artifact")
-            values.append(value)
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
         raise ValueError("invalid review queue artifact") from exc
-    if any(not isinstance(value, dict) for value in values):
-        raise ValueError("invalid review queue artifact")
-    return values
+    return _parse_jsonl_bytes(raw)
 
 
 def _parse_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
@@ -542,15 +533,7 @@ def _parse_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
 
 
 def _read_jsonl_bytes(raw: bytes) -> list[dict[str, Any]]:
-    values = []
-    for line in raw.decode("utf-8").splitlines():
-        if not line.strip():
-            continue
-        value = json.loads(line)
-        if not isinstance(value, dict):
-            raise ValueError("invalid review queue artifact")
-        values.append(value)
-    return values
+    return load_jsonl_objects(raw)
 
 
 def _redact(message: str, config: TopicMiningConfig) -> str:
