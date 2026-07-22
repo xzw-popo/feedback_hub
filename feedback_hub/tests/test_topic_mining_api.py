@@ -152,7 +152,7 @@ def test_legacy_exhaustive_run_reports_possible_matches_beyond_5000_candidate_sa
     payload = TestClient(app).get(f"/api/topic-mining/runs/{run['run_id']}").json()
 
     assert payload["mode"] == "exhaustive"
-    assert payload["result_scope"] == "reviewed"
+    assert payload["result_scope"] == "representative"
     assert payload["possibly_more_matches"] is True
 
 

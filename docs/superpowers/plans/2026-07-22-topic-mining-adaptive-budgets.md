@@ -323,7 +323,7 @@ git commit -m "feat: bound topic review sampling"
 - Produces: all final matched rows in `final_results.jsonl` and `feedback_list.xlsx`.
 - Produces: identical result-scope metadata in Run API, quality report, JSONL export manifest, and workbook metadata.
 
-- [ ] **Step 1: Replace capped-export tests with failing all-row expectations**
+- [x] **Step 1: Replace capped-export tests with failing all-row expectations**
 
 Change the 130-row standard fixture to expect all 130 rows and add a 321-row workbook fixture:
 
@@ -350,7 +350,7 @@ def test_standard_export_keeps_all_321_confirmed_matches(tmp_path):
 
 Add the complementary exact-coverage case with `retrieved_candidate_count == classified_count` expecting `reviewed` and `possibly_more_matches=false`.
 
-- [ ] **Step 2: Run export/API tests and confirm RED**
+- [x] **Step 2: Run export/API tests and confirm RED**
 
 Run:
 
@@ -363,7 +363,7 @@ python3 -m pytest \
 
 Expected: standard export still contains 100 rows and old scope values disagree.
 
-- [ ] **Step 3: Simplify shared result-scope calculation**
+- [x] **Step 3: Simplify shared result-scope calculation**
 
 Remove `_STANDARD_RESULT_LIMIT` and stop calling `select_representative_results` from service/export. Implement:
 
@@ -380,7 +380,7 @@ return {
 
 Apply the same fallback validation for malformed legacy count fields that `_result_scope` currently performs. Update `_public_result_scope` in the API to use identical semantics for verified and pre-export Runs.
 
-- [ ] **Step 4: Export every verified row atomically**
+- [x] **Step 4: Export every verified row atomically**
 
 Replace standard/exhaustive branching with:
 
@@ -390,7 +390,7 @@ selected_rows = list(rows)
 
 Keep sorting, required-field validation, formula escaping, manifest CAS publication, and artifact allowlisting unchanged. Ensure a failed workbook build does not publish a partial terminal mutation.
 
-- [ ] **Step 5: Run Task 3 tests and end-to-end coverage**
+- [x] **Step 5: Run Task 3 tests and end-to-end coverage**
 
 Run:
 

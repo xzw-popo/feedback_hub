@@ -22,7 +22,7 @@ from typing import Any, Mapping, Sequence
 from .budgets import candidate_budget, review_sample_budget
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
-from .diversity import select_diverse_candidates, select_representative_results
+from .diversity import select_diverse_candidates
 from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, persist_review_artifacts, plan_review_queue
@@ -49,9 +49,6 @@ _CLASSIFICATION_WORK_FILES = (
     "classification_audit.jsonl",
     "classified.jsonl",
 )
-_STANDARD_RESULT_LIMIT = 100
-
-
 def default_store(config: TopicMiningConfig | None = None) -> TopicRunStore:
     config = config or TopicMiningConfig()
     return TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
@@ -570,12 +567,6 @@ def _result_scope(
 ) -> dict[str, Any]:
     """Describe exactly what a downloadable result may claim to cover."""
     matched_total = len(rows)
-    if spec.mode == "standard":
-        returned_feedback = len(select_representative_results(
-            rows, recall_by_id, limit=_STANDARD_RESULT_LIMIT,
-        ))
-    else:
-        returned_feedback = matched_total
     fallback_classified = (
         classified_count
         if classified_count is not None
@@ -587,22 +578,13 @@ def _result_scope(
     retrieved = manifest.get("retrieved_candidate_count", len(recall_by_id) or manifest_classified)
     if isinstance(retrieved, bool) or not isinstance(retrieved, int):
         retrieved = len(recall_by_id) or manifest_classified
+    possibly_more_matches = retrieved > manifest_classified
     return {
         "mode": spec.mode,
-        "result_scope": (
-            "representative"
-            if spec.mode == "standard" and matched_total > returned_feedback
-            else "reviewed"
-        ),
+        "result_scope": "representative" if possibly_more_matches else "reviewed",
         "matched_total": matched_total,
-        "returned_feedback": returned_feedback,
-        "possibly_more_matches": (
-            retrieved > manifest_classified
-            or (
-                spec.mode == "standard"
-                and matched_total > returned_feedback
-            )
-        ),
+        "returned_feedback": matched_total,
+        "possibly_more_matches": possibly_more_matches,
     }
 
 

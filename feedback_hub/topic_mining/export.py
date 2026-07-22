@@ -9,7 +9,6 @@ from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
 from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
-from .diversity import select_representative_results
 from .contracts import load_persisted_topic_spec
 
 
@@ -47,11 +46,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
     if recall_by_id and not {str(row["item_id"]) for row in rows} <= set(recall_by_id):
         raise RunVerificationError("final_result_not_in_recall_pool")
     scope = _result_scope(spec, rows, recall_by_id, manifest)
-    selected_rows = (
-        select_representative_results(rows, recall_by_id, limit=100)
-        if spec.mode == "standard"
-        else list(rows)
-    )
+    selected_rows = list(rows)
     if len(selected_rows) != scope["returned_feedback"]:
         raise RunVerificationError("result_scope_mismatch")
     export_rows = [_export_row(row) for row in selected_rows]

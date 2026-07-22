@@ -488,23 +488,13 @@ def _public_result_scope(
     retrieved_count = manifest.get("retrieved_candidate_count", classified_count)
     if isinstance(retrieved_count, bool) or not isinstance(retrieved_count, int):
         retrieved_count = classified_count
-    returned_feedback = min(matched_total, 100) if spec.mode == "standard" else matched_total
+    possibly_more_matches = retrieved_count > classified_count
     return {
         "mode": spec.mode,
-        "result_scope": (
-            "representative"
-            if spec.mode == "standard" and matched_total > returned_feedback
-            else "reviewed"
-        ),
+        "result_scope": "representative" if possibly_more_matches else "reviewed",
         "matched_total": matched_total,
-        "returned_feedback": returned_feedback,
-        "possibly_more_matches": (
-            retrieved_count > classified_count
-            or (
-                spec.mode == "standard"
-                and matched_total > returned_feedback
-            )
-        ),
+        "returned_feedback": matched_total,
+        "possibly_more_matches": possibly_more_matches,
     }
 
 

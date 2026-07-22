@@ -141,28 +141,41 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert report["required_fields"] == ["feedback_text"]
 
 
-def test_standard_export_limits_rows_and_reports_representative_scope(tmp_path):
+def test_standard_export_keeps_all_321_confirmed_matches(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), CUTOFF_MS)
     artifact_dir = Path(run["artifact_dir"])
     final = artifact_dir / "final_reviewed.jsonl"
     final.write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 130)),
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in _rows(run["run_id"], 321)),
         encoding="utf-8",
     )
-    _persist_verified_manifest(store, run, final)
+    verified = _persist_verified_manifest(store, run, final)
+    verified.update({"retrieved_candidate_count": 570, "classified_count": 500})
+    store.update_manifest(run["run_id"], verified, stage="verified", status="verified")
+    (artifact_dir / "manifest.json").write_text(json.dumps(verified), encoding="utf-8")
 
-    path = export_topic_run(run["run_id"], "jsonl", store=store)
+    jsonl_path = export_topic_run(run["run_id"], "jsonl", store=store)
+    xlsx_path = export_topic_run(run["run_id"], "xlsx", store=store)
 
-    assert len(_read_jsonl(path)) == 100
+    assert len(_read_jsonl(jsonl_path)) == 321
+    workbook = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    assert workbook["反馈清单"].max_row == 322
+    metadata = dict(workbook["导出元数据"].iter_rows(values_only=True))
+    workbook.close()
+    assert metadata == {
+        "mode": "standard", "result_scope": "representative",
+        "matched_total": 321, "returned_feedback": 321,
+        "possibly_more_matches": True,
+    }
     report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
     assert {key: report[key] for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")} == {
-        "mode": "standard", "result_scope": "representative", "matched_total": 130,
-        "returned_feedback": 100, "possibly_more_matches": True,
+        "mode": "standard", "result_scope": "representative", "matched_total": 321,
+        "returned_feedback": 321, "possibly_more_matches": True,
     }
     manifest = json.loads(store.get(run["run_id"])["manifest_json"])
     assert manifest["result_scope"] == "representative"
-    assert len(_read_jsonl(final)) == 130
+    assert len(_read_jsonl(final)) == 321
 
 
 def test_standard_export_under_limit_reports_possible_unclassified_matches_in_xlsx_metadata(tmp_path):
@@ -185,7 +198,7 @@ def test_standard_export_under_limit_reports_possible_unclassified_matches_in_xl
     metadata = dict(workbook["导出元数据"].iter_rows(values_only=True))
     workbook.close()
     assert metadata == {
-        "mode": "standard", "result_scope": "reviewed", "matched_total": 23,
+        "mode": "standard", "result_scope": "representative", "matched_total": 23,
         "returned_feedback": 23, "possibly_more_matches": True,
     }
 
@@ -230,6 +243,7 @@ def test_exhaustive_export_reports_possible_matches_beyond_5000_candidate_safety
     assert len(_read_jsonl(path)) == 130
     report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
     assert report["mode"] == "exhaustive"
+    assert report["result_scope"] == "representative"
     assert report["possibly_more_matches"] is True
 
 
