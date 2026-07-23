@@ -1000,3 +1000,142 @@ def test_candidate_page_rejects_v1_run(tmp_path):
 
     with pytest.raises(RunVerificationError, match="caller_ai_protocol_required"):
         get_candidate_page(run["run_id"], 0, 20, store=store)
+
+
+def test_one_invalid_caller_decision_does_not_discard_499_valid_siblings(
+    tmp_path,
+):
+    from feedback_hub.topic_mining.config import TopicMiningConfig
+    from feedback_hub.topic_mining.service import (
+        run_topic_job,
+        submit_caller_classifications,
+    )
+    from feedback_hub.topic_mining.vector_client import (
+        VectorCapabilities,
+        VectorHit,
+        VectorSearchResult,
+    )
+
+    source = tmp_path / "source.db"
+    start = int(
+        datetime(2023, 11, 14, tzinfo=timezone.utc).timestamp() * 1000
+    )
+    end = int(
+        datetime(2023, 11, 16, tzinfo=timezone.utc).timestamp() * 1000
+    )
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            """CREATE TABLE feedback (
+                feedback_id TEXT PRIMARY KEY, conversation_id TEXT,
+                msg_seq INTEGER, ts_ms INTEGER, platform TEXT,
+                appversion TEXT, channel TEXT, device_name TEXT,
+                user_vid TEXT, service_vid INTEGER, external_chat_url TEXT,
+                text TEXT
+            )"""
+        )
+        rows = []
+        for index in range(500):
+            item_id = f"item-{index:04d}"
+            ts_ms = start + ((end - start - 1) * index // 499)
+            rows.append((
+                item_id, f"conversation-{index}", 1, ts_ms, "Win", "1",
+                "pc", "PC", f"user-{index}", 1,
+                f"https://example.test/{index}", f"原文片段 {index}",
+            ))
+        connection.executemany(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        connection.execute(
+            """CREATE TABLE feedback_source_coverage (
+                channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
+                end_ts_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO feedback_source_coverage VALUES (?, ?, ?, ?)",
+            ("pc", start, end, end),
+        )
+    raw_spec = _spec().to_dict()
+    raw_spec["mode"] = "exhaustive"
+    spec = validate_topic_spec(raw_spec)
+    config = TopicMiningConfig(
+        source_db_path=source,
+        data_dir=tmp_path / "data",
+        vector_api_url="https://vector.test",
+        vector_max_lag_seconds=1_000_000,
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(
+        spec,
+        end,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+
+    class FakeVector:
+        def capabilities(self):
+            return VectorCapabilities("feedback-items-v1", 1, ("feedback",), end)
+
+        def search(self, *_args):
+            return VectorSearchResult(
+                "feedback-items-v1",
+                end,
+                tuple(
+                    VectorHit(
+                        f"item-{index:04d}", "objective:0",
+                        1 - index / 1000, index + 1,
+                    )
+                    for index in range(500)
+                ),
+            )
+
+    run_topic_job(
+        run["run_id"], store=store, config=config,
+        vector_client=FakeVector(),
+        model_call_fn=lambda *_args, **_kwargs: pytest.fail(
+            "caller-ai run invoked backend model",
+        ),
+    )
+    decisions = [
+        {
+            "item_id": f"item-{index:04d}",
+            "label": "matched",
+            "reason": "明确命中",
+            "evidence": [
+                "不是原文" if index == 317 else f"原文片段 {index}"
+            ],
+        }
+        for index in range(500)
+    ]
+
+    response = submit_caller_classifications(
+        run["run_id"], decisions, store=store,
+    )
+
+    assert len(response["accepted_ids"]) == 499
+    assert response["rejected"] == [{
+        "item_id": "item-0317",
+        "code": "evidence_not_grounded",
+    }]
+    assert response["accepted_count"] == 499
+    assert response["pending_count"] == 1
+    assert store.get(run["run_id"])["status"] == "classification_in_progress"
+    assert len(store.get_caller_decisions(run["run_id"])) == 499
+    revisions_before = store.caller_revision_count(run["run_id"])
+
+    fixed = submit_caller_classifications(
+        run["run_id"],
+        [{
+            "item_id": "item-0317",
+            "label": "matched",
+            "reason": "修正",
+            "evidence": ["原文片段 317"],
+        }],
+        store=store,
+    )
+
+    assert fixed["accepted_count"] == 500
+    assert fixed["pending_count"] == 0
+    assert store.get(run["run_id"])["status"] == "verification_ready"
+    assert store.caller_revision_count(run["run_id"]) == revisions_before + 1

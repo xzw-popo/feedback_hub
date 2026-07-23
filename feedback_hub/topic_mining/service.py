@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .budgets import candidate_budget, review_sample_budget
+from .caller_classification import DecisionValidationError, validate_decision
 from .classifier import ClassificationResult, classify_candidates
 from .config import TopicMiningConfig
 from .diversity import select_diverse_candidates
@@ -40,6 +41,7 @@ class RunVerificationError(ValueError):
 _STAGES = ("snapshot", "hard_scope", "hybrid_recall", "classify", "review_queue", "review_ready")
 _CALLER_AI_STAGES = (
     "snapshot", "hard_scope", "hybrid_recall", "classification_ready",
+    "caller_classification",
 )
 _MANIFEST_VERSION = 2
 _CALLER_AI_MANIFEST_VERSION = 3
@@ -533,6 +535,153 @@ def get_candidate_page(
             ],
         },
         "items": items,
+    }
+
+
+def submit_caller_classifications(
+    run_id: str,
+    decisions: Sequence[Mapping[str, Any]],
+    *,
+    store: TopicRunStore | None = None,
+) -> dict[str, Any]:
+    """Validate each caller decision independently and retain valid siblings."""
+    if not isinstance(decisions, Sequence) or isinstance(
+        decisions, (str, bytes),
+    ):
+        raise ValueError("caller decisions must be an array")
+    store = store or default_store()
+    run = _require_run(run_id, store)
+    version, owner = classification_protocol(run)
+    if (version, owner) != (2, "caller_ai"):
+        raise RunVerificationError("caller_ai_protocol_required")
+    if run["status"] not in {
+        "classification_ready", "classification_in_progress",
+    }:
+        raise RunVerificationError("caller_decisions_immutable")
+    artifact_dir = Path(str(run["artifact_dir"]))
+    manifest = _load_manifest(run, artifact_dir)
+    _verify_manifest(manifest, artifact_dir)
+    candidate_digest = manifest.get("candidate_set_sha256")
+    selected_path = artifact_dir / "selected_candidates.jsonl"
+    if (
+        not isinstance(candidate_digest, str)
+        or len(candidate_digest) != 64
+        or not selected_path.is_file()
+        or _sha256(selected_path) != candidate_digest
+    ):
+        raise RunVerificationError("candidate_set_mismatch")
+    recalls = [
+        _recall_from_dict(row)
+        for row in _read_required_jsonl(
+            artifact_dir / "recall_candidates.jsonl", manifest,
+        )
+    ]
+    selected = _classification_candidates(manifest, artifact_dir, recalls)
+    contexts = _read_required_json(
+        artifact_dir / "item_contexts.json", manifest,
+    )
+    candidates_by_id = {
+        candidate.item_id: candidate for candidate in selected
+    }
+    valid: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    request_ids: set[str] = set()
+    for raw in decisions:
+        item_id = (
+            raw.get("item_id") if isinstance(raw, Mapping) else None
+        )
+        display_id = item_id if isinstance(item_id, str) else ""
+        if isinstance(item_id, str) and item_id in request_ids:
+            rejected.append({
+                "item_id": item_id,
+                "code": "duplicate_item_id",
+            })
+            continue
+        if isinstance(item_id, str):
+            request_ids.add(item_id)
+        candidate = candidates_by_id.get(str(item_id))
+        if candidate is None:
+            rejected.append({
+                "item_id": display_id,
+                "code": "unknown_item",
+            })
+            continue
+        try:
+            decision = validate_decision(
+                raw, candidate.item,
+                [
+                    item for item in contexts.get(candidate.item_id, [])
+                    if isinstance(item, Mapping)
+                ],
+            )
+        except DecisionValidationError as exc:
+            rejected.append({
+                "item_id": candidate.item_id,
+                "code": exc.code,
+            })
+            continue
+        valid.append(decision.to_dict())
+    write_result = store.upsert_caller_decisions(
+        run_id, candidate_digest, valid,
+    )
+    candidate_ids = [candidate.item_id for candidate in selected]
+    progress = store.caller_decision_progress(run_id, candidate_ids)
+    manifest.update({
+        "classification_owner": "caller_ai",
+        "classification_protocol_version": 2,
+        "accepted_decision_count": progress["accepted_count"],
+        "pending_decision_count": progress["pending_count"],
+        "classification_revision_count": store.caller_revision_count(run_id),
+    })
+    if progress["pending_count"]:
+        manifest["stage"] = "classification_in_progress"
+        _write_manifest_mirror(
+            run_id, store, artifact_dir, manifest,
+        )
+        store.update_manifest(
+            run_id, manifest,
+            stage="classification_in_progress",
+            status="classification_in_progress",
+        )
+    else:
+        effective = {
+            row["item_id"]: row
+            for row in store.get_caller_decisions(run_id)
+        }
+        ordered = [effective[item_id] for item_id in candidate_ids]
+        caller_path = artifact_dir / "caller_classifications.jsonl"
+        workspace = _stage_workspace(
+            store, artifact_dir, "caller_classification",
+        )
+        _write_jsonl(workspace / caller_path.name, ordered)
+        hashes = _promote_stage_files(
+            run_id, store, artifact_dir, workspace, [caller_path.name],
+        )
+        manifest.update({
+            "unresolved_classifier_items": 0,
+            "unresolved_parser_items": 0,
+        })
+        _checkpoint(
+            run_id, store, artifact_dir, manifest,
+            "caller_classification", [caller_path],
+            output_hashes=hashes,
+        )
+        _set_status(
+            run_id, store, "verification_ready",
+            stage="verification_ready",
+        )
+    pending_ids = progress["pending_ids"]
+    return {
+        "run_id": run_id,
+        "accepted_ids": progress["accepted_ids"],
+        "rejected": rejected,
+        "accepted_count": progress["accepted_count"],
+        "pending_count": progress["pending_count"],
+        "next_pending_offset": (
+            candidate_ids.index(pending_ids[0]) // 20 * 20
+            if pending_ids else None
+        ),
+        "write_result": write_result,
     }
 
 
@@ -1653,6 +1802,14 @@ def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set
             {"selected_candidates.jsonl", "item_contexts.json"},
             {"classification_ready.json"},
         ),
+        "caller_classification": (
+            {
+                "classification_ready.json",
+                "selected_candidates.jsonl",
+                "item_contexts.json",
+            },
+            {"caller_classifications.jsonl"},
+        ),
     }
     inputs, outputs = contracts[stage]
     selected_path = artifact_dir / "selected_candidates.jsonl"
@@ -1683,6 +1840,8 @@ def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, A
         return len(_read_jsonl(artifact_dir / "classified.jsonl"))
     if stage == "classification_ready":
         return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
+    if stage == "caller_classification":
+        return len(_read_jsonl(artifact_dir / "caller_classifications.jsonl"))
     return len(_read_jsonl(artifact_dir / "final_reviewed.jsonl"))
 
 
@@ -1693,7 +1852,7 @@ def _stage_input_count(stage: str, artifact_dir: Path) -> int:
         return _snapshot_row_count(artifact_dir)
     if stage == "classify" and (artifact_dir / "selected_candidates.jsonl").is_file():
         return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
-    if stage == "classification_ready":
+    if stage in {"classification_ready", "caller_classification"}:
         return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
     stages = _CALLER_AI_STAGES if stage in _CALLER_AI_STAGES else _STAGES
     previous = stages[stages.index(stage) - 1]
