@@ -162,6 +162,10 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert not {
         "命中分类", "Conversation ID", "Run ID", "数据截止时间",
     } & set(headers)
+    assert ws["C2"].data_type == "f"
+    assert ws["C2"].value == (
+        '=HYPERLINK("https://example.test/chat/1","打开反馈")'
+    )
     assert ws["C2"].hyperlink.target.startswith("https://")
     assert ws.cell(2, headers.index("判定理由") + 1).value == "全屏仍显示"
     assert ws.cell(2, headers.index("证据") + 1).value == "工具栏一直显示"

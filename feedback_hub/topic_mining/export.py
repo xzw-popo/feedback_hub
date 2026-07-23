@@ -178,6 +178,8 @@ def _xlsx_bytes(
         ]
         sheet.append([_safe_cell(value) for value in values])
         link = sheet.cell(sheet.max_row, 3)
+        formula_url = url.replace('"', '""')
+        link.value = f'=HYPERLINK("{formula_url}","打开反馈")'
         link.hyperlink = url
         link.style = "Hyperlink"
     sheet.freeze_panes = "A2"
