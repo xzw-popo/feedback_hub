@@ -10,7 +10,7 @@ Use [`topic_backend_client.py`](../scripts/topic_backend_client.py). The client 
 | `get-run RUN_ID` | Poll status, stage, funnel, cutoff, watermark, and unresolved quality fields. |
 | `resume RUN_ID` | Resume a recoverable original run after repairing its blocker. |
 | `candidate-page RUN_ID --output FILE --offset OFFSET --limit 20` | Save one frozen candidate page with topic boundary, source item, contexts, and decision state. |
-| `apply-classifications RUN_ID --page PAGE --file FILE` | Locally validate and submit one complete page of caller-AI decisions. |
+| `apply-classifications RUN_ID --page PAGE --file FILE [--repair]` | Locally validate and submit a complete page, or a non-empty repair subset. |
 | `verify RUN_ID` | Gate final membership and evidence. |
 | `export RUN_ID --format xlsx|jsonl` | Create an artifact only after verification. |
 | `download RUN_ID ARTIFACT --output FILE` | Atomically save the returned artifact. |

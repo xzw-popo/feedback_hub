@@ -162,7 +162,7 @@ TOPIC_VECTOR_MAX_LAG_SECONDS=21600
 TOPIC_MINING_API_TOKEN=
 ```
 
-专题分类复用现有 OpenAI-compatible LLM 运行时。以下三项是运行分类必需的共享变量，也只允许配置在远端 `.env`，示例不包含真实地址、模型名或密钥：
+协议 v2 的专题挖掘不会调用后端语义分类模型。`LLM_*` 可以继续为搜索、打标等其他服务保留，但 `LLM_MODEL`（包括 `deepseek-v4-flash`）不会参与 v2 专题的成员判定：
 
 ```dotenv
 LLM_API_URL=
@@ -170,7 +170,7 @@ LLM_API_KEY=
 LLM_MODEL=
 ```
 
-`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于召回，最终结果仍需分类、审核和验证。向量服务返回的 `watermark_ts_ms` 必须是从 `feedback_source_coverage.completed_at_ms` 传递的同一数据代际，不能用最后一条反馈的事件时间代替。
+`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于候选召回，调用 Skill 的 AI 负责逐条语义分类，后端负责证据校验、验证和导出。向量服务返回的 `watermark_ts_ms` 必须是从 `feedback_source_coverage.completed_at_ms` 传递的同一数据代际，不能用最后一条反馈的事件时间代替。
 
 新版 schema 会创建 `feedback_source_coverage`，每次 `feedback_hub pull` 成功后写入本次的 channel、拉取起止区间和单调递增的数据代际。专题服务只读这张表：它用覆盖区间区分“该时段没有反馈”和“该时段尚未同步”，并用数据代际区分最大反馈时间不变的历史补录。旧数据库在首次启动新代码时只会建表，不会猜测历史覆盖范围；在运行专题前，必须用正常拉取流程同步请求的完整时间段。如果 run 返回 `data_coverage_error`，应补拉缺失区间并新建数据代际下的 run，不得伪造边界反馈或手工绕过验证。
 
@@ -180,6 +180,28 @@ LLM_MODEL=
 APP_PORT=8000 scripts/devcloud_runtime.sh restart
 APP_PORT=8000 scripts/devcloud_runtime.sh status
 ```
+
+能力接口必须包含完整且精确的 v2 所有权契约，新的 Skill 才允许创建 Run：
+
+```json
+{
+  "classification_protocol": {
+    "version": 2,
+    "owner": "caller_ai",
+    "candidate_page_default": 20,
+    "candidate_page_maximum": 20,
+    "matched_evidence": "exact_source_or_context_substring",
+    "partial_acceptance": true
+  }
+}
+```
+
+健康的新 Run 在快照、硬筛和混合召回后应停在
+`classification_ready`，此时没有后台模型来源或重试信息。后续运维观察
+`accepted_decision_count` 和 `pending_decision_count`；覆盖完整后进入
+`verification_ready`。冒烟测试应故意在一页中提交一条不落原文的证据，
+确认其他条目被接受、仅该 ID 保持 pending，再修复该 ID 并验证、导出。
+不要恢复未完成的 v1 Run；旧 v1 仅保留已验证结果的重新导出兼容。
 
 `.env` 不会自动导出到当前 shell。保持在 `/opt/feedback_hub`，先用 `env -u` 避免当前 shell 的同名变量遮蔽项目配置，再由当前虚拟环境导入 `feedback_hub.config`，让它加载项目根 `.env`，最后把专题 API token 只保存到临时 shell 变量。以下命令不打印 token；也不要额外 `echo` 该变量：
 

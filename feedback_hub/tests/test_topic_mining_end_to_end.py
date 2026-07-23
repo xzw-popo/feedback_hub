@@ -6,20 +6,18 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import openpyxl
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from feedback_hub.topic_discovery.model_routes import ModelReply, ModelRoute
 from feedback_hub.topic_mining.api import make_router
 from feedback_hub.topic_mining.config import TopicMiningConfig
 from feedback_hub.topic_mining.contracts import validate_topic_spec
-from feedback_hub.topic_mining.export import export_topic_run
+from feedback_hub.topic_mining.export import HEADERS, export_topic_run
 from feedback_hub.topic_mining.run_store import TopicRunStore
 from feedback_hub.topic_mining.service import (
-    RunVerificationError,
+    get_candidate_page,
     run_topic_job,
-    submit_review_overrides,
+    submit_caller_classifications,
     verify_topic_run,
 )
 from feedback_hub.topic_mining.vector_client import (
@@ -52,7 +50,9 @@ def _topic_spec(start: datetime, end: datetime):
         ],
         "output": {
             "preferred_format": "xlsx",
-            "required_fields": ["feedback_text", "feedback_time", "source_url"],
+            "required_fields": [
+                "feedback_text", "feedback_time", "source_url",
+            ],
         },
     })
 
@@ -62,26 +62,52 @@ def _create_source(path, start: datetime, end: datetime) -> None:
     end_ms = int(end.timestamp() * 1000)
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "CREATE TABLE feedback (feedback_id TEXT PRIMARY KEY, conversation_id TEXT, "
-            "msg_seq INTEGER, ts_ms INTEGER, platform TEXT, appversion TEXT, channel TEXT, "
-            "device_name TEXT, user_vid TEXT, service_vid INTEGER, external_chat_url TEXT, text TEXT)"
+            """CREATE TABLE feedback (
+                feedback_id TEXT PRIMARY KEY, conversation_id TEXT,
+                msg_seq INTEGER, ts_ms INTEGER, platform TEXT,
+                appversion TEXT, channel TEXT, device_name TEXT,
+                user_vid TEXT, service_vid INTEGER,
+                external_chat_url TEXT, text TEXT
+            )"""
         )
-        connection.executemany("INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-            ("win-game", "c-game", 1, start_ms, "Win", "1", "pc", "PC", "u1", 1,
-             "https://example.test/game", "游戏全屏时输入法工具栏一直显示"),
-            ("win-taskbar", "c-taskbar", 1, start_ms + 1, "Win", "1", "pc", "PC", "u2", 2,
-             "https://example.test/taskbar", "全屏时 Windows 系统任务栏仍显示"),
-            ("win-black-screen", "c-black", 1, start_ms + 2, "Win", "1", "pc", "PC", "u3", 3,
-             "https://example.test/black", "游戏进入全屏后黑屏"),
-            ("mac-semantic", "c-mac", 1, start_ms + 3, "Mac", "1", "pc", "Mac", "u4", 4,
-             "https://example.test/mac", "视频全屏时输入法工具栏一直显示"),
-            ("win-paraphrase", "c-vector", 1, start_ms + 4, "Win", "1", "pc", "PC", "u5", 5,
-             "https://example.test/vector", "沉浸场景悬浮控件遮住画面且始终没有收起"),
-            # This exclusive-end boundary establishes source coverage without
-            # joining the scoped Win candidate set.
-            ("coverage-boundary", "c-boundary", 1, end_ms, "Win", "1", "pc", "PC", "u6", 6,
-             "https://example.test/boundary", "范围结束边界"),
-        ])
+        connection.executemany(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "win-game", "c-game", 1, start_ms, "Win", "1", "pc",
+                    "PC", "u1", 1, "https://example.test/game",
+                    "游戏全屏时输入法工具栏一直显示",
+                ),
+                (
+                    "win-taskbar", "c-taskbar", 1, start_ms + 1, "Win",
+                    "1", "pc", "PC", "u2", 2,
+                    "https://example.test/taskbar",
+                    "全屏时 Windows 系统任务栏仍显示",
+                ),
+                (
+                    "win-black-screen", "c-black", 1, start_ms + 2,
+                    "Win", "1", "pc", "PC", "u3", 3,
+                    "https://example.test/black", "游戏进入全屏后黑屏",
+                ),
+                (
+                    "mac-semantic", "c-mac", 1, start_ms + 3, "Mac",
+                    "1", "pc", "Mac", "u4", 4,
+                    "https://example.test/mac",
+                    "视频全屏时输入法工具栏一直显示",
+                ),
+                (
+                    "win-paraphrase", "c-vector", 1, start_ms + 4, "Win",
+                    "1", "pc", "PC", "u5", 5,
+                    "https://example.test/vector",
+                    "沉浸场景悬浮控件遮住画面且始终没有收起",
+                ),
+                (
+                    "coverage-boundary", "c-boundary", 1, end_ms, "Win",
+                    "1", "pc", "PC", "u6", 6,
+                    "https://example.test/boundary", "范围结束边界",
+                ),
+            ],
+        )
         connection.execute(
             """CREATE TABLE feedback_source_coverage (
                 channel TEXT NOT NULL, start_ts_ms INTEGER NOT NULL,
@@ -94,208 +120,136 @@ def _create_source(path, start: datetime, end: datetime) -> None:
         )
 
 
-def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_matches(tmp_path):
+def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
+    watermark = int(end.timestamp() * 1000)
     source = tmp_path / "source.db"
     _create_source(source, start, end)
     source_sha_before = hashlib.sha256(source.read_bytes()).hexdigest()
-
+    spec = _topic_spec(start, end)
+    assert spec.scope.platforms == ("Win",)
     config = TopicMiningConfig(
         source_db_path=source,
         data_dir=tmp_path / "topic-mining-data",
         vector_api_url="https://vector.example.test",
         vector_max_lag_seconds=1_000_000,
-        classifier_batch_size=20,
-        classifier_concurrency=1,
     )
     store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
-    run = store.create_or_get(_topic_spec(start, end), int(end.timestamp() * 1000))
+    run = store.create_or_get(
+        spec,
+        watermark,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
 
     class FakeVector:
         def capabilities(self):
-            return VectorCapabilities("feedback-items-v1", 1, ("feedback",), int(end.timestamp() * 1000))
+            return VectorCapabilities(
+                "feedback-items-v1", 1, ("feedback",), watermark,
+            )
 
         def search(self, _queries, filters, _limit):
             assert filters["platforms"] == ["Win"]
             return VectorSearchResult(
                 "feedback-items-v1",
-                int(end.timestamp() * 1000),
+                watermark,
                 (
-                    # The paraphrase has no lexical overlap with the topic and
-                    # reaches classification exclusively through vector recall.
                     VectorHit("win-paraphrase", "objective:0", 0.99, 1),
-                    # Out-of-scope identifiers are treated as recall rejects.
                     VectorHit("mac-semantic", "objective:0", 0.98, 2),
                 ),
             )
 
-    route = ModelRoute("fixture-model", "openai_compatible", "https://model.example.test", "fixture-secret", "fixture")
-
-    def model_call(prompt, **_kwargs):
-        candidate_ids = {row["item_id"] for row in json.loads(prompt)["candidates"]}
-        results = {
-            "win-game": {"label": "matched", "evidence": ["输入法工具栏一直显示"], "reason": "全屏工具栏仍显示"},
-            # Deliberately corrected by the required review override below.
-            "win-taskbar": {"label": "matched", "evidence": ["Windows 系统任务栏仍显示"], "reason": "需要人工排除"},
-            "win-black-screen": {"label": "not_matched", "evidence": [], "reason": "仅描述黑屏"},
-            "win-paraphrase": {"label": "not_matched", "evidence": [], "reason": "分类器证据不足"},
-        }
-        return ModelReply(
-            json.dumps({"results": [
-                {"item_id": item_id, **results[item_id], "confidence": 0.95, "needs_review": False}
-                for item_id in sorted(candidate_ids)
-            ]}, ensure_ascii=False),
-            route.name, route.endpoint_class, route.model, 1, 1, (),
-        )
-
-    # These public aliases are the test seam promised by the distributable
-    # integration contract; legacy classifier_* aliases remain supported.
     outcome = run_topic_job(
-        run["run_id"], store=store, config=config, vector_client=FakeVector(),
-        model_routes=[route], model_call_fn=model_call,
+        run["run_id"],
+        store=store,
+        config=config,
+        vector_client=FakeVector(),
+        model_call_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("backend model called"),
+        ),
     )
-    assert outcome["status"] == "review_ready", outcome
+    assert outcome["status"] == "classification_ready"
+    artifact_dir = config.data_dir / "runs" / run["run_id"]
+    assert not (artifact_dir / "classified.jsonl").exists()
 
-    expected_funnel = {
-        "hard_scope_count": 4,
-        "candidate_count": 4,
-        "classified_count": 4,
-        "review_queue_count": 4,
+    page = get_candidate_page(run["run_id"], 0, 20, store=store)
+    assert {row["item_id"] for row in page["items"]} == {
+        "win-game", "win-taskbar", "win-black-screen", "win-paraphrase",
     }
-    persisted_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
-    assert {
-        key: persisted_manifest["funnel"][key]
-        for key in expected_funnel
-    } == expected_funnel
+    paraphrase = next(
+        row for row in page["items"] if row["item_id"] == "win-paraphrase"
+    )
+    assert paraphrase["channels"] == ["vector"]
+    decisions = [
+        {
+            "item_id": "win-game", "label": "matched",
+            "reason": "游戏全屏时工具栏仍显示",
+            "evidence": ["输入法工具栏一直显示"],
+        },
+        {
+            "item_id": "win-taskbar", "label": "not_matched",
+            "reason": "明确排除系统任务栏", "evidence": [],
+        },
+        {
+            "item_id": "win-black-screen", "label": "not_matched",
+            "reason": "仅描述黑屏", "evidence": [],
+        },
+        {
+            "item_id": "win-paraphrase", "label": "matched",
+            "reason": "语义符合但先提交错误证据",
+            "evidence": ["原文中不存在"],
+        },
+    ]
+    partial = submit_caller_classifications(
+        run["run_id"], decisions, store=store,
+    )
+    assert partial["accepted_count"] == 3
+    assert partial["pending_count"] == 1
+    assert partial["rejected"] == [{
+        "item_id": "win-paraphrase",
+        "code": "evidence_not_grounded",
+    }]
+    assert not (artifact_dir / "caller_classifications.jsonl").exists()
+
+    repaired = submit_caller_classifications(
+        run["run_id"],
+        [{
+            "item_id": "win-paraphrase", "label": "matched",
+            "reason": "悬浮控件遮挡且未收起",
+            "evidence": ["悬浮控件遮住画面"],
+        }],
+        store=store,
+    )
+    assert repaired["accepted_count"] == 4
+    assert repaired["pending_count"] == 0
+    assert store.get(run["run_id"])["status"] == "verification_ready"
+    assert verify_topic_run(run["run_id"], store=store) == {
+        "run_id": run["run_id"],
+        "status": "verified",
+        "matched_count": 2,
+    }
 
     app = FastAPI()
     app.include_router(make_router(config=config, store=store))
     with TestClient(app) as client:
-        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
-    assert response.status_code == 200
-    public_funnel = response.json()["quality"]["funnel"]
-    assert {key: public_funnel[key] for key in expected_funnel} == expected_funnel
+        public = client.get(
+            f"/api/topic-mining/runs/{run['run_id']}",
+        ).json()
+    assert public["classification_owner"] == "caller_ai"
+    assert public["accepted_decision_count"] == 4
+    assert public["pending_decision_count"] == 0
 
-    artifact_dir = config.data_dir / "runs" / run["run_id"]
-    recalls = [json.loads(line) for line in (artifact_dir / "recall_candidates.jsonl").read_text(encoding="utf-8").splitlines()]
-    classifications = [json.loads(line) for line in (artifact_dir / "classified.jsonl").read_text(encoding="utf-8").splitlines()]
-    by_id = {row["item_id"]: row for row in recalls}
-    assert set(by_id) == {"win-game", "win-taskbar", "win-black-screen", "win-paraphrase"}
-    assert by_id["win-paraphrase"]["channels"] == ["vector"]
-    assert "mac-semantic" not in by_id
-    assert {row["item_id"] for row in classifications} == set(by_id)
-
-    overrides_path = artifact_dir / "review_overrides.jsonl"
-    before_invalid_submit = overrides_path.read_bytes()
-    with pytest.raises(ValueError, match="evidence"):
-        submit_review_overrides(run["run_id"], [{
-            "item_id": "win-paraphrase", "label": "matched",
-            "reason": "无根据改判", "reviewer": "fixture-reviewer",
-            "evidence": ["原文中不存在的证据"],
-        }], store=store)
-    assert overrides_path.read_bytes() == before_invalid_submit
-
-    review_queue = [
-        json.loads(line)
-        for line in (artifact_dir / "review_queue.jsonl").read_text(
-            encoding="utf-8",
-        ).splitlines()
-    ]
-    decisions = [
-        {
-            "item_id": "win-taskbar", "label": "not_matched",
-            "reason": "专题明确排除 Windows 系统任务栏", "reviewer": "fixture-reviewer",
-        },
-        {
-            "item_id": "win-paraphrase", "label": "matched",
-            "reason": "受控原文明确描述全屏遮挡", "reviewer": "fixture-reviewer",
-            "evidence": ["悬浮控件遮住画面"],
-        },
-    ]
-    decisions.extend({
-        "item_id": row["item_id"], "label": row["label"],
-        "reason": "确认现有判定", "reviewer": "fixture-reviewer",
-    } for row in review_queue if row["item_id"] not in {"win-taskbar", "win-paraphrase"})
-    submit_review_overrides(run["run_id"], decisions, store=store)
-    persisted_overrides = [json.loads(line) for line in overrides_path.read_text(encoding="utf-8").splitlines()]
-    assert persisted_overrides[1]["evidence"] == ["悬浮控件遮住画面"]
-
-    # Even a forged manifest cannot turn ungrounded override evidence into a
-    # verified claim: verification re-checks merged evidence against sources.
-    valid_override_bytes = overrides_path.read_bytes()
-    valid_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
-    tampered_overrides = [
-        json.loads(line)
-        for line in valid_override_bytes.decode("utf-8").splitlines()
-    ]
-    next(
-        row for row in tampered_overrides
-        if row["item_id"] == "win-paraphrase"
-    )["evidence"] = ["伪造证据"]
-    overrides_path.write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in tampered_overrides), encoding="utf-8")
-    tampered_manifest = json.loads(json.dumps(valid_manifest))
-    override_hash = hashlib.sha256(overrides_path.read_bytes()).hexdigest()
-    tampered_manifest["artifacts"]["review_overrides.jsonl"] = override_hash
-    for stage_name in ("review_queue", "review_ready"):
-        for direction in ("inputs", "outputs"):
-            if "review_overrides.jsonl" in tampered_manifest["stages"][stage_name][direction]:
-                tampered_manifest["stages"][stage_name][direction]["review_overrides.jsonl"] = override_hash
-    store.update_manifest(run["run_id"], tampered_manifest, stage="review_ready")
-    (artifact_dir / "manifest.json").write_text(json.dumps(tampered_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    with pytest.raises(RunVerificationError, match="invalid_evidence"):
-        verify_topic_run(run["run_id"], store=store)
-    overrides_path.write_bytes(valid_override_bytes)
-    store.update_manifest(run["run_id"], valid_manifest, stage="review_ready")
-    (artifact_dir / "manifest.json").write_text(json.dumps(valid_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-
-    assert verify_topic_run(run["run_id"], store=store) == {
-        "run_id": run["run_id"], "status": "verified", "matched_count": 2,
-    }
-    verified_manifest = json.loads(store.get(run["run_id"])["manifest_json"])
-    assert {
-        key: verified_manifest[key]
-        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
-    } == {
-        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
-        "returned_feedback": 2, "possibly_more_matches": False,
-    }
-    with TestClient(app) as client:
-        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
-    assert response.status_code == 200
-    assert {
-        key: response.json()[key]
-        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
-    } == {
-        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
-        "returned_feedback": 2, "possibly_more_matches": False,
-    }
-    # Verified runs created before scope metadata was introduced remain
-    # inspectable. The public response derives the exact bounded scope from
-    # the authenticated verification counts without rewriting the old run.
-    historical_manifest = json.loads(json.dumps(verified_manifest))
-    for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):
-        historical_manifest.pop(key)
-    store.update_manifest(run["run_id"], historical_manifest, stage="verified")
-    (artifact_dir / "manifest.json").write_text(json.dumps(historical_manifest), encoding="utf-8")
-    with TestClient(app) as client:
-        response = client.get(f"/api/topic-mining/runs/{run['run_id']}")
-    assert response.status_code == 200
-    assert {
-        key: response.json()[key]
-        for key in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches")
-    } == {
-        "mode": "standard", "result_scope": "reviewed", "matched_total": 2,
-        "returned_feedback": 2, "possibly_more_matches": False,
-    }
-    final_reviewed = [json.loads(line) for line in (artifact_dir / "final_reviewed.jsonl").read_text(encoding="utf-8").splitlines()]
-    final_by_id = {row["item_id"]: row for row in final_reviewed}
-    assert final_by_id["win-paraphrase"]["evidence"] == ["悬浮控件遮住画面"]
-    assert {row["data_cutoff_ms"] for row in final_reviewed} == {int(end.timestamp() * 1000)}
     workbook_path = export_topic_run(run["run_id"], "xlsx", store=store)
-    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+    workbook = openpyxl.load_workbook(
+        workbook_path, read_only=True, data_only=True,
+    )
     sheet = workbook["反馈清单"]
-    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    headers = [
+        cell.value for cell in next(
+            sheet.iter_rows(min_row=1, max_row=1),
+        )
+    ]
     feedback_id_column = headers.index("Feedback ID")
     workbook_ids = {
         row[feedback_id_column]
@@ -303,13 +257,13 @@ def test_complete_fixture_run_keeps_source_read_only_and_exports_verified_win_ma
         if row[feedback_id_column]
     }
     workbook.close()
+    assert headers == HEADERS
     assert workbook_ids == {"win-game", "win-paraphrase"}
-    assert headers == [
-        "反馈时间", "反馈原文", "对应链接", "平台", "版本", "设备",
-        "Feedback ID", "判定理由", "证据",
+    final_rows = [
+        json.loads(line)
+        for line in (
+            artifact_dir / "final_reviewed.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
     ]
-    final_results = [json.loads(line) for line in (artifact_dir / "final_results.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert {row["data_cutoff_ms"] for row in final_results} == {int(end.timestamp() * 1000)}
-    quality_report = json.loads((artifact_dir / "quality_report.json").read_text(encoding="utf-8"))
-    assert quality_report["data_cutoff_ms"] == int(end.timestamp() * 1000)
+    assert all(row["source"] == "caller_ai" for row in final_rows)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha_before

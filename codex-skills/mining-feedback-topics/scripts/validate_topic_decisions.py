@@ -20,7 +20,12 @@ def _load(path: str) -> Any:
         raise ValueError(f"cannot read JSON file: {Path(path).name}") from exc
 
 
-def validate(page: Any, decisions: Any) -> list[dict[str, Any]]:
+def validate(
+    page: Any,
+    decisions: Any,
+    *,
+    repair: bool = False,
+) -> list[dict[str, Any]]:
     if not isinstance(page, dict) or not isinstance(page.get("items"), list):
         raise ValueError("candidate page is invalid")
     if not isinstance(decisions, list):
@@ -81,22 +86,52 @@ def validate(page: Any, decisions: Any) -> list[dict[str, Any]]:
             "reason": reason.strip(),
             "evidence": list(evidence),
         })
-    if seen != set(by_id):
+    if repair and not seen:
+        raise ValueError("repair decision file must not be empty")
+    if not repair and seen != set(by_id):
         raise ValueError("decision file is missing candidate item IDs")
     return normalized
+
+
+def _write_atomic(path: str, value: Any, inputs: tuple[str, str]) -> None:
+    target = Path(path).resolve()
+    if target in {Path(value).resolve() for value in inputs}:
+        raise ValueError("output must differ from input files")
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f"cannot write output: {target.name}") from exc
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--page", required=True)
     parser.add_argument("--file", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--repair", action="store_true")
     arguments = parser.parse_args()
     try:
-        result = validate(_load(arguments.page), _load(arguments.file))
+        result = validate(
+            _load(arguments.page), _load(arguments.file),
+            repair=arguments.repair,
+        )
+        _write_atomic(
+            arguments.output, result, (arguments.page, arguments.file),
+        )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    print(json.dumps({
+        "output": arguments.output,
+        "decision_count": len(result),
+        "repair": arguments.repair,
+    }, ensure_ascii=False, sort_keys=True))
 
 
 if __name__ == "__main__":

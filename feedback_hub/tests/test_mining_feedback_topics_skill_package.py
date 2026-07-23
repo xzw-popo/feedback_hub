@@ -738,7 +738,7 @@ def test_skill_exhausts_candidate_pagination_with_page_local_submissions():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "limit 20" in body
     assert "follow `next_offset`" in body
-    assert "every returned item" in body
+    assert "independently decide every item" in body
     assert "apply-classifications run_id --page page --file decisions" in body
 
 
@@ -1139,7 +1139,7 @@ def test_client_argument_errors_are_redacted(monkeypatch):
     assert "Traceback" not in stderr
 
 
-def test_client_rejects_non_json_api_response_and_preserves_review_output(tmp_path, monkeypatch):
+def test_client_rejects_non_json_api_response_and_preserves_candidate_output(tmp_path, monkeypatch):
     module = _load_client_module()
     target = tmp_path / "review.json"
     target.write_text("old", encoding="utf-8")
@@ -1157,7 +1157,7 @@ def test_client_rejects_non_json_api_response_and_preserves_review_output(tmp_pa
     monkeypatch.setattr(module.urllib.request, "urlopen", lambda request, *, timeout: Response())
     code, _, stderr = _run_client(
         module,
-        ["--base-url", "https://topic.internal", "review-queue", "run-1", "--output", str(target)],
+        ["--base-url", "https://topic.internal", "candidate-page", "run-1", "--output", str(target)],
     )
 
     assert code == 4
@@ -1236,7 +1236,9 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ("POST", "https://topic.internal/api/topic-mining/runs", json.dumps(valid_spec(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/resume", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1/candidate-page?offset=0&limit=20", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/classifications", json.dumps([{
             "item_id": "a", "label": "matched", "reason": "命中",
             "evidence": ["原文"],
@@ -1258,7 +1260,7 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ["--offset", "not-an-integer"],
     ),
 )
-def test_client_rejects_invalid_review_page_arguments_before_request(
+def test_client_rejects_invalid_candidate_page_arguments_before_request(
     tmp_path, monkeypatch, arguments,
 ):
     module = _load_client_module()
@@ -1271,11 +1273,11 @@ def test_client_rejects_invalid_review_page_arguments_before_request(
     code, _, stderr = _run_client(
         module,
         [
-            "--base-url", "https://topic.internal", "review-queue", "run-1",
+            "--base-url", "https://topic.internal", "candidate-page", "run-1",
             "--output", str(tmp_path / "page.json"), *arguments,
         ],
     )
 
     assert code == 2
-    assert "review" in stderr
+    assert "candidate" in stderr or "offset" in stderr
     assert not requested

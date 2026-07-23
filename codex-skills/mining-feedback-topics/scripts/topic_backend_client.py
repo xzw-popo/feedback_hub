@@ -127,24 +127,14 @@ def _safe_path_segment(value: str, label: str) -> str:
     return value
 
 
-def _review_offset(value: str) -> int:
+def _page_offset(value: str) -> int:
     try:
         offset = int(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("review offset must be an integer") from error
+        raise argparse.ArgumentTypeError("page offset must be an integer") from error
     if offset < 0:
-        raise argparse.ArgumentTypeError("review offset must be at least 0")
+        raise argparse.ArgumentTypeError("page offset must be at least 0")
     return offset
-
-
-def _review_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("review limit must be an integer") from error
-    if not 1 <= limit <= 50:
-        raise argparse.ArgumentTypeError("review limit must be between 1 and 50")
-    return limit
 
 
 def _candidate_limit(value: str) -> int:
@@ -212,10 +202,8 @@ def _parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create-run"); create.add_argument("--spec", required=True)
     get = subparsers.add_parser("get-run"); get.add_argument("run_id")
     resume = subparsers.add_parser("resume"); resume.add_argument("run_id")
-    review = subparsers.add_parser("review-queue"); review.add_argument("run_id"); review.add_argument("--output", required=True); review.add_argument("--offset", type=_review_offset, default=0); review.add_argument("--limit", type=_review_limit, default=50)
-    overrides = subparsers.add_parser("apply-overrides"); overrides.add_argument("run_id"); overrides.add_argument("--file", required=True)
-    candidates = subparsers.add_parser("candidate-page"); candidates.add_argument("run_id"); candidates.add_argument("--output", required=True); candidates.add_argument("--offset", type=_review_offset, default=0); candidates.add_argument("--limit", type=_candidate_limit, default=20)
-    classifications = subparsers.add_parser("apply-classifications"); classifications.add_argument("run_id"); classifications.add_argument("--page", required=True); classifications.add_argument("--file", required=True)
+    candidates = subparsers.add_parser("candidate-page"); candidates.add_argument("run_id"); candidates.add_argument("--output", required=True); candidates.add_argument("--offset", type=_page_offset, default=0); candidates.add_argument("--limit", type=_candidate_limit, default=20)
+    classifications = subparsers.add_parser("apply-classifications"); classifications.add_argument("run_id"); classifications.add_argument("--page", required=True); classifications.add_argument("--file", required=True); classifications.add_argument("--repair", action="store_true")
     verify = subparsers.add_parser("verify"); verify.add_argument("run_id")
     export = subparsers.add_parser("export"); export.add_argument("run_id"); export.add_argument("--format", choices=("xlsx", "jsonl"), required=True)
     download = subparsers.add_parser("download"); download.add_argument("run_id"); download.add_argument("artifact_name"); download.add_argument("--output", required=True)
@@ -279,19 +267,9 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         run_id = _safe_path_segment(arguments.run_id, "run id")
         response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/resume")
         return response
-    if command == "review-queue":
-        run_id = _safe_path_segment(arguments.run_id, "run id")
-        query = urlencode({"offset": arguments.offset, "limit": arguments.limit})
-        response, raw = _request(
-            base_url, token, "GET", f"/runs/{run_id}/review-queue?{query}",
-        )
-        _write_atomic(arguments.output, raw)
-        return response
-    if command == "apply-overrides":
-        run_id = _safe_path_segment(arguments.run_id, "run id")
-        response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/overrides", _read_json(arguments.file, require_list=True))
-        return response
     if command == "candidate-page":
+        capabilities, _ = _request(base_url, token, "GET", "/capabilities")
+        _classification_contract(capabilities)
         run_id = _safe_path_segment(arguments.run_id, "run id")
         query = urlencode({"offset": arguments.offset, "limit": arguments.limit})
         response, raw = _request(
@@ -301,27 +279,40 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         _write_atomic(arguments.output, raw)
         return response
     if command == "apply-classifications":
+        capabilities, _ = _request(base_url, token, "GET", "/capabilities")
+        _classification_contract(capabilities)
         run_id = _safe_path_segment(arguments.run_id, "run id")
         validator = Path(__file__).with_name("validate_topic_decisions.py")
-        completed = subprocess.run(
-            [
-                sys.executable, str(validator), "--page", arguments.page,
-                "--file", arguments.file,
-            ],
-            text=True, capture_output=True, check=False,
+        decision_path = Path(arguments.file)
+        prepared = decision_path.with_name(
+            f".{decision_path.name}.{os.getpid()}.prepared.json",
         )
-        if completed.returncode != 0:
-            raise LocalError(
-                completed.stderr.strip() or "topic decision validation failed",
-            )
         try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as error:
-            raise LocalError("topic decision validation returned invalid JSON") from error
-        response, _ = _request(
-            base_url, token, "POST",
-            f"/runs/{run_id}/classifications", payload,
-        )
+            command_line = [
+                sys.executable, str(validator), "--page", arguments.page,
+                "--file", arguments.file, "--output", str(prepared),
+            ]
+            if arguments.repair:
+                command_line.append("--repair")
+            completed = subprocess.run(
+                command_line,
+                text=True, capture_output=True, check=False,
+            )
+            if completed.returncode != 0:
+                raise LocalError(
+                    completed.stderr.strip()
+                    or "topic decision validation failed",
+                )
+            payload = _read_json(str(prepared), require_list=True)
+            response, _ = _request(
+                base_url, token, "POST",
+                f"/runs/{run_id}/classifications", payload,
+            )
+        finally:
+            try:
+                prepared.unlink(missing_ok=True)
+            except OSError:
+                pass
         return response
     if command == "verify":
         run_id = _safe_path_segment(arguments.run_id, "run id")
