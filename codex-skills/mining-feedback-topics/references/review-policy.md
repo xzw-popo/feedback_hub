@@ -1,18 +1,15 @@
-# Review Policy
+# Caller-AI Decision Policy
 
-The backend returns every mandatory uncertainty plus a bounded deterministic QA sample. Review every returned queue item for each listed reason:
+The calling AI owns every semantic decision. The backend supplies frozen recall candidates, source text, `context_items`, and the user's complete inclusion/exclusion boundary; similarity scores are retrieval hints, never labels.
 
-| Reason | Check |
-| --- | --- |
-| `classifier_requested_review` | Resolve an explicit classifier uncertainty. |
-| `low_confidence_match` | Confirm the match boundary. |
-| `vector_only_match` | Require source-grounded support beyond recall similarity. |
-| `negative_query_conflict` | Decide which stated boundary applies. |
-| `deterministic_label_sample` | Audit representative decisions for each label. |
-| `high_confidence_reject_sample` | Check strong exclusions for systematic misses. |
+For every candidate page, return exactly one JSON decision per item:
 
-Make every decision from `source_item`, supplied `context_items`, inclusion/exclusion criteria, and evidence. Do not decide from similarity or a score alone. Submit one explicit decision for every queue item, including a confirmation when the label stays unchanged; verification remains blocked until queue and decision IDs match exactly.
+```json
+{"item_id":"...","label":"matched","reason":"...","evidence":["exact source substring"]}
+```
 
-Submit a JSON list of review decisions. Each entry needs `item_id`, `label` (`matched` or `not_matched`), `reason`, and `reviewer`; each item may appear once. When setting `matched` without existing grounded evidence—especially changing `not_matched` to `matched`—also provide `evidence` as a non-empty string list. Every evidence string must be an exact substring of `source_item.text` or one of the supplied `context_items` texts. A decision changes only the run's decision layer and audit trail. It never edits a source record, source text, source link, or formal label.
+Allowed fields are only `item_id`, `label`, `reason`, and `evidence`. Use `matched` only when the inclusion criteria are affirmatively satisfied and no exclusion applies. Every matched decision needs one or more exact, non-empty substrings from `item.text` or a supplied context text. Use `not_matched` when evidence is insufficient or an exclusion applies; its evidence must be `[]`. Explain the boundary in `reason`.
 
-Fetch pages with `limit 50`, starting at offset 0. Follow the response's `next_offset` until it is null, including queues of 51 or more items. Keep decisions keyed by `item_id`, reject duplicate IDs while merging pages, and call `apply-overrides` only once with the complete merged decision list. Never submit a first page while later pages remain.
+Fetch at most 20 candidates per page. Do not omit, add, or duplicate page IDs. Run the bundled local validator through `apply-classifications`; it must pass before the request is made. The backend validates each item again and may accept valid siblings while rejecting individual invalid decisions. A partial HTTP 200 is progress, not Run failure: keep accepted items, repair only rejected/pending IDs, and never reclassify accepted siblings merely because one item failed.
+
+Continue until every frozen candidate is accepted and the Run reaches `verification_ready`. Verification rechecks exact coverage and evidence against authenticated source artifacts. Decisions affect only this Run's audited result; they never change source feedback or formal labels.

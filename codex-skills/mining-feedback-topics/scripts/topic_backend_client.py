@@ -147,6 +147,20 @@ def _review_limit(value: str) -> int:
     return limit
 
 
+def _candidate_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "candidate limit must be an integer",
+        ) from error
+    if not 1 <= limit <= 20:
+        raise argparse.ArgumentTypeError(
+            "candidate limit must be between 1 and 20",
+        )
+    return limit
+
+
 def _positive_days(value: str) -> int:
     try:
         days = int(value)
@@ -169,6 +183,23 @@ def _platform_contract(capabilities: Any) -> dict[str, Any]:
     return platforms
 
 
+def _classification_contract(capabilities: Any) -> dict[str, Any]:
+    expected = {
+        "version": 2,
+        "owner": "caller_ai",
+        "candidate_page_default": 20,
+        "candidate_page_maximum": 20,
+        "matched_evidence": "exact_source_or_context_substring",
+        "partial_acceptance": True,
+    }
+    if (
+        not isinstance(capabilities, dict)
+        or capabilities.get("classification_protocol") != expected
+    ):
+        raise LocalError("backend caller-AI classification protocol is unavailable")
+    return expected
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _ClientArgumentParser(description=__doc__)
     parser.add_argument("--base-url", help="Override FEEDBACK_TOPIC_API_URL")
@@ -183,6 +214,8 @@ def _parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume"); resume.add_argument("run_id")
     review = subparsers.add_parser("review-queue"); review.add_argument("run_id"); review.add_argument("--output", required=True); review.add_argument("--offset", type=_review_offset, default=0); review.add_argument("--limit", type=_review_limit, default=50)
     overrides = subparsers.add_parser("apply-overrides"); overrides.add_argument("run_id"); overrides.add_argument("--file", required=True)
+    candidates = subparsers.add_parser("candidate-page"); candidates.add_argument("run_id"); candidates.add_argument("--output", required=True); candidates.add_argument("--offset", type=_review_offset, default=0); candidates.add_argument("--limit", type=_candidate_limit, default=20)
+    classifications = subparsers.add_parser("apply-classifications"); classifications.add_argument("run_id"); classifications.add_argument("--page", required=True); classifications.add_argument("--file", required=True)
     verify = subparsers.add_parser("verify"); verify.add_argument("run_id")
     export = subparsers.add_parser("export"); export.add_argument("run_id"); export.add_argument("--format", choices=("xlsx", "jsonl"), required=True)
     download = subparsers.add_parser("download"); download.add_argument("run_id"); download.add_argument("artifact_name"); download.add_argument("--output", required=True)
@@ -198,6 +231,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         return response
     if command == "prepare-spec":
         capabilities, _ = _request(base_url, token, "GET", "/capabilities")
+        _classification_contract(capabilities)
         freshness = capabilities.get("source_freshness") if isinstance(capabilities, dict) else None
         if not isinstance(freshness, dict) or freshness.get("ready") is not True:
             raise LocalError("source freshness is not ready")
@@ -233,6 +267,8 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             raise LocalError("topic spec preparation returned invalid JSON")
         return prepared
     if command == "create-run":
+        capabilities, _ = _request(base_url, token, "GET", "/capabilities")
+        _classification_contract(capabilities)
         response, _ = _request(base_url, token, "POST", "/runs", _read_json(arguments.spec))
         return response
     if command == "get-run":
@@ -254,6 +290,38 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
     if command == "apply-overrides":
         run_id = _safe_path_segment(arguments.run_id, "run id")
         response, _ = _request(base_url, token, "POST", f"/runs/{run_id}/overrides", _read_json(arguments.file, require_list=True))
+        return response
+    if command == "candidate-page":
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        query = urlencode({"offset": arguments.offset, "limit": arguments.limit})
+        response, raw = _request(
+            base_url, token, "GET",
+            f"/runs/{run_id}/candidate-page?{query}",
+        )
+        _write_atomic(arguments.output, raw)
+        return response
+    if command == "apply-classifications":
+        run_id = _safe_path_segment(arguments.run_id, "run id")
+        validator = Path(__file__).with_name("validate_topic_decisions.py")
+        completed = subprocess.run(
+            [
+                sys.executable, str(validator), "--page", arguments.page,
+                "--file", arguments.file,
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        if completed.returncode != 0:
+            raise LocalError(
+                completed.stderr.strip() or "topic decision validation failed",
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise LocalError("topic decision validation returned invalid JSON") from error
+        response, _ = _request(
+            base_url, token, "POST",
+            f"/runs/{run_id}/classifications", payload,
+        )
         return response
     if command == "verify":
         run_id = _safe_path_segment(arguments.run_id, "run id")

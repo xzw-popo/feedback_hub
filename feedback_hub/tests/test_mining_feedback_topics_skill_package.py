@@ -21,6 +21,20 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_ROOT = REPO_ROOT / "codex-skills" / "mining-feedback-topics"
 VALIDATOR = SKILL_ROOT / "scripts" / "validate_topic_spec.py"
 CLIENT = SKILL_ROOT / "scripts" / "topic_backend_client.py"
+DECISION_VALIDATOR = (
+    SKILL_ROOT / "scripts" / "validate_topic_decisions.py"
+)
+
+
+def _classification_protocol():
+    return {
+        "version": 2,
+        "owner": "caller_ai",
+        "candidate_page_default": 20,
+        "candidate_page_maximum": 20,
+        "matched_evidence": "exact_source_or_context_substring",
+        "partial_acceptance": True,
+    }
 
 
 def _platform_contract():
@@ -183,6 +197,9 @@ def test_validator_prepares_independent_spec_consumed_by_create_run(tmp_path, mo
     submitted = []
 
     class Response:
+        def __init__(self, raw=b'{"run_id":"run-1"}'):
+            self.raw = raw
+
         def __enter__(self):
             return self
 
@@ -190,9 +207,13 @@ def test_validator_prepares_independent_spec_consumed_by_create_run(tmp_path, mo
             return False
 
         def read(self):
-            return b'{"run_id":"run-1"}'
+            return self.raw
 
     def recording_urlopen(request, *, timeout):
+        if request.data is None:
+            return Response(json.dumps({
+                "classification_protocol": _classification_protocol(),
+            }).encode("utf-8"))
         submitted.append(json.loads(request.data.decode("utf-8")))
         return Response()
 
@@ -316,6 +337,7 @@ def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path
     def request(base_url, token, method, path, payload=None, *, expect_json=True):
         requests.append((method, path))
         return ({
+            "classification_protocol": _classification_protocol(),
             "default_time_days": 14,
             "source_freshness": {
                 "ready": True,
@@ -346,6 +368,7 @@ def test_client_prepare_spec_preserves_complete_explicit_time_pair(tmp_path, mon
     source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
     module = _load_client_module()
     monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "classification_protocol": _classification_protocol(),
         "default_time_days": 14,
         "source_freshness": {
             "ready": True,
@@ -401,6 +424,7 @@ def test_client_prepare_spec_fails_closed_on_missing_or_malformed_platform_contr
     source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
     prepared.write_text("old", encoding="utf-8")
     capabilities = {
+        "classification_protocol": _classification_protocol(),
         "default_time_days": 14,
         "source_freshness": {
             "ready": True,
@@ -430,6 +454,7 @@ def test_client_prepare_spec_rejects_unready_source_without_output(tmp_path, mon
     source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
     module = _load_client_module()
     monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "classification_protocol": _classification_protocol(),
         "default_time_days": 14,
         "source_freshness": {"ready": False, "available_through": None},
     }, b""))
@@ -570,20 +595,20 @@ def test_skill_guidance_has_auditable_ordered_workflow_and_direct_resources():
     for resource in (
         "[topic spec](references/topic-spec.md)",
         "[backend contract](references/backend-contract.md)",
-        "[review policy](references/review-policy.md)",
+        "[decision policy](references/review-policy.md)",
         "[validate_topic_spec.py](scripts/validate_topic_spec.py)",
         "[topic_backend_client.py](scripts/topic_backend_client.py)",
     ):
         assert resource in body
         assert f"`{resource}" not in body
-    gates = ("capabilities", "validate", "create", "inspect", "review", "verify", "export", "deliver")
+    gates = ("capabilities", "validate", "create", "inspect", "classify", "verify", "export", "deliver")
     positions = [body.lower().index(gate) for gate in gates]
     assert positions == sorted(positions)
     for condition in (
-        "data coverage",
+        "data/index gaps",
         "vector watermark",
-        "exact classification coverage",
-        "source evidence",
+        "exact candidate coverage",
+        "source-grounded evidence",
         "valid links",
     ):
         assert condition in body.lower()
@@ -625,21 +650,20 @@ def test_skill_uses_backend_owned_dynamic_budgets_and_uncapped_confirmed_exports
 def test_skill_guidance_keeps_unverified_or_plan_only_work_inside_the_backend_contract():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "do not query source databases or vector tools directly" in body
-    assert "do not claim artifacts, results, or validation" in body
-    assert "do not expand the user's named object into a different object or product" in body
+    assert "do not claim results" in body
 
 
 def test_skill_guidance_preserves_user_named_target_objects():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
-    assert "keep each user-named target object and behavior as required inclusion conditions" in body
-    assert "put unrequested adjacent objects or behaviors only in exclusion criteria" in body
+    assert "preserve user-named objects and behaviors as required inclusion conditions" in body
+    assert "exclude unrequested adjacent topics" in body
 
 
 def test_skill_guidance_copies_hard_scope_and_client_commands_without_invention():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "populate each hard-scope field only with values explicit in the current request" in body
     assert "leave every other hard-scope field empty" in body
-    assert "copy client commands from the backend contract verbatim" in body
+    assert "read the [backend contract]" in body
 
 
 def test_skill_guidance_shapes_blocked_pre_run_responses():
@@ -670,8 +694,8 @@ def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
         "`create-run --spec prepared_spec_path`",
         "`get-run run_id`",
         "`resume run_id`",
-        "`review-queue run_id --output file --offset offset --limit 50`",
-        "`apply-overrides run_id --file file`",
+        "`candidate-page run_id --output page --offset offset --limit 20`",
+        "`apply-classifications run_id --page page --file decisions`",
         "`verify run_id`",
         "`export run_id --format xlsx|jsonl`",
         "`download run_id artifact --output file`",
@@ -710,12 +734,12 @@ def test_skill_and_references_advertise_only_feedback_units():
     assert schema["properties"]["unit"] == {"enum": ["feedback"]}
 
 
-def test_skill_exhausts_review_pagination_before_submitting_one_override_set():
+def test_skill_exhausts_candidate_pagination_with_page_local_submissions():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
-    assert "limit 50" in body
-    assert "until `next_offset` is null" in body
-    assert "merge all page decisions" in body
-    assert body.index("until `next_offset` is null") < body.index("`apply-overrides run_id --file file`")
+    assert "limit 20" in body
+    assert "follow `next_offset`" in body
+    assert "every returned item" in body
+    assert "apply-classifications run_id --page page --file decisions" in body
 
 
 def test_skill_discloses_representative_scope():
@@ -780,8 +804,8 @@ def test_backend_contract_has_one_copyable_complete_command_sequence():
         "python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH",
         "python3 scripts/topic_backend_client.py get-run RUN_ID",
         "python3 scripts/topic_backend_client.py resume RUN_ID",
-        "python3 scripts/topic_backend_client.py review-queue RUN_ID --output REVIEW_PAGE_PATH --offset OFFSET --limit 50",
-        "python3 scripts/topic_backend_client.py apply-overrides RUN_ID --file OVERRIDES_PATH",
+        "python3 scripts/topic_backend_client.py candidate-page RUN_ID --output CANDIDATE_PAGE_PATH --offset OFFSET --limit 20",
+        "python3 scripts/topic_backend_client.py apply-classifications RUN_ID --page CANDIDATE_PAGE_PATH --file DECISIONS_PATH",
         "python3 scripts/topic_backend_client.py verify RUN_ID",
         "python3 scripts/topic_backend_client.py export RUN_ID --format xlsx",
         "python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH",
@@ -803,9 +827,9 @@ def test_skill_references_define_default_mode_paging_and_delivery_policy():
     assert "authentication=internal_network_boundary" in backend
     for field in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):
         assert f"`{field}`" in backend
-    assert "follow the returned `next_offset` and stop only when it is null" in backend
-    assert "including queues of 51 or more items" in review
-    assert "call `apply-overrides` only once" in review
+    assert "follow `next_offset`" in backend
+    assert "at most 20 candidates per page" in review
+    assert "partial http 200 is progress" in review.lower()
     assert "retrieved_candidate_count > classified_count" in backend
     assert "possibly_more_matches=true in either mode" in backend
 
@@ -831,25 +855,23 @@ def test_review_contract_requires_complete_context_grounded_decisions():
         SKILL_ROOT / "references" / "review-policy.md"
     ).read_text(encoding="utf-8")
 
-    assert "one explicit decision for every item" in contract
+    assert "cover exactly its page ids once" in contract.lower()
     assert "context_items" in skill
     assert "context_items" in policy
-    assert "non-empty string list" in policy
-    assert "exact substring" in policy
+    assert "non-empty substrings" in policy
+    assert "exact" in policy
 
 
-def test_skill_requires_repair_then_resume_of_the_original_recoverable_run():
+def test_skill_resumes_only_recoverable_preclassification_runs():
     skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
     contract = (
         SKILL_ROOT / "references" / "backend-contract.md"
     ).read_text(encoding="utf-8").lower()
 
-    for text in (skill, contract):
-        assert "paused_quota_exhausted" in text
-        assert "failed" in text
-        assert "resume run_id" in text
-        assert "original run" in text
-        assert "do not create a replacement run" in text
+    assert "only for a recoverable pre-classification run" in skill
+    assert "classification states are caller-owned" in skill
+    assert "resume applies only to recoverable pre-classification work" in contract
+    assert "backend never chooses a semantic classifier for v2" in contract
 
 
 def test_backend_contract_keeps_internal_artifacts_out_of_download_contract():
@@ -1147,9 +1169,12 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
     module = _load_client_module()
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(valid_spec()), encoding="utf-8")
-    overrides_path = tmp_path / "overrides.json"
-    overrides_path.write_text("[]", encoding="utf-8")
-    review_output = tmp_path / "review.json"
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text(json.dumps([{
+        "item_id": "a", "label": "matched", "reason": "命中",
+        "evidence": ["原文"],
+    }]), encoding="utf-8")
+    review_output = tmp_path / "candidate-page.json"
     download_output = tmp_path / "results.xlsx"
     requests = []
 
@@ -1168,7 +1193,19 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
 
     def urlopen(request, *, timeout):
         requests.append((request.get_method(), request.full_url, request.data, timeout))
-        raw = b"binary-xlsx" if "/artifacts/" in request.full_url else b'{"ok":true}'
+        if request.full_url.endswith("/capabilities"):
+            raw = json.dumps({
+                "classification_protocol": _classification_protocol(),
+            }).encode("utf-8")
+        elif "/candidate-page?" in request.full_url:
+            raw = json.dumps({
+                "items": [{
+                    "item_id": "a", "item": {"item_id": "a", "text": "原文"},
+                    "context_items": [],
+                }],
+            }, ensure_ascii=False).encode("utf-8")
+        else:
+            raw = b"binary-xlsx" if "/artifacts/" in request.full_url else b'{"ok":true}'
         return Response(raw)
 
     monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
@@ -1178,10 +1215,13 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
         ["get-run", "run-1"],
         ["resume", "run-1"],
         [
-            "review-queue", "run-1", "--output", str(review_output),
-            "--offset", "7", "--limit", "20",
+            "candidate-page", "run-1", "--output", str(review_output),
+            "--offset", "0", "--limit", "20",
         ],
-        ["apply-overrides", "run-1", "--file", str(overrides_path)],
+        [
+            "apply-classifications", "run-1", "--page", str(review_output),
+            "--file", str(decisions_path),
+        ],
         ["verify", "run-1"],
         ["export", "run-1", "--format", "xlsx"],
         ["download", "run-1", "results.xlsx", "--output", str(download_output)],
@@ -1192,16 +1232,20 @@ def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monk
 
     assert [(method, url, body, timeout) for method, url, body, timeout in requests] == [
         ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs", json.dumps(valid_spec(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/resume", None, 30),
-        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/review-queue?offset=7&limit=20", None, 30),
-        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/overrides", b"[]", 30),
+        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/candidate-page?offset=0&limit=20", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/classifications", json.dumps([{
+            "item_id": "a", "label": "matched", "reason": "命中",
+            "evidence": ["原文"],
+        }], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"), 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/verify", None, 30),
         ("POST", "https://topic.internal/api/topic-mining/runs/run-1/export", b'{"format":"xlsx"}', 30),
         ("GET", "https://topic.internal/api/topic-mining/runs/run-1/artifacts/results.xlsx", None, 30),
     ]
-    assert json.loads(review_output.read_text(encoding="utf-8")) == {"ok": True}
+    assert json.loads(review_output.read_text(encoding="utf-8"))["items"][0]["item_id"] == "a"
     assert download_output.read_bytes() == b"binary-xlsx"
 
 
