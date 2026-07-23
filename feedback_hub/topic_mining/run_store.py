@@ -17,7 +17,9 @@ from .contracts import TopicSpec, topic_spec_hash
 
 
 RUN_STATES = frozenset({
-    "pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted",
+    "pending", "running", "classification_ready", "classification_in_progress",
+    "verification_ready", "review_ready", "verified", "failed",
+    "paused_quota_exhausted",
 })
 
 
@@ -57,44 +59,126 @@ class TopicRunStore:
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            current_sql_row = connection.execute(
+                """SELECT sql FROM sqlite_master
+                   WHERE type = 'table' AND name = 'topic_run'"""
+            ).fetchone()
+            if current_sql_row is None:
+                connection.execute(self._topic_run_schema("topic_run"))
+            else:
+                current_sql = str(current_sql_row["sql"] or "")
+                existing = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(topic_run)")
+                }
+                canonical_markers = {
+                    "classification_protocol_version",
+                    "classification_owner",
+                    "worker_claim_token",
+                    "worker_claimed_at_ms",
+                    "worker_lease_expires_at_ms",
+                    "publication_json",
+                }
+                requires_rebuild = (
+                    not canonical_markers <= existing
+                    or "classification_ready" not in current_sql
+                    or "verification_ready" not in current_sql
+                    or "classification_protocol_version)" not in current_sql.replace(
+                        " ", ""
+                    )
+                )
+                if requires_rebuild:
+                    self._migrate_topic_run_table(connection, existing)
             connection.execute(
-                """CREATE TABLE IF NOT EXISTS topic_run (
-                    run_id TEXT PRIMARY KEY,
-                    spec_hash TEXT NOT NULL,
-                    spec_json TEXT NOT NULL,
-                    source_watermark_ms INTEGER NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN (
-                        'pending', 'running', 'review_ready', 'verified', 'failed',
-                        'paused_quota_exhausted'
-                    )),
-                    stage TEXT NOT NULL,
-                    error_code TEXT,
-                    error_message TEXT,
-                    artifact_dir TEXT NOT NULL,
+                """CREATE TABLE IF NOT EXISTS topic_run_caller_decision (
+                    run_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    candidate_set_sha256 TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
-                    manifest_json TEXT NOT NULL,
-                    worker_claim_token TEXT,
-                    worker_claimed_at_ms INTEGER,
-                    worker_lease_expires_at_ms INTEGER,
-                    publication_json TEXT,
-                    UNIQUE(spec_hash, source_watermark_ms)
+                    PRIMARY KEY(run_id, item_id),
+                    FOREIGN KEY(run_id) REFERENCES topic_run(run_id)
                 )"""
             )
-            existing = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(topic_run)")
-            }
-            for name, sql_type in (
-                ("worker_claim_token", "TEXT"),
-                ("worker_claimed_at_ms", "INTEGER"),
-                ("worker_lease_expires_at_ms", "INTEGER"),
-                ("publication_json", "TEXT"),
-            ):
-                if name not in existing:
-                    connection.execute(
-                        f"ALTER TABLE topic_run ADD COLUMN {name} {sql_type}"
-                    )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS topic_run_caller_decision_audit (
+                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    candidate_set_sha256 TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    recorded_at_ms INTEGER NOT NULL,
+                    UNIQUE(run_id, item_id, revision),
+                    FOREIGN KEY(run_id) REFERENCES topic_run(run_id)
+                )"""
+            )
+
+    @staticmethod
+    def _topic_run_schema(table_name: str) -> str:
+        return f"""CREATE TABLE {table_name} (
+            run_id TEXT PRIMARY KEY,
+            spec_hash TEXT NOT NULL,
+            spec_json TEXT NOT NULL,
+            source_watermark_ms INTEGER NOT NULL,
+            classification_protocol_version INTEGER NOT NULL DEFAULT 1,
+            classification_owner TEXT NOT NULL DEFAULT 'backend_model',
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'running', 'classification_ready',
+                'classification_in_progress', 'verification_ready',
+                'review_ready', 'verified', 'failed', 'paused_quota_exhausted'
+            )),
+            stage TEXT NOT NULL,
+            error_code TEXT,
+            error_message TEXT,
+            artifact_dir TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            manifest_json TEXT NOT NULL,
+            worker_claim_token TEXT,
+            worker_claimed_at_ms INTEGER,
+            worker_lease_expires_at_ms INTEGER,
+            publication_json TEXT,
+            UNIQUE(spec_hash, source_watermark_ms, classification_protocol_version)
+        )"""
+
+    @classmethod
+    def _migrate_topic_run_table(
+        cls,
+        connection: sqlite3.Connection,
+        existing: set[str],
+    ) -> None:
+        """Rebuild the table because SQLite cannot alter CHECK/UNIQUE clauses."""
+        connection.execute("DROP TABLE IF EXISTS topic_run_v2")
+        connection.execute(cls._topic_run_schema("topic_run_v2"))
+        canonical = (
+            "run_id", "spec_hash", "spec_json", "source_watermark_ms",
+            "classification_protocol_version", "classification_owner",
+            "status", "stage", "error_code", "error_message", "artifact_dir",
+            "created_at_ms", "updated_at_ms", "manifest_json",
+            "worker_claim_token", "worker_claimed_at_ms",
+            "worker_lease_expires_at_ms", "publication_json",
+        )
+        defaults = {
+            "classification_protocol_version": "1",
+            "classification_owner": "'backend_model'",
+            "worker_claim_token": "NULL",
+            "worker_claimed_at_ms": "NULL",
+            "worker_lease_expires_at_ms": "NULL",
+            "publication_json": "NULL",
+        }
+        expressions = [
+            name if name in existing else defaults[name]
+            for name in canonical
+        ]
+        connection.execute(
+            f"""INSERT INTO topic_run_v2 ({", ".join(canonical)})
+                SELECT {", ".join(expressions)} FROM topic_run"""
+        )
+        connection.execute("DROP TABLE topic_run")
+        connection.execute("ALTER TABLE topic_run_v2 RENAME TO topic_run")
 
     def create_or_get(
         self,
@@ -104,19 +188,35 @@ class TopicRunStore:
         initial_files: Mapping[str, Path] | None = None,
         initial_manifest: Mapping[str, Any] | None = None,
         initial_stage: str = "created",
+        classification_protocol_version: int = 1,
+        classification_owner: str = "backend_model",
     ) -> dict[str, Any]:
         """Create one run, optionally installing a frozen snapshot first."""
         if (initial_files is None) != (initial_manifest is None):
             raise ValueError("initial files and manifest must be provided together")
         if not isinstance(initial_stage, str) or not initial_stage:
             raise ValueError("initial stage is required")
+        expected_owner = {
+            1: "backend_model",
+            2: "caller_ai",
+        }.get(classification_protocol_version)
+        if expected_owner is None or classification_owner != expected_owner:
+            raise ValueError("unsupported classification protocol")
         spec_hash = topic_spec_hash(spec)
-        run_id = hashlib.sha256(f"{spec_hash}:{source_watermark_ms}".encode("utf-8")).hexdigest()[:16]
+        identity = f"{spec_hash}:{source_watermark_ms}"
+        if classification_protocol_version != 1:
+            identity += f":classification-v{classification_protocol_version}"
+        run_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         artifact_dir = self.artifacts_dir / run_id
         with self._connect() as connection:
             existing = connection.execute(
-                "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
-                (spec_hash, int(source_watermark_ms)),
+                """SELECT * FROM topic_run
+                   WHERE spec_hash = ? AND source_watermark_ms = ?
+                     AND classification_protocol_version = ?""",
+                (
+                    spec_hash, int(source_watermark_ms),
+                    classification_protocol_version,
+                ),
             ).fetchone()
         if existing is not None:
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -171,6 +271,8 @@ class TopicRunStore:
             "spec_hash": spec_hash,
             "spec_json": json.dumps(spec.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             "source_watermark_ms": int(source_watermark_ms),
+            "classification_protocol_version": classification_protocol_version,
+            "classification_owner": classification_owner,
             "status": "pending",
             "stage": initial_stage,
             "error_code": None,
@@ -188,8 +290,13 @@ class TopicRunStore:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
-                    (spec_hash, int(source_watermark_ms)),
+                    """SELECT * FROM topic_run
+                       WHERE spec_hash = ? AND source_watermark_ms = ?
+                         AND classification_protocol_version = ?""",
+                    (
+                        spec_hash, int(source_watermark_ms),
+                        classification_protocol_version,
+                    ),
                 ).fetchone()
                 if row is not None:
                     result = dict(row)
@@ -202,12 +309,16 @@ class TopicRunStore:
                     self._write_manifest_mirror(artifact_dir, initial_manifest)
                 cursor = connection.execute(
                     """INSERT INTO topic_run (
-                        run_id, spec_hash, spec_json, source_watermark_ms, status, stage,
+                        run_id, spec_hash, spec_json, source_watermark_ms,
+                        classification_protocol_version, classification_owner,
+                        status, stage,
                         error_code, error_message, artifact_dir, created_at_ms, updated_at_ms, manifest_json,
                         worker_claim_token, worker_claimed_at_ms, worker_lease_expires_at_ms,
                         publication_json
                     ) VALUES (
-                        :run_id, :spec_hash, :spec_json, :source_watermark_ms, :status, :stage,
+                        :run_id, :spec_hash, :spec_json, :source_watermark_ms,
+                        :classification_protocol_version, :classification_owner,
+                        :status, :stage,
                         :error_code, :error_message, :artifact_dir, :created_at_ms, :updated_at_ms, :manifest_json,
                         :worker_claim_token, :worker_claimed_at_ms, :worker_lease_expires_at_ms,
                         :publication_json
@@ -216,8 +327,13 @@ class TopicRunStore:
                 )
                 created = cursor.rowcount == 1
                 row = connection.execute(
-                    "SELECT * FROM topic_run WHERE spec_hash = ? AND source_watermark_ms = ?",
-                    (spec_hash, int(source_watermark_ms)),
+                    """SELECT * FROM topic_run
+                       WHERE spec_hash = ? AND source_watermark_ms = ?
+                         AND classification_protocol_version = ?""",
+                    (
+                        spec_hash, int(source_watermark_ms),
+                        classification_protocol_version,
+                    ),
                 ).fetchone()
         finally:
             for temporary, _target in prepared_initial:
@@ -227,6 +343,152 @@ class TopicRunStore:
         result = dict(row)
         result["created"] = created
         return result
+
+    def upsert_caller_decisions(
+        self,
+        run_id: str,
+        candidate_set_sha256: str,
+        decisions: list[Mapping[str, Any]],
+    ) -> dict[str, list[str]]:
+        """Persist caller-AI decisions with idempotency and revision history."""
+        if (
+            not isinstance(candidate_set_sha256, str)
+            or len(candidate_set_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in candidate_set_sha256)
+        ):
+            raise ValueError("invalid candidate set digest")
+        result: dict[str, list[str]] = {
+            "inserted": [],
+            "updated": [],
+            "unchanged": [],
+        }
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """SELECT classification_protocol_version, classification_owner,
+                          status
+                   FROM topic_run WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            if (
+                int(run["classification_protocol_version"]) != 2
+                or str(run["classification_owner"]) != "caller_ai"
+            ):
+                raise ValueError("caller decisions require classification protocol v2")
+            if str(run["status"]) not in {
+                "classification_ready", "classification_in_progress",
+            }:
+                raise ValueError("caller_decisions_immutable")
+            bound = connection.execute(
+                """SELECT DISTINCT candidate_set_sha256
+                   FROM topic_run_caller_decision WHERE run_id = ?""",
+                (run_id,),
+            ).fetchall()
+            if any(
+                str(row["candidate_set_sha256"]) != candidate_set_sha256
+                for row in bound
+            ):
+                raise ValueError("candidate_set_mismatch")
+
+            now_ms = int(time.time() * 1000)
+            seen: set[str] = set()
+            for decision in decisions:
+                item_id = decision.get("item_id")
+                if not isinstance(item_id, str) or not item_id:
+                    raise ValueError("caller decision item_id is required")
+                if item_id in seen:
+                    raise ValueError("duplicate caller decision item_id")
+                seen.add(item_id)
+                decision_json = json.dumps(
+                    dict(decision), ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                )
+                existing = connection.execute(
+                    """SELECT candidate_set_sha256, decision_json, revision,
+                              created_at_ms
+                       FROM topic_run_caller_decision
+                       WHERE run_id = ? AND item_id = ?""",
+                    (run_id, item_id),
+                ).fetchone()
+                if existing is not None and (
+                    str(existing["candidate_set_sha256"]) != candidate_set_sha256
+                ):
+                    raise ValueError("candidate_set_mismatch")
+                if existing is not None and str(existing["decision_json"]) == decision_json:
+                    result["unchanged"].append(item_id)
+                    continue
+                revision = 1 if existing is None else int(existing["revision"]) + 1
+                created_at_ms = (
+                    now_ms if existing is None else int(existing["created_at_ms"])
+                )
+                connection.execute(
+                    """INSERT INTO topic_run_caller_decision (
+                        run_id, item_id, candidate_set_sha256, decision_json,
+                        revision, created_at_ms, updated_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, item_id) DO UPDATE SET
+                        candidate_set_sha256 = excluded.candidate_set_sha256,
+                        decision_json = excluded.decision_json,
+                        revision = excluded.revision,
+                        updated_at_ms = excluded.updated_at_ms""",
+                    (
+                        run_id, item_id, candidate_set_sha256, decision_json,
+                        revision, created_at_ms, now_ms,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO topic_run_caller_decision_audit (
+                        run_id, item_id, revision, candidate_set_sha256,
+                        decision_json, recorded_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id, item_id, revision, candidate_set_sha256,
+                        decision_json, now_ms,
+                    ),
+                )
+                result["inserted" if existing is None else "updated"].append(item_id)
+        return result
+
+    def get_caller_decisions(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT decision_json FROM topic_run_caller_decision
+                   WHERE run_id = ? ORDER BY item_id""",
+                (run_id,),
+            ).fetchall()
+        return [json.loads(str(row["decision_json"])) for row in rows]
+
+    def caller_decision_progress(
+        self,
+        run_id: str,
+        candidate_ids: list[str],
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT item_id FROM topic_run_caller_decision
+                   WHERE run_id = ?""",
+                (run_id,),
+            ).fetchall()
+        accepted = {str(row["item_id"]) for row in rows}
+        accepted_ids = [item_id for item_id in candidate_ids if item_id in accepted]
+        pending_ids = [item_id for item_id in candidate_ids if item_id not in accepted]
+        return {
+            "accepted_count": len(accepted_ids),
+            "pending_count": len(pending_ids),
+            "accepted_ids": accepted_ids,
+            "pending_ids": pending_ids,
+        }
+
+    def caller_revision_count(self, run_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS count
+                   FROM topic_run_caller_decision_audit WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+        return int(row["count"])
 
     def claim_worker(
         self,
@@ -254,7 +516,10 @@ class TopicRunStore:
             if row is None:
                 return WorkerClaim(run_id, False, "run_not_found", None)
             status = str(row["status"])
-            if status in {"review_ready", "verified"}:
+            if status in {
+                "classification_ready", "classification_in_progress",
+                "verification_ready", "review_ready", "verified",
+            }:
                 return WorkerClaim(run_id, False, "run_not_recoverable", status)
             live_lease = row["worker_lease_expires_at_ms"]
             if status == "running" and live_lease is not None and int(live_lease) > claimed_at_ms:

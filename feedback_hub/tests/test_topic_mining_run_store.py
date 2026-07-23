@@ -62,6 +62,36 @@ def test_same_spec_with_new_source_watermark_creates_new_run(tmp_path, valid_top
     )["run_id"]
 
 
+def test_v2_run_identity_is_idempotent_and_distinct_from_v1(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+
+    v1 = store.create_or_get(valid_topic_spec, 1234)
+    v2 = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+    same_v2 = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+
+    assert v1["run_id"] != v2["run_id"]
+    assert v2["run_id"] == same_v2["run_id"]
+    assert v1["classification_protocol_version"] == 1
+    assert v1["classification_owner"] == "backend_model"
+    assert v2["classification_protocol_version"] == 2
+    assert v2["classification_owner"] == "caller_ai"
+    assert v2["run_id"] == hashlib.sha256(
+        f"{v2['spec_hash']}:1234:classification-v2".encode()
+    ).hexdigest()[:16]
+
+
 def test_create_run_uses_independent_database_and_artifact_dir(tmp_path, valid_topic_spec):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
 
@@ -233,6 +263,116 @@ def test_existing_run_database_is_migrated_with_worker_lease_columns(tmp_path):
     # can be reclaimed after the schema upgrade.
     claim = store.claim_worker("legacy-running", lease_seconds=60, now_ms=10_000)
     assert claim.claimed is True
+
+
+def test_existing_run_database_migration_preserves_v1_protocol_identity(tmp_path):
+    db_path = tmp_path / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE topic_run (
+                run_id TEXT PRIMARY KEY,
+                spec_hash TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                source_watermark_ms INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'running', 'review_ready', 'verified', 'failed',
+                    'paused_quota_exhausted'
+                )),
+                stage TEXT NOT NULL,
+                error_code TEXT,
+                error_message TEXT,
+                artifact_dir TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                manifest_json TEXT NOT NULL,
+                worker_claim_token TEXT,
+                worker_claimed_at_ms INTEGER,
+                worker_lease_expires_at_ms INTEGER,
+                publication_json TEXT,
+                UNIQUE(spec_hash, source_watermark_ms)
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO topic_run VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )""",
+            (
+                "legacy-run", "legacy-spec", "{}", 123, "review_ready",
+                "review_ready", None, None,
+                str(tmp_path / "runs" / "legacy-run"), 1, 1, "{}",
+                None, None, None, None,
+            ),
+        )
+
+    store = TopicRunStore(db_path, tmp_path / "runs")
+    legacy = store.get("legacy-run")
+
+    assert legacy["classification_protocol_version"] == 1
+    assert legacy["classification_owner"] == "backend_model"
+    assert legacy["status"] == "review_ready"
+    with sqlite3.connect(db_path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='topic_run'"
+        ).fetchone()[0]
+    assert "classification_ready" in table_sql
+    assert "verification_ready" in table_sql
+
+
+def test_caller_decisions_are_idempotent_revisioned_and_digest_bound(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(
+        valid_topic_spec,
+        1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+    store.update_status(
+        run["run_id"], "classification_ready", stage="classification_ready",
+    )
+    first = {
+        "item_id": "a", "label": "matched", "reason": "明确",
+        "evidence": ["原文"],
+    }
+
+    inserted = store.upsert_caller_decisions(
+        run["run_id"], "a" * 64, [first],
+    )
+    unchanged = store.upsert_caller_decisions(
+        run["run_id"], "a" * 64, [first],
+    )
+    corrected = {
+        "item_id": "a", "label": "not_matched", "reason": "修正",
+        "evidence": [],
+    }
+    updated = store.upsert_caller_decisions(
+        run["run_id"], "a" * 64, [corrected],
+    )
+
+    assert inserted == {"inserted": ["a"], "updated": [], "unchanged": []}
+    assert unchanged == {"inserted": [], "updated": [], "unchanged": ["a"]}
+    assert updated == {"inserted": [], "updated": ["a"], "unchanged": []}
+    assert store.get_caller_decisions(run["run_id"]) == [corrected]
+    assert store.caller_decision_progress(run["run_id"], ["a", "b"]) == {
+        "accepted_count": 1,
+        "pending_count": 1,
+        "accepted_ids": ["a"],
+        "pending_ids": ["b"],
+    }
+    assert store.caller_revision_count(run["run_id"]) == 2
+
+    with pytest.raises(ValueError, match="candidate_set_mismatch"):
+        store.upsert_caller_decisions(
+            run["run_id"], "b" * 64, [corrected],
+        )
+    store.update_status(
+        run["run_id"], "verification_ready", stage="verification_ready",
+    )
+    with pytest.raises(ValueError, match="caller_decisions_immutable"):
+        store.upsert_caller_decisions(
+            run["run_id"], "a" * 64, [corrected],
+        )
 
 
 def test_pending_worker_claim_is_atomic_under_concurrency(tmp_path, valid_topic_spec):
