@@ -12,6 +12,7 @@ from urllib.error import URLError
 
 import pytest
 import yaml
+from openpyxl import Workbook, load_workbook
 
 from feedback_hub.tests.test_topic_mining_contracts import valid_spec
 from feedback_hub.topic_mining.contracts import topic_spec_json_schema, validate_topic_spec
@@ -23,6 +24,9 @@ VALIDATOR = SKILL_ROOT / "scripts" / "validate_topic_spec.py"
 CLIENT = SKILL_ROOT / "scripts" / "topic_backend_client.py"
 DECISION_VALIDATOR = (
     SKILL_ROOT / "scripts" / "validate_topic_decisions.py"
+)
+HYPERLINK_GATE = (
+    SKILL_ROOT / "scripts" / "ensure_feedback_hyperlinks.py"
 )
 
 
@@ -93,6 +97,251 @@ def _parse_frontmatter(path: Path) -> dict[str, object]:
     value = yaml.safe_load(metadata)
     assert isinstance(value, dict)
     return value
+
+
+def _write_official_workbook(
+    tmp_path: Path,
+    *,
+    missing_link_for: str | None = None,
+) -> Path:
+    path = tmp_path / "official.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "反馈清单"
+    sheet.append(["反馈原文", "Feedback ID", "对应链接"])
+    for feedback_id, text, url in (
+        ("feedback-1", "第一条反馈", "https://example.test/1"),
+        ("feedback-2", "第二条反馈", "https://example.test/2"),
+    ):
+        sheet.append([text, feedback_id, None])
+        link = sheet.cell(sheet.max_row, 3)
+        if feedback_id != missing_link_for:
+            link.value = f'=HYPERLINK("{url}","打开反馈")'
+            link.hyperlink = url
+            link.style = "Hyperlink"
+    workbook.save(path)
+    return path
+
+
+def _write_derived_workbook(
+    tmp_path: Path,
+    *,
+    rows: list[tuple[object, object, object]],
+    name: str = "derived.xlsx",
+) -> Path:
+    path = tmp_path / name
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "反馈清单"
+    sheet.append(["Feedback ID", "反馈原文", "对应链接", "自定义分类"])
+    for feedback_id, link, label in rows:
+        sheet.append([feedback_id, f"加工后的 {feedback_id}", link, label])
+    workbook.save(path)
+    return path
+
+
+def _run_hyperlink_gate(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(HYPERLINK_GATE), *arguments],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_hyperlink_gate_repairs_filtered_reordered_and_labeled_workbook(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[
+            ("feedback-2", "https://wrong.test/plain", "类别 B"),
+            ("feedback-1", None, "类别 A"),
+        ],
+    )
+    original = derived.read_bytes()
+    output = tmp_path / "verified.xlsx"
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "feedback_rows": 2,
+        "item_sheets": 1,
+        "repaired_links": 2,
+    }
+    assert derived.read_bytes() == original
+    workbook = load_workbook(output, data_only=False)
+    sheet = workbook["反馈清单"]
+    assert sheet["C2"].data_type == "f"
+    assert sheet["C2"].value == '=HYPERLINK("https://example.test/2","打开反馈")'
+    assert sheet["C2"].hyperlink.target == "https://example.test/2"
+    assert sheet["C2"].style == "Hyperlink"
+    assert sheet["D2"].value == "类别 B"
+
+
+def test_hyperlink_gate_repairs_multiple_item_sheets_and_ignores_summary(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别 A")],
+    )
+    workbook = load_workbook(derived)
+    second = workbook.create_sheet("类别 B")
+    second.append(["说明"])
+    second.append(["此处是任意摘要"])
+    second.append(["Feedback ID", "对应链接", "附加判断"])
+    second.append(["feedback-2", "plain", "需要跟进"])
+    summary = workbook.create_sheet("汇总")
+    summary.append(["类别", "数量"])
+    summary.append(["类别 A", 1])
+    workbook.save(derived)
+    output = tmp_path / "verified.xlsx"
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value == {"feedback_rows": 2, "item_sheets": 2, "repaired_links": 2}
+    repaired = load_workbook(output, data_only=False)
+    assert repaired["类别 B"]["B4"].hyperlink.target == "https://example.test/2"
+    assert repaired["汇总"]["B2"].value == 1
+
+
+def test_hyperlink_gate_check_accepts_untouched_official_workbook(tmp_path):
+    official = _write_official_workbook(tmp_path)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(official),
+        "--check",
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "feedback_rows": 2,
+        "item_sheets": 1,
+        "repaired_links": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    (
+        ([("unknown", "plain", "类别")], "unknown"),
+        (
+            [
+                ("feedback-1", "plain", "类别 A"),
+                ("feedback-1", "plain", "类别 B"),
+            ],
+            "unique",
+        ),
+        ([(None, "plain", "类别")], "non-empty"),
+    ),
+)
+def test_hyperlink_gate_rejects_invalid_feedback_ids(tmp_path, rows, message):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(tmp_path, rows=rows)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert message in result.stderr.lower()
+
+
+@pytest.mark.parametrize("missing_header", ("Feedback ID", "对应链接"))
+def test_hyperlink_gate_rejects_feedback_sheet_missing_required_column(
+    tmp_path, missing_header,
+):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别")],
+    )
+    workbook = load_workbook(derived)
+    sheet = workbook["反馈清单"]
+    for cell in sheet[1]:
+        if cell.value == missing_header:
+            cell.value = "已删除"
+    workbook.save(derived)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert "requires feedback id and link columns" in result.stderr.lower()
+
+
+def test_hyperlink_gate_rejects_missing_official_target(tmp_path):
+    official = _write_official_workbook(
+        tmp_path,
+        missing_link_for="feedback-2",
+    )
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-2", "plain", "类别")],
+    )
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert "official link" in result.stderr.lower()
+
+
+def test_hyperlink_gate_rejects_same_input_and_output(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别")],
+    )
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(derived),
+    ])
+
+    assert result.returncode == 2
+    assert "output must differ" in result.stderr.lower()
+
+
+def test_hyperlink_gate_failed_repair_preserves_existing_output(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("unknown", "plain", "类别")],
+    )
+    output = tmp_path / "verified.xlsx"
+    output.write_bytes(b"existing artifact")
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 2
+    assert "unknown" in result.stderr.lower()
+    assert output.read_bytes() == b"existing artifact"
 
 
 def test_skill_schema_matches_backend_contract():
