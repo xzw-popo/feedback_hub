@@ -49,3 +49,19 @@ A source-coverage rejection means the backend has no continuous successful-pull 
 Source snapshots, recall files, caller-decision audit data, and `final_reviewed.jsonl` are backend-internal and never available through artifact download. Only verified final deliverables `final_results.jsonl`, `quality_report.json`, and `feedback_list.xlsx` may be downloaded. Retrieval controls remain backend-owned.
 
 Every run and exported artifact reports `mode`, `result_scope`, `matched_total`, `returned_feedback`, and `possibly_more_matches`. The only current `result_scope` values are `reviewed` and `representative`; copy the backend value and never invent `complete` or another value. Both modes export all verified matched rows, so `returned_feedback=matched_total`. When `retrieved_candidate_count > classified_count`, `possibly_more_matches=true in either mode` and `result_scope=representative`; otherwise the scope is `reviewed`. Representative means the delivery contains every confirmed match but may omit potential matches that were never classified. Never hide standard or exhaustive candidate safety-limit truncation.
+
+## Excel delivery gate
+
+Keep the downloaded `feedback_list.xlsx` byte-for-byte as a separate backend official Excel and present it first. Validate it before delivery:
+
+```bash
+python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input OFFICIAL_XLSX --check
+```
+
+Arbitrary post-processing—including filtering, sorting, grouping, labeling, annotations, added columns, or new sheets—does not exempt a workbook from link validation. Keep `Feedback ID` and a feedback-link column on every item-level row. Repair each derived workbook to a distinct output using only official ID-to-link mappings:
+
+```bash
+python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input DERIVED_XLSX --output VERIFIED_XLSX
+```
+
+Present only `VERIFIED_XLSX`, never the unverified derived input. The gate scans all item-level sheets, ignores summary-only sheets, and fails on missing columns, blank/duplicate/unknown IDs, missing official targets, or links that remain plain text. On failure, do not deliver that workbook. A derived workbook never replaces or hides the official artifact; if official export, download, or `--check` fails, disclose the blocker instead of substituting an Agent-generated file.

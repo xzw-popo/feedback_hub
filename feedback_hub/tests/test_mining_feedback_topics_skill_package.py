@@ -1009,6 +1009,43 @@ def test_skill_delivery_copies_all_five_backend_scope_fields_only():
     assert "copy only these five backend-returned fields" in body
 
 
+def test_skill_requires_backend_official_excel_as_primary_delivery():
+    body = (
+        SKILL_ROOT / "SKILL.md"
+    ).read_text(encoding="utf-8").split("---", 2)[2].lower()
+
+    assert "backend official excel" in body
+    assert "first file" in body
+    assert "must not be replaced" in body
+    assert "must not be hidden" in body
+
+
+def test_skill_requires_every_presented_excel_to_pass_hyperlink_gate():
+    body = (
+        SKILL_ROOT / "SKILL.md"
+    ).read_text(encoding="utf-8").split("---", 2)[2].lower()
+
+    assert "every presented `.xlsx`" in body
+    assert "[ensure_feedback_hyperlinks.py](scripts/ensure_feedback_hyperlinks.py)" in body
+    assert "plain-text link" in body
+    assert "must not be delivered" in body
+    assert "feedback id" in body
+
+
+def test_backend_contract_has_copyable_hyperlink_delivery_gate_commands():
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8")
+
+    for command in (
+        "python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input OFFICIAL_XLSX --check",
+        "python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input DERIVED_XLSX --output VERIFIED_XLSX",
+    ):
+        assert command in contract
+    assert "arbitrary post-processing" in contract.lower()
+    assert "separate backend official excel" in contract.lower()
+
+
 def test_skill_uses_only_backend_returned_result_scope_values():
     body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
     assert "result_scope=reviewed" in body
