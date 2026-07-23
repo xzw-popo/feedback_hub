@@ -27,6 +27,7 @@ from .contracts import TopicSpec, load_persisted_topic_spec, topic_spec_hash
 from feedback_hub.jsonl_io import load_jsonl_objects
 from .retrieval import RecallHit, build_semantic_queries, build_vector_filters, hybrid_recall, recall_budget
 from .review import apply_review_overrides, persist_review_artifacts, plan_review_queue
+from .protocol import classification_protocol
 from .run_store import RunPublicationConflictError, TopicRunStore
 from .source import DataCoverageError, SourceReadinessError, build_item_contexts, create_source_snapshot, fetch_scoped_items
 from .vector_client import HttpVectorSearchClient
@@ -37,7 +38,11 @@ class RunVerificationError(ValueError):
 
 
 _STAGES = ("snapshot", "hard_scope", "hybrid_recall", "classify", "review_queue", "review_ready")
+_CALLER_AI_STAGES = (
+    "snapshot", "hard_scope", "hybrid_recall", "classification_ready",
+)
 _MANIFEST_VERSION = 2
+_CALLER_AI_MANIFEST_VERSION = 3
 _UNRESOLVED_KEYS = (
     "unresolved_classifier_items", "unresolved_parser_items", "duplicate_item_ids",
     "missing_link_items", "unresolved_vector_items", "unresolved_coverage_items",
@@ -256,6 +261,53 @@ def _run_pipeline(
         )
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
     selected_recalls = _classification_candidates(manifest, artifact_dir, recalls)
+    protocol_version, protocol_owner = classification_protocol(run)
+    if protocol_version == 2 and protocol_owner == "caller_ai":
+        candidate_digest = _sha256(selected_path)
+        manifest.update({
+            "manifest_version": _CALLER_AI_MANIFEST_VERSION,
+            "classification_protocol": {
+                "version": protocol_version,
+                "owner": protocol_owner,
+            },
+            "classification_owner": protocol_owner,
+            "candidate_set_sha256": candidate_digest,
+            "accepted_decision_count": 0,
+            "pending_decision_count": len(selected_recalls),
+        })
+        if not _stage_valid(
+            manifest, "classification_ready", artifact_dir,
+        ):
+            _ensure_worker_active(run_id, store)
+            ready_path = artifact_dir / "classification_ready.json"
+            ready_workspace = _stage_workspace(
+                store, artifact_dir, "classification_ready",
+            )
+            _atomic_json(
+                ready_workspace / ready_path.name,
+                {
+                    "classification_protocol_version": protocol_version,
+                    "classification_owner": protocol_owner,
+                    "candidate_set_sha256": candidate_digest,
+                    "candidate_count": len(selected_recalls),
+                },
+            )
+            ready_hashes = _promote_stage_files(
+                run_id, store, artifact_dir, ready_workspace,
+                [ready_path.name],
+            )
+            _checkpoint(
+                run_id, store, artifact_dir, manifest,
+                "classification_ready", [ready_path],
+                output_hashes=ready_hashes,
+            )
+        _set_status(
+            run_id, store, "classification_ready",
+            stage="classification_ready",
+        )
+        return
+    if protocol_version != 1 or protocol_owner != "backend_model":
+        raise RunVerificationError("unsupported_classification_protocol")
 
     classified_path = artifact_dir / "classified.jsonl"
     audit_path = artifact_dir / "classification_audit.jsonl"
@@ -388,6 +440,100 @@ def _run_pipeline(
         [queue_path, overrides_path], output_hashes=ready_hashes,
     )
     _set_status(run_id, store, "review_ready", stage="review_ready")
+
+
+def get_candidate_page(
+    run_id: str,
+    offset: int,
+    limit: int,
+    *,
+    store: TopicRunStore | None = None,
+) -> dict[str, Any]:
+    """Return one stable, hash-verified page for caller-owned classification."""
+    if (
+        isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+        or isinstance(limit, bool) or not isinstance(limit, int)
+        or not 1 <= limit <= 20
+    ):
+        raise RunVerificationError("invalid_candidate_page")
+    store = store or default_store()
+    run = _require_run(run_id, store)
+    version, owner = classification_protocol(run)
+    if version != 2 or owner != "caller_ai":
+        raise RunVerificationError("caller_ai_protocol_required")
+    if run["status"] not in {
+        "classification_ready", "classification_in_progress",
+        "verification_ready",
+    }:
+        raise RunVerificationError("run_not_classification_ready")
+    artifact_dir = Path(str(run["artifact_dir"]))
+    manifest = _load_manifest(run, artifact_dir)
+    if manifest.get("classification_protocol") != {
+        "version": 2, "owner": "caller_ai",
+    }:
+        raise RunVerificationError("classification_protocol_mismatch")
+    _verify_manifest(manifest, artifact_dir)
+    _require_artifact(manifest, artifact_dir / "recall_candidates.jsonl")
+    _require_artifact(manifest, artifact_dir / "selected_candidates.jsonl")
+    _require_artifact(manifest, artifact_dir / "item_contexts.json")
+    candidate_digest = manifest.get("candidate_set_sha256")
+    if (
+        not isinstance(candidate_digest, str)
+        or candidate_digest != _sha256(artifact_dir / "selected_candidates.jsonl")
+    ):
+        raise RunVerificationError("candidate_set_mismatch")
+    recalls = [
+        _recall_from_dict(row)
+        for row in _read_required_jsonl(
+            artifact_dir / "recall_candidates.jsonl", manifest,
+        )
+    ]
+    selected = _classification_candidates(manifest, artifact_dir, recalls)
+    contexts = _read_required_json(
+        artifact_dir / "item_contexts.json", manifest,
+    )
+    decisions = {
+        str(row.get("item_id"))
+        for row in store.get_caller_decisions(run_id)
+        if isinstance(row, Mapping)
+    }
+    page = selected[offset:offset + limit]
+    items = [
+        {
+            **candidate.to_dict(),
+            "context_items": [
+                dict(item)
+                for item in contexts.get(candidate.item_id, [])
+                if isinstance(item, Mapping)
+            ],
+            "decision_state": (
+                "accepted" if candidate.item_id in decisions else "pending"
+            ),
+        }
+        for candidate in page
+    ]
+    next_offset = offset + limit if offset + limit < len(selected) else None
+    spec = load_persisted_topic_spec(json.loads(run["spec_json"]))
+    return {
+        "run_id": run_id,
+        "candidate_set_sha256": candidate_digest,
+        "offset": offset,
+        "limit": limit,
+        "total": len(selected),
+        "next_offset": next_offset,
+        "topic": {
+            "topic_name": spec.topic_name,
+            "objective": spec.objective,
+            "inclusion_criteria": list(spec.inclusion_criteria),
+            "exclusion_criteria": list(spec.exclusion_criteria),
+            "positive_examples": list(spec.positive_examples),
+            "negative_examples": list(spec.negative_examples),
+            "classification_labels": [
+                dict(label) for label in spec.classification_labels
+            ],
+        },
+        "items": items,
+    }
 
 
 def submit_review_overrides(
@@ -971,9 +1117,14 @@ def _require_artifact(manifest: Mapping[str, Any], path: Path) -> None:
 
 def _require_stage_chain(manifest: Mapping[str, Any], artifact_dir: Path) -> None:
     stages = manifest.get("stages")
-    if manifest.get("manifest_version") != _MANIFEST_VERSION or not isinstance(stages, Mapping):
+    expected_version = (
+        _CALLER_AI_MANIFEST_VERSION
+        if _caller_ai_manifest(manifest)
+        else _MANIFEST_VERSION
+    )
+    if manifest.get("manifest_version") != expected_version or not isinstance(stages, Mapping):
         raise RunVerificationError("manifest_stage_chain")
-    for stage in _STAGES:
+    for stage in _stages_for_manifest(manifest):
         record = stages.get(stage)
         if not isinstance(record, Mapping) or not isinstance(record.get("inputs"), Mapping) or not isinstance(record.get("outputs"), Mapping):
             raise RunVerificationError("manifest_stage_chain")
@@ -1009,7 +1160,7 @@ def _checkpoint(
             if output_hashes is not None and path.name in output_hashes
             else _sha256(path)
         )
-    if stage not in _STAGES:
+    if stage not in _stages_for_manifest(manifest):
         manifest["stage"] = stage
         _write_manifest_mirror(run_id, store, artifact_dir, manifest)
         store.update_manifest(run_id, manifest, stage=stage)
@@ -1043,7 +1194,11 @@ def _checkpoint(
     if stage == "classify":
         manifest.get("stage_attempts", {}).pop("classify", None)
     funnel[stage + "_count"] = output_count
-    manifest["manifest_version"] = _MANIFEST_VERSION
+    manifest["manifest_version"] = (
+        _CALLER_AI_MANIFEST_VERSION
+        if _caller_ai_manifest(manifest)
+        else _MANIFEST_VERSION
+    )
     manifest["stage"] = stage
     _write_manifest_mirror(run_id, store, artifact_dir, manifest)
     store.update_manifest(run_id, manifest, stage=stage)
@@ -1060,7 +1215,7 @@ def _prepare_checkpoint_manifest(
     if not isinstance(artifacts, dict):
         raise RunVerificationError("manifest_hash_reconciliation")
     artifacts.update(pending_hashes)
-    if stage not in _STAGES:
+    if stage not in _stages_for_manifest(manifest):
         manifest["stage"] = stage
         return
     input_names, output_names = _stage_contract_names(stage, artifact_dir)
@@ -1087,7 +1242,11 @@ def _prepare_checkpoint_manifest(
         "output_count": output_count,
     }
     manifest.setdefault("funnel", {})[stage + "_count"] = output_count
-    manifest["manifest_version"] = _MANIFEST_VERSION
+    manifest["manifest_version"] = (
+        _CALLER_AI_MANIFEST_VERSION
+        if _caller_ai_manifest(manifest)
+        else _MANIFEST_VERSION
+    )
     manifest["stage"] = stage
 
 
@@ -1270,7 +1429,7 @@ def _trusted_stage_input_hashes(
     trusted: dict[str, str] = {}
     for name in names:
         expected: str | None = None
-        for stage in reversed(_STAGES):
+        for stage in reversed(_stages_for_manifest(manifest)):
             record = stages.get(stage)
             outputs = record.get("outputs") if isinstance(record, Mapping) else None
             value = outputs.get(name) if isinstance(outputs, Mapping) else None
@@ -1490,6 +1649,10 @@ def _stage_contract_names(stage: str, artifact_dir: Path) -> tuple[set[str], set
         "classify": ({"recall_candidates.jsonl", "recall_manifest.json", "item_contexts.json"}, {"classified.jsonl", "classification_audit.jsonl"}),
         "review_queue": ({"classified.jsonl", "recall_candidates.jsonl", "classification_audit.jsonl"}, {"review_queue.jsonl", "review_overrides.jsonl"}),
         "review_ready": ({"review_queue.jsonl", "review_overrides.jsonl"}, {"review_ready.json"}),
+        "classification_ready": (
+            {"selected_candidates.jsonl", "item_contexts.json"},
+            {"classification_ready.json"},
+        ),
     }
     inputs, outputs = contracts[stage]
     selected_path = artifact_dir / "selected_candidates.jsonl"
@@ -1518,6 +1681,8 @@ def _stage_output_count(stage: str, artifact_dir: Path, manifest: Mapping[str, A
         return len(_read_jsonl(artifact_dir / "review_queue.jsonl"))
     if stage == "review_ready":
         return len(_read_jsonl(artifact_dir / "classified.jsonl"))
+    if stage == "classification_ready":
+        return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
     return len(_read_jsonl(artifact_dir / "final_reviewed.jsonl"))
 
 
@@ -1528,8 +1693,21 @@ def _stage_input_count(stage: str, artifact_dir: Path) -> int:
         return _snapshot_row_count(artifact_dir)
     if stage == "classify" and (artifact_dir / "selected_candidates.jsonl").is_file():
         return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
-    previous = _STAGES[_STAGES.index(stage) - 1]
+    if stage == "classification_ready":
+        return len(_read_jsonl(artifact_dir / "selected_candidates.jsonl"))
+    stages = _CALLER_AI_STAGES if stage in _CALLER_AI_STAGES else _STAGES
+    previous = stages[stages.index(stage) - 1]
     return _stage_output_count(previous, artifact_dir, {})
+
+
+def _caller_ai_manifest(manifest: Mapping[str, Any]) -> bool:
+    return manifest.get("classification_protocol") == {
+        "version": 2, "owner": "caller_ai",
+    }
+
+
+def _stages_for_manifest(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    return _CALLER_AI_STAGES if _caller_ai_manifest(manifest) else _STAGES
 
 
 def _snapshot_row_count(artifact_dir: Path) -> int:

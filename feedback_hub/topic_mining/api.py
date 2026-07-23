@@ -20,10 +20,15 @@ from .config import TopicMiningConfig
 from .contracts import load_persisted_topic_spec, topic_spec_hash, validate_topic_spec
 from feedback_hub.jsonl_io import load_jsonl_objects
 from .platforms import platform_capability
+from .protocol import (
+    CLASSIFICATION_OWNER,
+    CLASSIFICATION_PROTOCOL_VERSION,
+    classification_capability,
+)
 from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (
-    RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_topic_run, run_topic_job,
+    RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_candidate_page, get_topic_run, run_topic_job,
     submit_review_overrides, verify_topic_run,
 )
 
@@ -214,6 +219,7 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             "read_only_source": True, "formal_label_writeback": False,
             "supported_units": ["feedback"],
             "scope_filters": {"platforms": platform_capability()},
+            "classification": classification_capability(),
             "default_time_days": 14,
             "run_modes": {
                 "standard": {
@@ -257,13 +263,20 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             watermark = int(snapshot.coverage_watermark_ms)
             spec_hash = topic_spec_hash(spec)
             run_id = hashlib.sha256(
-                f"{spec_hash}:{watermark}".encode("utf-8")
+                (
+                    f"{spec_hash}:{watermark}:"
+                    f"classification-v{CLASSIFICATION_PROTOCOL_VERSION}"
+                ).encode("utf-8")
             ).hexdigest()[:16]
             final_snapshot = store.artifacts_dir / run_id / "source_snapshot.sqlite"
             snapshot_data = asdict(snapshot)
             snapshot_data["path"] = str(final_snapshot)
             manifest = {
-                "manifest_version": 2,
+                "manifest_version": 3,
+                "classification_protocol": {
+                    "version": CLASSIFICATION_PROTOCOL_VERSION,
+                    "owner": CLASSIFICATION_OWNER,
+                },
                 "stage": "snapshot",
                 "artifacts": {"source_snapshot.sqlite": snapshot.sha256},
                 "stages": {
@@ -287,6 +300,8 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
                 initial_files={"source_snapshot.sqlite": incoming_snapshot},
                 initial_manifest=manifest,
                 initial_stage="snapshot",
+                classification_protocol_version=CLASSIFICATION_PROTOCOL_VERSION,
+                classification_owner=CLASSIFICATION_OWNER,
             )
             scheduled = False
             if run["created"]:
@@ -352,6 +367,25 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
             }
         except (ValueError, RunVerificationError) as exc:
             raise HTTPException(status_code=409, detail=_redact(str(exc), config)) from None
+
+    @router.get(
+        "/runs/{run_id}/candidate-page",
+        dependencies=[Depends(require_token)],
+    )
+    def candidate_page(
+        run_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(20, ge=1, le=20),
+    ) -> dict[str, Any]:
+        _get_or_404(run_id, store)
+        try:
+            return get_candidate_page(
+                run_id, offset, limit, store=store,
+            )
+        except RunVerificationError as exc:
+            raise HTTPException(
+                status_code=409, detail=_redact(str(exc), config),
+            ) from None
 
     @router.post("/runs/{run_id}/overrides", dependencies=[Depends(require_token)])
     def overrides(run_id: str, payload: list[dict[str, Any]]) -> dict[str, Any]:

@@ -900,3 +900,103 @@ def test_source_bytes_unchanged_by_complete_fake_backed_run(tmp_path):
     _review_every_queue_item(store.get(run["run_id"]), store)
     assert verify_topic_run(run["run_id"], store=store)["status"] == "verified"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+
+
+def test_caller_ai_run_stops_after_recall_without_invoking_model(tmp_path):
+    from feedback_hub.topic_mining.config import TopicMiningConfig
+    from feedback_hub.topic_mining.service import get_candidate_page, run_topic_job
+    from feedback_hub.topic_mining.vector_client import (
+        VectorCapabilities,
+        VectorHit,
+        VectorSearchResult,
+    )
+
+    source = tmp_path / "source.db"
+    _start, watermark = _write_source(source)
+    config = TopicMiningConfig(
+        source_db_path=source,
+        data_dir=tmp_path / "data",
+        vector_api_url="https://vector.test",
+        vector_max_lag_seconds=1_000_000,
+    )
+    store = TopicRunStore(config.data_dir / "runs.db", config.data_dir / "runs")
+    run = store.create_or_get(
+        _spec(),
+        watermark,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+
+    class FakeVector:
+        def capabilities(self):
+            return VectorCapabilities("feedback-items-v1", 1, ("feedback",), watermark)
+
+        def search(self, *_args):
+            return VectorSearchResult(
+                "feedback-items-v1",
+                watermark,
+                (
+                    VectorHit("f1", "objective:0", .9, 1),
+                    VectorHit("boundary-a", "objective:0", .8, 2),
+                ),
+            )
+
+    def forbidden_model_call(*_args, **_kwargs):
+        raise AssertionError("v2 topic run invoked a classifier")
+
+    outcome = run_topic_job(
+        run["run_id"],
+        store=store,
+        config=config,
+        vector_client=FakeVector(),
+        model_call_fn=forbidden_model_call,
+    )
+
+    assert outcome["status"] == "classification_ready"
+    assert outcome["stage"] == "classification_ready"
+    manifest = json.loads(outcome["manifest_json"])
+    assert manifest["manifest_version"] == 3
+    assert manifest["classification_protocol"] == {
+        "version": 2,
+        "owner": "caller_ai",
+    }
+    assert len(manifest["candidate_set_sha256"]) == 64
+    artifact_dir = Path(outcome["artifact_dir"])
+    assert not (artifact_dir / "classified.jsonl").exists()
+    assert not (artifact_dir / "classification_audit.jsonl").exists()
+
+    page = get_candidate_page(run["run_id"], 0, 20, store=store)
+    assert page["candidate_set_sha256"] == manifest["candidate_set_sha256"]
+    assert page["total"] == 2
+    assert page["next_offset"] is None
+    assert all(item["decision_state"] == "pending" for item in page["items"])
+    assert page["topic"]["inclusion_criteria"] == list(_spec().inclusion_criteria)
+    assert all("context_items" in item for item in page["items"])
+
+
+@pytest.mark.parametrize(
+    ("offset", "limit", "message"),
+    [(-1, 20, "invalid_candidate_page"), (0, 21, "invalid_candidate_page")],
+)
+def test_candidate_page_rejects_invalid_bounds(tmp_path, offset, limit, message):
+    from feedback_hub.topic_mining.service import get_candidate_page
+
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(
+        _spec(),
+        1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+    with pytest.raises(RunVerificationError, match=message):
+        get_candidate_page(run["run_id"], offset, limit, store=store)
+
+
+def test_candidate_page_rejects_v1_run(tmp_path):
+    from feedback_hub.topic_mining.service import get_candidate_page
+
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(_spec(), 1234)
+
+    with pytest.raises(RunVerificationError, match="caller_ai_protocol_required"):
+        get_candidate_page(run["run_id"], 0, 20, store=store)

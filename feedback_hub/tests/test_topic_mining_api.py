@@ -85,6 +85,14 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     }
     assert payload["authentication"] == "internal_network_boundary"
     assert payload["supported_units"] == ["feedback"]
+    assert payload["classification"] == {
+        "version": 2,
+        "owner": "caller_ai",
+        "candidate_page_default": 20,
+        "candidate_page_maximum": 20,
+        "matched_evidence": "exact_source_or_context_substring",
+        "partial_acceptance": True,
+    }
     assert payload["scope_filters"]["platforms"] == {
         "canonical_values": ["Win", "Android", "iOS", "Mac"],
         "aliases": {
@@ -245,6 +253,13 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
     assert first["scheduled"] is True
     assert second["scheduled"] is False
     assert started == [first["run_id"]]
+    with sqlite3.connect(tmp_path / "data" / "runs.db") as connection:
+        protocol = connection.execute(
+            """SELECT classification_protocol_version, classification_owner
+               FROM topic_run WHERE run_id = ?""",
+            (first["run_id"],),
+        ).fetchone()
+    assert protocol == (2, "caller_ai")
     assert first["quality"]["candidate_budget"] == {
         "mode": "standard", "effective_days": 2,
         "minimum": 100, "per_day": 80, "maximum": 500,
@@ -254,6 +269,43 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
         "effective_days": 2, "per_day": 20, "maximum": 80,
         "sample_limit": 40,
     }
+
+
+def test_candidate_page_endpoint_delegates_to_verified_service(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    monkeypatch.setattr(
+        api,
+        "start_run_async",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scheduled=True, reason="scheduled",
+        ),
+    )
+    client = _client(tmp_path)
+    created = client.post("/api/topic-mining/runs", json=_spec()).json()
+    calls = []
+
+    def page(run_id, offset, limit, *, store):
+        calls.append((run_id, offset, limit, store))
+        return {
+            "run_id": run_id,
+            "candidate_set_sha256": "a" * 64,
+            "items": [],
+            "total": 0,
+            "next_offset": None,
+        }
+
+    monkeypatch.setattr(api, "get_candidate_page", page)
+    response = client.get(
+        f"/api/topic-mining/runs/{created['run_id']}/candidate-page"
+        "?offset=0&limit=20",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["candidate_set_sha256"] == "a" * 64
+    assert calls[0][0:3] == (created["run_id"], 0, 20)
 
 
 def test_missing_snapshot_cannot_rebind_a_run_to_changed_live_source(
