@@ -1000,7 +1000,7 @@ def test_candidate_page_rejects_v1_run(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), 1234)
 
-    with pytest.raises(RunVerificationError, match="caller_ai_protocol_required"):
+    with pytest.raises(RunVerificationError, match="legacy_classification_protocol"):
         get_candidate_page(run["run_id"], 0, 20, store=store)
 
 

@@ -462,7 +462,7 @@ def get_candidate_page(
     run = _require_run(run_id, store)
     version, owner = classification_protocol(run)
     if version != 2 or owner != "caller_ai":
-        raise RunVerificationError("caller_ai_protocol_required")
+        raise RunVerificationError("legacy_classification_protocol")
     if run["status"] not in {
         "classification_ready", "classification_in_progress",
         "verification_ready",
@@ -553,7 +553,7 @@ def submit_caller_classifications(
     run = _require_run(run_id, store)
     version, owner = classification_protocol(run)
     if (version, owner) != (2, "caller_ai"):
-        raise RunVerificationError("caller_ai_protocol_required")
+        raise RunVerificationError("legacy_classification_protocol")
     if run["status"] not in {
         "classification_ready", "classification_in_progress",
     }:

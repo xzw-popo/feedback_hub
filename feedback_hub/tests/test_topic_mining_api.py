@@ -85,7 +85,7 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     }
     assert payload["authentication"] == "internal_network_boundary"
     assert payload["supported_units"] == ["feedback"]
-    assert payload["classification"] == {
+    assert payload["classification_protocol"] == {
         "version": 2,
         "owner": "caller_ai",
         "candidate_page_default": 20,
@@ -112,6 +112,8 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     assert freshness["observed_at_ms"] >= freshness["source_generation_ms"]
     assert freshness["freshness_lag_seconds"] >= 0
     assert freshness["sync_interval_seconds"] == 1_200
+    assert "classification_ready" in payload["run_statuses"]
+    assert "verification_ready" in payload["run_statuses"]
 
 
 def test_create_run_rejects_conversation_before_scheduling_worker(tmp_path, monkeypatch):
@@ -260,6 +262,9 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
             (first["run_id"],),
         ).fetchone()
     assert protocol == (2, "caller_ai")
+    assert first["classification_protocol_version"] == 2
+    assert first["classification_owner"] == "caller_ai"
+    assert first["accepted_decision_count"] == 0
     assert first["quality"]["candidate_budget"] == {
         "mode": "standard", "effective_days": 2,
         "minimum": 100, "per_day": 80, "maximum": 500,
@@ -306,6 +311,81 @@ def test_candidate_page_endpoint_delegates_to_verified_service(
     assert response.status_code == 200
     assert response.json()["candidate_set_sha256"] == "a" * 64
     assert calls[0][0:3] == (created["run_id"], 0, 20)
+
+
+def test_classifications_endpoint_preserves_partial_acceptance(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    monkeypatch.setattr(
+        api,
+        "start_run_async",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scheduled=True, reason="scheduled",
+        ),
+    )
+    client = _client(tmp_path)
+    created = client.post("/api/topic-mining/runs", json=_spec()).json()
+    expected = {
+        "run_id": created["run_id"],
+        "accepted_ids": ["a"],
+        "rejected": [{"item_id": "b", "code": "evidence_not_grounded"}],
+        "accepted_count": 1,
+        "pending_count": 1,
+        "next_pending_offset": 0,
+        "write_result": {
+            "inserted": ["a"], "updated": [], "unchanged": [],
+        },
+    }
+    monkeypatch.setattr(
+        api, "submit_caller_classifications",
+        lambda *_args, **_kwargs: expected,
+    )
+
+    response = client.post(
+        f"/api/topic-mining/runs/{created['run_id']}/classifications",
+        json=[
+            {
+                "item_id": "a", "label": "matched", "reason": "命中",
+                "evidence": ["原文"],
+            },
+            {
+                "item_id": "b", "label": "matched", "reason": "命中",
+                "evidence": ["概括"],
+            },
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+def test_classifications_endpoint_rejects_more_than_20_items(
+    tmp_path, monkeypatch,
+):
+    import feedback_hub.topic_mining.api as api
+
+    monkeypatch.setattr(
+        api,
+        "start_run_async",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scheduled=True, reason="scheduled",
+        ),
+    )
+    client = _client(tmp_path)
+    created = client.post("/api/topic-mining/runs", json=_spec()).json()
+
+    response = client.post(
+        f"/api/topic-mining/runs/{created['run_id']}/classifications",
+        json=[{
+            "item_id": str(index), "label": "not_matched",
+            "reason": "排除", "evidence": [],
+        } for index in range(21)],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "classification_batch_limit_exceeded"
 
 
 def test_missing_snapshot_cannot_rebind_a_run_to_changed_live_source(

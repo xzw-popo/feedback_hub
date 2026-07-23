@@ -29,7 +29,7 @@ from .run_store import TopicRunStore, WorkerClaimLostError
 from .source import create_source_snapshot, source_freshness, validate_source_coverage
 from .service import (
     RunVerificationError, _artifact_valid, _effective_data_cutoff, _verify_manifest, read_verified_artifact_bytes, default_store, get_candidate_page, get_topic_run, run_topic_job,
-    submit_review_overrides, verify_topic_run,
+    submit_caller_classifications, submit_review_overrides, verify_topic_run,
 )
 
 
@@ -215,11 +215,16 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
         )
         return {
             "schema_versions": [1], "preferred_formats": ["xlsx", "jsonl"],
-            "run_statuses": ["pending", "running", "review_ready", "verified", "failed", "paused_quota_exhausted"],
+            "run_statuses": [
+                "pending", "running", "classification_ready",
+                "classification_in_progress", "verification_ready",
+                "review_ready", "verified", "failed",
+                "paused_quota_exhausted",
+            ],
             "read_only_source": True, "formal_label_writeback": False,
             "supported_units": ["feedback"],
             "scope_filters": {"platforms": platform_capability()},
-            "classification": classification_capability(),
+            "classification_protocol": classification_capability(),
             "default_time_days": 14,
             "run_modes": {
                 "standard": {
@@ -387,6 +392,33 @@ def make_router(*, config: TopicMiningConfig | None = None, store: TopicRunStore
                 status_code=409, detail=_redact(str(exc), config),
             ) from None
 
+    @router.post(
+        "/runs/{run_id}/classifications",
+        dependencies=[Depends(require_token)],
+    )
+    def classifications(
+        run_id: str,
+        payload: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        _get_or_404(run_id, store)
+        if len(payload) > 20:
+            raise HTTPException(
+                status_code=422,
+                detail="classification_batch_limit_exceeded",
+            )
+        try:
+            return submit_caller_classifications(
+                run_id, payload, store=store,
+            )
+        except RunVerificationError as exc:
+            raise HTTPException(
+                status_code=409, detail=_redact(str(exc), config),
+            ) from None
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=_redact(str(exc), config),
+            ) from None
+
     @router.post("/runs/{run_id}/overrides", dependencies=[Depends(require_token)])
     def overrides(run_id: str, payload: list[dict[str, Any]]) -> dict[str, Any]:
         _get_or_404(run_id, store)
@@ -483,6 +515,20 @@ def _public_run(run: dict[str, Any]) -> dict[str, Any]:
         "run_id": run["run_id"], "status": run["status"], "stage": run["stage"],
         "error_code": run.get("error_code"), "error_message": run.get("error_message"),
         "created": bool(run.get("created", False)), "source_watermark_ms": source_watermark_ms,
+        "classification_protocol_version": int(
+            run.get("classification_protocol_version", 1),
+        ),
+        "classification_owner": str(
+            run.get("classification_owner", "backend_model"),
+        ),
+        "accepted_decision_count": int(
+            manifest.get("accepted_decision_count", 0) or 0,
+        ),
+        "pending_decision_count": (
+            int(manifest.get("pending_decision_count", 0) or 0)
+            if int(run.get("classification_protocol_version", 1)) == 2
+            else 0
+        ),
         **result_scope,
         "quality": {
             "funnel": manifest.get("funnel", {}), "source_watermark_ms": source_watermark_ms,
