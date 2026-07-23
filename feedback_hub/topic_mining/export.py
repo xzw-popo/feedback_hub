@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .run_store import TopicRunStore
+from .protocol import classification_protocol
 from .service import RunVerificationError, _effective_data_cutoff, _load_manifest, _publish_terminal_mutation, _recall_from_dict, _require_run, _result_scope, _validate_final_rows, _validate_run_identity, _verify_manifest, read_verified_artifact_bytes
 from .contracts import load_persisted_topic_spec
 from feedback_hub.jsonl_io import load_jsonl_objects
@@ -74,6 +75,18 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         "required_fields": list(required_fields),
         **scope,
     }
+    protocol_version, protocol_owner = classification_protocol(run)
+    if (protocol_version, protocol_owner) == (2, "caller_ai"):
+        report.update({
+            "classification_protocol_version": protocol_version,
+            "classification_owner": protocol_owner,
+            "classification_revision_count": manifest.get(
+                "classification_revision_count", 0,
+            ),
+            "pending_decision_count": manifest.get(
+                "pending_decision_count", 0,
+            ),
+        })
     report_bytes = (
         json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")

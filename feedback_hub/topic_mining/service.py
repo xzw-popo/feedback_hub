@@ -758,6 +758,16 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     """Validate every membership claim and make an immutable verified result."""
     store = store or default_store()
     run = _require_run(run_id, store)
+    if classification_protocol(run) == (2, "caller_ai"):
+        return _verify_v2_topic_run(run, store)
+    return _verify_v1_topic_run(run, store)
+
+
+def _verify_v1_topic_run(
+    run: Mapping[str, Any],
+    store: TopicRunStore,
+) -> dict[str, Any]:
+    run_id = str(run["run_id"])
     if run["status"] not in {"review_ready", "verified"}:
         raise RunVerificationError("run_not_review_ready")
     artifact_dir = Path(run["artifact_dir"])
@@ -851,6 +861,138 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
         files={"final_reviewed.jsonl": final_bytes},
     )
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
+
+
+def _verify_v2_topic_run(
+    run: Mapping[str, Any],
+    store: TopicRunStore,
+) -> dict[str, Any]:
+    run_id = str(run["run_id"])
+    if run["status"] not in {"verification_ready", "verified"}:
+        raise RunVerificationError("classification_incomplete")
+    artifact_dir = Path(str(run["artifact_dir"]))
+    manifest = _load_manifest(run, artifact_dir)
+    _verify_manifest(manifest, artifact_dir)
+    spec = load_persisted_topic_spec(json.loads(str(run["spec_json"])))
+    data_cutoff_ms = _effective_data_cutoff(
+        run, manifest, require_snapshot=True,
+    )
+    _validate_run_identity(run, spec, data_cutoff_ms)
+    for key in _UNRESOLVED_KEYS:
+        if int(manifest.get(key, 0) or 0) > 0:
+            raise RunVerificationError(key)
+    _require_stage_chain(manifest, artifact_dir)
+    recall_path = artifact_dir / "recall_candidates.jsonl"
+    caller_path = artifact_dir / "caller_classifications.jsonl"
+    contexts_path = artifact_dir / "item_contexts.json"
+    for path in (recall_path, caller_path, contexts_path):
+        _require_artifact(manifest, path)
+    if run["status"] == "verified":
+        _require_artifact(manifest, artifact_dir / "final_reviewed.jsonl")
+    recalls = [
+        _recall_from_dict(row)
+        for row in _read_required_jsonl(recall_path, manifest)
+    ]
+    selected = _classification_candidates(manifest, artifact_dir, recalls)
+    contexts = _read_required_json(contexts_path, manifest)
+    raw_decisions = _read_required_jsonl(caller_path, manifest)
+    if (
+        len(raw_decisions) != len(selected)
+        or manifest.get("accepted_decision_count") != len(selected)
+        or manifest.get("pending_decision_count") != 0
+    ):
+        raise RunVerificationError("classification_coverage")
+    by_id = {candidate.item_id: candidate for candidate in selected}
+    if len(by_id) != len(selected):
+        raise RunVerificationError("duplicate_item_id")
+    classifications: list[ClassificationResult] = []
+    seen: set[str] = set()
+    for raw in raw_decisions:
+        item_id = raw.get("item_id") if isinstance(raw, Mapping) else None
+        candidate = by_id.get(str(item_id))
+        if candidate is None or candidate.item_id in seen:
+            raise RunVerificationError("classification_coverage")
+        seen.add(candidate.item_id)
+        try:
+            decision = validate_decision(
+                raw,
+                candidate.item,
+                [
+                    item for item in contexts.get(candidate.item_id, [])
+                    if isinstance(item, Mapping)
+                ],
+            )
+        except DecisionValidationError as exc:
+            code = (
+                "invalid_evidence"
+                if exc.code in {"evidence_required", "evidence_not_grounded"}
+                else exc.code
+            )
+            raise RunVerificationError(code) from exc
+        classifications.append(ClassificationResult(
+            item_id=decision.item_id,
+            label=decision.label,
+            confidence=1.0,
+            evidence=decision.evidence,
+            reason=decision.reason,
+            needs_review=False,
+            source="caller_ai",
+        ))
+    if seen != set(by_id):
+        raise RunVerificationError("classification_coverage")
+    for candidate in selected:
+        item = candidate.item
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RunVerificationError("missing_text")
+        if not _valid_source_url(item.get("source_url")):
+            raise RunVerificationError("missing_link")
+        if not _item_in_scope(item, spec):
+            raise RunVerificationError("invalid_scope")
+    final_rows = [
+        _final_row(
+            result,
+            by_id[result.item_id].item,
+            run_id,
+            _context_texts(contexts, result.item_id),
+            data_cutoff_ms,
+        )
+        for result in classifications if result.label == "matched"
+    ]
+    _validate_final_rows(
+        final_rows, spec, contexts=contexts, expected_run_id=run_id,
+        expected_data_cutoff_ms=data_cutoff_ms,
+    )
+    scope = _result_scope(
+        spec, final_rows, by_id, manifest,
+        classified_count=len(classifications),
+    )
+    final_bytes = _jsonl_bytes(final_rows)
+    proposed = json.loads(json.dumps(manifest))
+    proposed.update(scope)
+    proposed["verified"] = {
+        "matched_count": len(final_rows),
+        "verified_at_ms": int(time.time() * 1000),
+    }
+    _prepare_checkpoint_manifest(
+        proposed,
+        artifact_dir,
+        "verified",
+        {"final_reviewed.jsonl": hashlib.sha256(final_bytes).hexdigest()},
+    )
+    _publish_terminal_mutation(
+        run,
+        store,
+        proposed,
+        stage="verified",
+        status="verified",
+        files={"final_reviewed.jsonl": final_bytes},
+    )
+    return {
+        "run_id": run_id,
+        "status": "verified",
+        "matched_count": len(final_rows),
+    }
 
 
 def _result_scope(
@@ -1132,15 +1274,22 @@ def _validate_run_identity(
 ) -> None:
     persisted_hash = run.get("spec_hash")
     expected_hash = topic_spec_hash(spec)
+    version, owner = classification_protocol(run)
+    identity = f"{expected_hash}:{source_watermark_ms}"
+    if (version, owner) == (2, "caller_ai"):
+        identity += ":classification-v2"
     expected_run_id = hashlib.sha256(
-        f"{expected_hash}:{source_watermark_ms}".encode("utf-8"),
+        identity.encode("utf-8"),
     ).hexdigest()[:16]
     if (
         persisted_hash == expected_hash
         and run.get("run_id") == expected_run_id
     ):
         return
-    if _is_pre_mode_run_identity(run, spec, source_watermark_ms):
+    if (
+        (version, owner) == (1, "backend_model")
+        and _is_pre_mode_run_identity(run, spec, source_watermark_ms)
+    ):
         return
     raise RunVerificationError("run_identity_mismatch")
 

@@ -972,6 +972,8 @@ def test_caller_ai_run_stops_after_recall_without_invoking_model(tmp_path):
     assert all(item["decision_state"] == "pending" for item in page["items"])
     assert page["topic"]["inclusion_criteria"] == list(_spec().inclusion_criteria)
     assert all("context_items" in item for item in page["items"])
+    with pytest.raises(RunVerificationError, match="classification_incomplete"):
+        verify_topic_run(run["run_id"], store=store)
 
 
 @pytest.mark.parametrize(
@@ -1139,3 +1141,31 @@ def test_one_invalid_caller_decision_does_not_discard_499_valid_siblings(
     assert fixed["pending_count"] == 0
     assert store.get(run["run_id"])["status"] == "verification_ready"
     assert store.caller_revision_count(run["run_id"]) == revisions_before + 1
+
+    verified = verify_topic_run(run["run_id"], store=store)
+    assert verified == {
+        "run_id": run["run_id"],
+        "status": "verified",
+        "matched_count": 500,
+    }
+    final_rows = [
+        json.loads(line)
+        for line in (
+            Path(run["artifact_dir"]) / "final_reviewed.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(final_rows) == 500
+    assert all(row["source"] == "caller_ai" for row in final_rows)
+    from feedback_hub.topic_mining.export import export_topic_run
+
+    workbook = export_topic_run(run["run_id"], "xlsx", store=store)
+    assert workbook.is_file()
+    report = json.loads(
+        (Path(run["artifact_dir"]) / "quality_report.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert report["classification_protocol_version"] == 2
+    assert report["classification_owner"] == "caller_ai"
+    assert report["classification_revision_count"] == 500
+    assert report["pending_decision_count"] == 0

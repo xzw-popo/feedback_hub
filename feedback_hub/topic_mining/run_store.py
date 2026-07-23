@@ -747,7 +747,9 @@ class TopicRunStore:
                        WHERE run_id = ? AND manifest_json = ?
                          AND publication_json IS NULL
                          AND worker_claim_token IS NULL
-                         AND status IN ('review_ready', 'verified')""",
+                         AND status IN (
+                             'verification_ready', 'review_ready', 'verified'
+                         )""",
                     (publication_json, run_id, expected_manifest_json),
                 )
             if cursor.rowcount != 1:
