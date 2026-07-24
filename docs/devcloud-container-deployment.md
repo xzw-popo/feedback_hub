@@ -162,7 +162,7 @@ TOPIC_VECTOR_MAX_LAG_SECONDS=21600
 TOPIC_MINING_API_TOKEN=
 ```
 
-协议 v2 的专题挖掘不会调用后端语义分类模型。`LLM_*` 可以继续为搜索、打标等其他服务保留，但 `LLM_MODEL`（包括 `deepseek-v4-flash`）不会参与 v2 专题的成员判定：
+协议 v3 的专题挖掘不会调用后端语义分类模型。`LLM_*` 可以继续为搜索、打标等其他服务保留，但 `LLM_MODEL`（包括 `deepseek-v4-flash`）不会参与 v3 专题的成员判定：
 
 ```dotenv
 LLM_API_URL=
@@ -181,16 +181,16 @@ APP_PORT=8000 scripts/devcloud_runtime.sh restart
 APP_PORT=8000 scripts/devcloud_runtime.sh status
 ```
 
-能力接口必须包含完整且精确的 v2 所有权契约，新的 Skill 才允许创建 Run：
+能力接口必须包含完整且精确的 v3 所有权契约，新的 Skill 才允许创建 Run：
 
 ```json
 {
   "classification_protocol": {
-    "version": 2,
+    "version": 3,
     "owner": "caller_ai",
     "candidate_page_default": 20,
     "candidate_page_maximum": 20,
-    "matched_evidence": "exact_source_or_context_substring",
+    "matched_evidence": "exact_candidate_substring",
     "partial_acceptance": true
   }
 }
@@ -199,9 +199,11 @@ APP_PORT=8000 scripts/devcloud_runtime.sh status
 健康的新 Run 在快照、硬筛和混合召回后应停在
 `classification_ready`，此时没有后台模型来源或重试信息。后续运维观察
 `accepted_decision_count` 和 `pending_decision_count`；覆盖完整后进入
-`verification_ready`。冒烟测试应故意在一页中提交一条不落原文的证据，
-确认其他条目被接受、仅该 ID 保持 pending，再修复该 ID 并验证、导出。
-不要恢复未完成的 v1 Run；旧 v1 仅保留已验证结果的重新导出兼容。
+`verification_ready`。冒烟测试应故意把一条只存在于 `context_items` 的证据
+提交给候选反馈，确认返回 `evidence_not_candidate_grounded`、其他条目被接受、
+仅该 ID 保持 pending；再将其修复为 `not_matched`，并确认真正相关的上下文消息
+只有以自己的 Feedback ID 独立召回和判定后才能导出。不要恢复未完成的 v1/v2
+Run；旧 v1/v2 仅保留已验证结果的读取和重新导出兼容。
 
 `.env` 不会自动导出到当前 shell。保持在 `/opt/feedback_hub`，先用 `env -u` 避免当前 shell 的同名变量遮蔽项目配置，再由当前虚拟环境导入 `feedback_hub.config`，让它加载项目根 `.env`，最后把专题 API token 只保存到临时 shell 变量。以下命令不打印 token；也不要额外 `echo` 该变量：
 
