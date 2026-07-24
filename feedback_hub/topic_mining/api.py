@@ -526,7 +526,7 @@ def _public_run(run: dict[str, Any]) -> dict[str, Any]:
         ),
         "pending_decision_count": (
             int(manifest.get("pending_decision_count", 0) or 0)
-            if int(run.get("classification_protocol_version", 1)) == 2
+            if int(run.get("classification_protocol_version", 1)) == 3
             else 0
         ),
         **result_scope,

@@ -199,6 +199,7 @@ class TopicRunStore:
         expected_owner = {
             1: "backend_model",
             2: "caller_ai",
+            3: "caller_ai",
         }.get(classification_protocol_version)
         if expected_owner is None or classification_owner != expected_owner:
             raise ValueError("unsupported classification protocol")
@@ -373,10 +374,10 @@ class TopicRunStore:
             if run is None:
                 raise KeyError(run_id)
             if (
-                int(run["classification_protocol_version"]) != 2
+                int(run["classification_protocol_version"]) != 3
                 or str(run["classification_owner"]) != "caller_ai"
             ):
-                raise ValueError("caller decisions require classification protocol v2")
+                raise ValueError("caller decisions require classification protocol v3")
             if str(run["status"]) not in {
                 "classification_ready", "classification_in_progress",
             }:

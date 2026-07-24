@@ -264,7 +264,7 @@ def _run_pipeline(
     recalls = [_recall_from_dict(row) for row in _read_jsonl(recall_path)]
     selected_recalls = _classification_candidates(manifest, artifact_dir, recalls)
     protocol_version, protocol_owner = classification_protocol(run)
-    if protocol_version == 2 and protocol_owner == "caller_ai":
+    if protocol_version == 3 and protocol_owner == "caller_ai":
         candidate_digest = _sha256(selected_path)
         manifest.update({
             "manifest_version": _CALLER_AI_MANIFEST_VERSION,
@@ -461,7 +461,7 @@ def get_candidate_page(
     store = store or default_store()
     run = _require_run(run_id, store)
     version, owner = classification_protocol(run)
-    if version != 2 or owner != "caller_ai":
+    if version != 3 or owner != "caller_ai":
         raise RunVerificationError("legacy_classification_protocol")
     if run["status"] not in {
         "classification_ready", "classification_in_progress",
@@ -471,7 +471,7 @@ def get_candidate_page(
     artifact_dir = Path(str(run["artifact_dir"]))
     manifest = _load_manifest(run, artifact_dir)
     if manifest.get("classification_protocol") != {
-        "version": 2, "owner": "caller_ai",
+        "version": 3, "owner": "caller_ai",
     }:
         raise RunVerificationError("classification_protocol_mismatch")
     _verify_manifest(manifest, artifact_dir)
@@ -552,7 +552,7 @@ def submit_caller_classifications(
     store = store or default_store()
     run = _require_run(run_id, store)
     version, owner = classification_protocol(run)
-    if (version, owner) != (2, "caller_ai"):
+    if (version, owner) != (3, "caller_ai"):
         raise RunVerificationError("legacy_classification_protocol")
     if run["status"] not in {
         "classification_ready", "classification_in_progress",
@@ -628,7 +628,7 @@ def submit_caller_classifications(
     progress = store.caller_decision_progress(run_id, candidate_ids)
     manifest.update({
         "classification_owner": "caller_ai",
-        "classification_protocol_version": 2,
+        "classification_protocol_version": 3,
         "accepted_decision_count": progress["accepted_count"],
         "pending_decision_count": progress["pending_count"],
         "classification_revision_count": store.caller_revision_count(run_id),
@@ -758,7 +758,7 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     """Validate every membership claim and make an immutable verified result."""
     store = store or default_store()
     run = _require_run(run_id, store)
-    if classification_protocol(run) == (2, "caller_ai"):
+    if classification_protocol(run) == (3, "caller_ai"):
         return _verify_v2_topic_run(run, store)
     return _verify_v1_topic_run(run, store)
 
@@ -1276,8 +1276,8 @@ def _validate_run_identity(
     expected_hash = topic_spec_hash(spec)
     version, owner = classification_protocol(run)
     identity = f"{expected_hash}:{source_watermark_ms}"
-    if (version, owner) == (2, "caller_ai"):
-        identity += ":classification-v2"
+    if version > 1 and owner == "caller_ai":
+        identity += f":classification-v{version}"
     expected_run_id = hashlib.sha256(
         identity.encode("utf-8"),
     ).hexdigest()[:16]
@@ -2010,7 +2010,7 @@ def _stage_input_count(stage: str, artifact_dir: Path) -> int:
 
 def _caller_ai_manifest(manifest: Mapping[str, Any]) -> bool:
     return manifest.get("classification_protocol") == {
-        "version": 2, "owner": "caller_ai",
+        "version": 3, "owner": "caller_ai",
     }
 
 

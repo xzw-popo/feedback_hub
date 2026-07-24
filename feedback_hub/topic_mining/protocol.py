@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-CLASSIFICATION_PROTOCOL_VERSION = 2
+CLASSIFICATION_PROTOCOL_VERSION = 3
 CLASSIFICATION_OWNER = "caller_ai"
 CANDIDATE_PAGE_LIMIT = 20
 
@@ -17,7 +17,7 @@ def classification_capability() -> dict[str, Any]:
         "owner": CLASSIFICATION_OWNER,
         "candidate_page_default": CANDIDATE_PAGE_LIMIT,
         "candidate_page_maximum": CANDIDATE_PAGE_LIMIT,
-        "matched_evidence": "exact_source_or_context_substring",
+        "matched_evidence": "exact_candidate_substring",
         "partial_acceptance": True,
     }
 

@@ -92,6 +92,33 @@ def test_v2_run_identity_is_idempotent_and_distinct_from_v1(
     ).hexdigest()[:16]
 
 
+def test_v3_run_identity_is_idempotent_and_distinct_from_v2(
+    tmp_path, valid_topic_spec,
+):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    v2 = store.create_or_get(
+        valid_topic_spec, 1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+    v3 = store.create_or_get(
+        valid_topic_spec, 1234,
+        classification_protocol_version=3,
+        classification_owner="caller_ai",
+    )
+    same_v3 = store.create_or_get(
+        valid_topic_spec, 1234,
+        classification_protocol_version=3,
+        classification_owner="caller_ai",
+    )
+    assert v3["run_id"] != v2["run_id"]
+    assert v3["run_id"] == same_v3["run_id"]
+    assert v3["classification_protocol_version"] == 3
+    assert v3["run_id"] == hashlib.sha256(
+        f"{v3['spec_hash']}:1234:classification-v3".encode()
+    ).hexdigest()[:16]
+
+
 def test_create_run_uses_independent_database_and_artifact_dir(tmp_path, valid_topic_spec):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
 
@@ -325,7 +352,7 @@ def test_caller_decisions_are_idempotent_revisioned_and_digest_bound(
     run = store.create_or_get(
         valid_topic_spec,
         1234,
-        classification_protocol_version=2,
+        classification_protocol_version=3,
         classification_owner="caller_ai",
     )
     store.update_status(

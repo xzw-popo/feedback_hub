@@ -76,7 +76,7 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         **scope,
     }
     protocol_version, protocol_owner = classification_protocol(run)
-    if (protocol_version, protocol_owner) == (2, "caller_ai"):
+    if protocol_version in {2, 3} and protocol_owner == "caller_ai":
         report.update({
             "classification_protocol_version": protocol_version,
             "classification_owner": protocol_owner,

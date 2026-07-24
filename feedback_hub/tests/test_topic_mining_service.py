@@ -923,7 +923,7 @@ def test_caller_ai_run_stops_after_recall_without_invoking_model(tmp_path):
     run = store.create_or_get(
         _spec(),
         watermark,
-        classification_protocol_version=2,
+        classification_protocol_version=3,
         classification_owner="caller_ai",
     )
 
@@ -957,7 +957,7 @@ def test_caller_ai_run_stops_after_recall_without_invoking_model(tmp_path):
     manifest = json.loads(outcome["manifest_json"])
     assert manifest["manifest_version"] == 3
     assert manifest["classification_protocol"] == {
-        "version": 2,
+        "version": 3,
         "owner": "caller_ai",
     }
     assert len(manifest["candidate_set_sha256"]) == 64
@@ -987,7 +987,7 @@ def test_candidate_page_rejects_invalid_bounds(tmp_path, offset, limit, message)
     run = store.create_or_get(
         _spec(),
         1234,
-        classification_protocol_version=2,
+        classification_protocol_version=3,
         classification_owner="caller_ai",
     )
     with pytest.raises(RunVerificationError, match=message):
@@ -1071,7 +1071,7 @@ def test_one_invalid_caller_decision_does_not_discard_499_valid_siblings(
     run = store.create_or_get(
         spec,
         end,
-        classification_protocol_version=2,
+        classification_protocol_version=3,
         classification_owner="caller_ai",
     )
 
@@ -1165,7 +1165,7 @@ def test_one_invalid_caller_decision_does_not_discard_499_valid_siblings(
             encoding="utf-8",
         )
     )
-    assert report["classification_protocol_version"] == 2
+    assert report["classification_protocol_version"] == 3
     assert report["classification_owner"] == "caller_ai"
     assert report["classification_revision_count"] == 500
     assert report["pending_decision_count"] == 0

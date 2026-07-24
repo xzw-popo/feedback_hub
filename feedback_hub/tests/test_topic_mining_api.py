@@ -86,11 +86,11 @@ def test_capabilities_advertise_backend_owned_policy(tmp_path):
     assert payload["authentication"] == "internal_network_boundary"
     assert payload["supported_units"] == ["feedback"]
     assert payload["classification_protocol"] == {
-        "version": 2,
+        "version": 3,
         "owner": "caller_ai",
         "candidate_page_default": 20,
         "candidate_page_maximum": 20,
-        "matched_evidence": "exact_source_or_context_substring",
+        "matched_evidence": "exact_candidate_substring",
         "partial_acceptance": True,
     }
     assert payload["scope_filters"]["platforms"] == {
@@ -261,8 +261,8 @@ def test_create_run_is_idempotent_and_starts_background_job(tmp_path, monkeypatc
                FROM topic_run WHERE run_id = ?""",
             (first["run_id"],),
         ).fetchone()
-    assert protocol == (2, "caller_ai")
-    assert first["classification_protocol_version"] == 2
+    assert protocol == (3, "caller_ai")
+    assert first["classification_protocol_version"] == 3
     assert first["classification_owner"] == "caller_ai"
     assert first["accepted_decision_count"] == 0
     assert first["quality"]["candidate_budget"] == {
