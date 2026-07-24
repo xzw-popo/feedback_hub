@@ -190,6 +190,47 @@ def test_export_has_unique_ids_links_and_evidence(tmp_path):
     assert report["required_fields"] == ["feedback_text"]
 
 
+def test_verified_v2_export_remains_compatible_with_context_evidence(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(
+        _spec(),
+        CUTOFF_MS,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+    artifact_dir = Path(run["artifact_dir"])
+    row = _row(run["run_id"])
+    row["source_item"]["text"] = "今天天气不错"
+    row["context_texts"] = ["游戏全屏工具栏一直显示"]
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    _persist_verified_manifest(store, run, final)
+
+    exported = export_topic_run(run["run_id"], "xlsx", store=store)
+
+    assert exported.is_file()
+
+
+def test_v3_export_rejects_context_only_evidence(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(
+        _spec(),
+        CUTOFF_MS,
+        classification_protocol_version=3,
+        classification_owner="caller_ai",
+    )
+    artifact_dir = Path(run["artifact_dir"])
+    row = _row(run["run_id"])
+    row["source_item"]["text"] = "今天天气不错"
+    row["context_texts"] = ["游戏全屏工具栏一直显示"]
+    final = artifact_dir / "final_reviewed.jsonl"
+    final.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    _persist_verified_manifest(store, run, final)
+
+    with pytest.raises(RunVerificationError, match="invalid_evidence"):
+        export_topic_run(run["run_id"], "xlsx", store=store)
+
+
 def test_standard_export_keeps_all_321_confirmed_matches(tmp_path):
     store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
     run = store.create_or_get(_spec(), CUTOFF_MS)

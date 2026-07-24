@@ -102,8 +102,19 @@ def _create_source(path, start: datetime, end: datetime) -> None:
                     "沉浸场景悬浮控件遮住画面且始终没有收起",
                 ),
                 (
-                    "coverage-boundary", "c-boundary", 1, end_ms, "Win",
+                    "context-candidate", "c-context", 1, start_ms + 5, "Win",
                     "1", "pc", "PC", "u6", 6,
+                    "https://example.test/context-candidate", "我也是",
+                ),
+                (
+                    "context-related", "c-context", 2, start_ms + 6, "Win",
+                    "1", "pc", "PC", "u6", 6,
+                    "https://example.test/context-related",
+                    "游戏全屏时输入法工具栏仍显示",
+                ),
+                (
+                    "coverage-boundary", "c-boundary", 1, end_ms, "Win",
+                    "1", "pc", "PC", "u7", 7,
                     "https://example.test/boundary", "范围结束边界",
                 ),
             ],
@@ -139,7 +150,7 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
     run = store.create_or_get(
         spec,
         watermark,
-        classification_protocol_version=2,
+        classification_protocol_version=3,
         classification_owner="caller_ai",
     )
 
@@ -156,6 +167,7 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
                 watermark,
                 (
                     VectorHit("win-paraphrase", "objective:0", 0.99, 1),
+                    VectorHit("context-candidate", "objective:0", 0.985, 2),
                     VectorHit("mac-semantic", "objective:0", 0.98, 2),
                 ),
             )
@@ -176,6 +188,7 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
     page = get_candidate_page(run["run_id"], 0, 20, store=store)
     assert {row["item_id"] for row in page["items"]} == {
         "win-game", "win-taskbar", "win-black-screen", "win-paraphrase",
+        "context-candidate", "context-related",
     }
     paraphrase = next(
         row for row in page["items"] if row["item_id"] == "win-paraphrase"
@@ -200,34 +213,57 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
             "reason": "语义符合但先提交错误证据",
             "evidence": ["原文中不存在"],
         },
+        {
+            "item_id": "context-candidate", "label": "matched",
+            "reason": "上下文相关但候选本身不自证",
+            "evidence": ["输入法工具栏仍显示"],
+        },
+        {
+            "item_id": "context-related", "label": "matched",
+            "reason": "该条反馈自身明确命中",
+            "evidence": ["输入法工具栏仍显示"],
+        },
     ]
     partial = submit_caller_classifications(
         run["run_id"], decisions, store=store,
     )
-    assert partial["accepted_count"] == 3
-    assert partial["pending_count"] == 1
-    assert partial["rejected"] == [{
-        "item_id": "win-paraphrase",
-        "code": "evidence_not_grounded",
-    }]
+    assert partial["accepted_count"] == 4
+    assert partial["pending_count"] == 2
+    assert partial["rejected"] == [
+        {
+            "item_id": "win-paraphrase",
+            "code": "evidence_not_grounded",
+        },
+        {
+            "item_id": "context-candidate",
+            "code": "evidence_not_candidate_grounded",
+        },
+    ]
     assert not (artifact_dir / "caller_classifications.jsonl").exists()
 
     repaired = submit_caller_classifications(
         run["run_id"],
-        [{
-            "item_id": "win-paraphrase", "label": "matched",
-            "reason": "悬浮控件遮挡且未收起",
-            "evidence": ["悬浮控件遮住画面"],
-        }],
+        [
+            {
+                "item_id": "win-paraphrase", "label": "matched",
+                "reason": "悬浮控件遮挡且未收起",
+                "evidence": ["悬浮控件遮住画面"],
+            },
+            {
+                "item_id": "context-candidate", "label": "not_matched",
+                "reason": "候选原文自身信息不足",
+                "evidence": [],
+            },
+        ],
         store=store,
     )
-    assert repaired["accepted_count"] == 4
+    assert repaired["accepted_count"] == 6
     assert repaired["pending_count"] == 0
     assert store.get(run["run_id"])["status"] == "verification_ready"
     assert verify_topic_run(run["run_id"], store=store) == {
         "run_id": run["run_id"],
         "status": "verified",
-        "matched_count": 2,
+        "matched_count": 3,
     }
 
     app = FastAPI()
@@ -237,7 +273,7 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
             f"/api/topic-mining/runs/{run['run_id']}",
         ).json()
     assert public["classification_owner"] == "caller_ai"
-    assert public["accepted_decision_count"] == 4
+    assert public["accepted_decision_count"] == 6
     assert public["pending_decision_count"] == 0
 
     workbook_path = export_topic_run(run["run_id"], "xlsx", store=store)
@@ -258,7 +294,9 @@ def test_caller_ai_end_to_end_partially_repairs_and_exports(tmp_path):
     }
     workbook.close()
     assert headers == HEADERS
-    assert workbook_ids == {"win-game", "win-paraphrase"}
+    assert workbook_ids == {
+        "win-game", "win-paraphrase", "context-related",
+    }
     final_rows = [
         json.loads(line)
         for line in (

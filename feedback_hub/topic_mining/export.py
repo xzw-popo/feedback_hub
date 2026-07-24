@@ -44,9 +44,15 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         )
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise RunVerificationError("invalid_artifact") from exc
+    protocol_version, protocol_owner = classification_protocol(run)
     _validate_final_rows(
         rows, spec, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,
+        evidence_scope=(
+            "candidate"
+            if (protocol_version, protocol_owner) == (3, "caller_ai")
+            else "candidate_or_context"
+        ),
     )
     rows = sorted(rows, key=lambda row: (str(row["label"]), -int(row["source_item"].get("ts_ms", 0)), str(row["item_id"])))
     recall_by_id = _verified_recall_by_id(manifest, artifact_dir)
@@ -75,7 +81,6 @@ def export_topic_run(run_id: str, export_format: str, *, store: TopicRunStore | 
         "required_fields": list(required_fields),
         **scope,
     }
-    protocol_version, protocol_owner = classification_protocol(run)
     if protocol_version in {2, 3} and protocol_owner == "caller_ai":
         report.update({
             "classification_protocol_version": protocol_version,

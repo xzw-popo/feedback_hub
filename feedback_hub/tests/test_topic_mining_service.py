@@ -11,6 +11,7 @@ import pytest
 from feedback_hub.topic_mining.contracts import validate_topic_spec
 from feedback_hub.topic_mining.service import (
     RunVerificationError,
+    _validate_final_rows,
     _validate_run_identity,
     submit_review_overrides,
     verify_topic_run,
@@ -21,6 +22,45 @@ from feedback_hub.topic_mining.run_store import TopicRunStore
 def _spec():
     from feedback_hub.tests.test_topic_mining_export import _spec as shared_spec
     return shared_spec()
+
+
+def _context_only_final_row() -> dict:
+    return {
+        "item_id": "candidate",
+        "label": "matched",
+        "run_id": "run-1",
+        "data_cutoff_ms": 1_700_000_000_000,
+        "evidence": ["工具栏一直显示"],
+        "source_item": {
+            "item_id": "candidate",
+            "ts_ms": 1_699_999_999_999,
+            "platform": "Win",
+            "text": "今天天气不错",
+            "source_url": "https://example.test/candidate",
+        },
+        "context_texts": ["游戏全屏时工具栏一直显示"],
+    }
+
+
+def test_v3_final_rows_reject_context_only_evidence():
+    with pytest.raises(RunVerificationError, match="invalid_evidence"):
+        _validate_final_rows(
+            [_context_only_final_row()],
+            _spec(),
+            evidence_scope="candidate",
+            expected_run_id="run-1",
+            expected_data_cutoff_ms=1_700_000_000_000,
+        )
+
+
+def test_legacy_final_rows_remain_readable_with_context_evidence():
+    _validate_final_rows(
+        [_context_only_final_row()],
+        _spec(),
+        evidence_scope="candidate_or_context",
+        expected_run_id="run-1",
+        expected_data_cutoff_ms=1_700_000_000_000,
+    )
 
 
 def _write_source(path, *, include_end=True):
@@ -1002,6 +1042,22 @@ def test_candidate_page_rejects_v1_run(tmp_path):
 
     with pytest.raises(RunVerificationError, match="legacy_classification_protocol"):
         get_candidate_page(run["run_id"], 0, 20, store=store)
+
+
+def test_nonterminal_v2_run_cannot_continue_verification(tmp_path):
+    store = TopicRunStore(tmp_path / "runs.db", tmp_path / "runs")
+    run = store.create_or_get(
+        _spec(),
+        1234,
+        classification_protocol_version=2,
+        classification_owner="caller_ai",
+    )
+
+    with pytest.raises(
+        RunVerificationError,
+        match="legacy_classification_protocol",
+    ):
+        verify_topic_run(run["run_id"], store=store)
 
 
 def test_one_invalid_caller_decision_does_not_discard_499_valid_siblings(

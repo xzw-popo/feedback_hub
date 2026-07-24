@@ -758,8 +758,17 @@ def verify_topic_run(run_id: str, *, store: TopicRunStore | None = None) -> dict
     """Validate every membership claim and make an immutable verified result."""
     store = store or default_store()
     run = _require_run(run_id, store)
-    if classification_protocol(run) == (3, "caller_ai"):
-        return _verify_v2_topic_run(run, store)
+    protocol = classification_protocol(run)
+    if protocol == (3, "caller_ai"):
+        return _verify_caller_ai_topic_run(
+            run, store, evidence_scope="candidate",
+        )
+    if protocol == (2, "caller_ai"):
+        if run["status"] != "verified":
+            raise RunVerificationError("legacy_classification_protocol")
+        return _verify_caller_ai_topic_run(
+            run, store, evidence_scope="candidate_or_context",
+        )
     return _verify_v1_topic_run(run, store)
 
 
@@ -863,9 +872,11 @@ def _verify_v1_topic_run(
     return {"run_id": run_id, "status": "verified", "matched_count": len(final_rows)}
 
 
-def _verify_v2_topic_run(
+def _verify_caller_ai_topic_run(
     run: Mapping[str, Any],
     store: TopicRunStore,
+    *,
+    evidence_scope: str,
 ) -> dict[str, Any]:
     run_id = str(run["run_id"])
     if run["status"] not in {"verification_ready", "verified"}:
@@ -921,11 +932,16 @@ def _verify_v2_topic_run(
                     item for item in contexts.get(candidate.item_id, [])
                     if isinstance(item, Mapping)
                 ],
+                evidence_scope=evidence_scope,
             )
         except DecisionValidationError as exc:
             code = (
                 "invalid_evidence"
-                if exc.code in {"evidence_required", "evidence_not_grounded"}
+                if exc.code in {
+                    "evidence_required",
+                    "evidence_not_grounded",
+                    "evidence_not_candidate_grounded",
+                }
                 else exc.code
             )
             raise RunVerificationError(code) from exc
@@ -962,6 +978,7 @@ def _verify_v2_topic_run(
     _validate_final_rows(
         final_rows, spec, contexts=contexts, expected_run_id=run_id,
         expected_data_cutoff_ms=data_cutoff_ms,
+        evidence_scope=evidence_scope,
     )
     scope = _result_scope(
         spec, final_rows, by_id, manifest,
@@ -1139,9 +1156,12 @@ def _validate_final_rows(
     spec: TopicSpec,
     *,
     contexts: Mapping[str, Any] | None = None,
+    evidence_scope: str = "candidate_or_context",
     expected_run_id: str,
     expected_data_cutoff_ms: int,
 ) -> None:
+    if evidence_scope not in {"candidate", "candidate_or_context"}:
+        raise ValueError("unsupported evidence scope")
     expected_data_cutoff_ms = _required_data_cutoff(expected_data_cutoff_ms)
     seen: set[str] = set()
     allowed = {entry["id"] for entry in spec.classification_labels}
@@ -1168,7 +1188,12 @@ def _validate_final_rows(
             raise RunVerificationError("missing_link")
         evidence = row.get("evidence")
         context_texts = list(row.get("context_texts", [])) or _context_texts(contexts or {}, str(item_id))
-        if not isinstance(evidence, list) or not evidence or not all(isinstance(value, str) and any(value in source for source in [item["text"], *context_texts]) for value in evidence):
+        evidence_sources = (
+            [item["text"]]
+            if evidence_scope == "candidate"
+            else [item["text"], *context_texts]
+        )
+        if not isinstance(evidence, list) or not evidence or not all(isinstance(value, str) and any(value in source for source in evidence_sources) for value in evidence):
             raise RunVerificationError("invalid_evidence")
         if not _item_in_scope(item, spec):
             raise RunVerificationError("invalid_scope")
@@ -2009,9 +2034,12 @@ def _stage_input_count(stage: str, artifact_dir: Path) -> int:
 
 
 def _caller_ai_manifest(manifest: Mapping[str, Any]) -> bool:
-    return manifest.get("classification_protocol") == {
-        "version": 3, "owner": "caller_ai",
-    }
+    protocol = manifest.get("classification_protocol")
+    return (
+        isinstance(protocol, Mapping)
+        and protocol.get("version") in {2, 3}
+        and protocol.get("owner") == "caller_ai"
+    )
 
 
 def _stages_for_manifest(manifest: Mapping[str, Any]) -> tuple[str, ...]:
