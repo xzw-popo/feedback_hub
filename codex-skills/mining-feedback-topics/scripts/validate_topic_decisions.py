@@ -70,15 +70,20 @@ def validate(
             raise ValueError("not_matched decision cannot include evidence")
         row = by_id[item_id]
         source_item = row.get("item")
-        texts = []
+        candidate_text = None
         if isinstance(source_item, dict) and isinstance(source_item.get("text"), str):
-            texts.append(source_item["text"])
+            candidate_text = source_item["text"]
+        context_texts = []
         for context in row.get("context_items", []):
             if isinstance(context, dict):
                 text = context.get("text") or context.get("feedback_text")
                 if isinstance(text, str):
-                    texts.append(text)
-        if any(not any(fragment in text for text in texts) for fragment in evidence):
+                    context_texts.append(text)
+        for fragment in evidence:
+            if isinstance(candidate_text, str) and fragment in candidate_text:
+                continue
+            if any(fragment in text for text in context_texts):
+                raise ValueError("decision evidence is not candidate-grounded")
             raise ValueError("decision evidence is not grounded")
         normalized.append({
             "item_id": item_id,

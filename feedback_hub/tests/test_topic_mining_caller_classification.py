@@ -26,6 +26,37 @@ def test_valid_caller_decision_preserves_exact_evidence():
     }
 
 
+def test_context_only_evidence_cannot_match_candidate():
+    with pytest.raises(DecisionValidationError) as error:
+        validate_decision(
+            {
+                "item_id": "a",
+                "label": "matched",
+                "reason": "上下文相关",
+                "evidence": ["语音输入无法识别"],
+            },
+            {"item_id": "a", "text": "今天天气不错"},
+            [{"text": "语音输入无法识别"}],
+        )
+
+    assert error.value.code == "evidence_not_candidate_grounded"
+
+
+def test_candidate_evidence_matches_with_unrelated_context_present():
+    decision = validate_decision(
+        {
+            "item_id": "a",
+            "label": "matched",
+            "reason": "候选原文自证",
+            "evidence": ["语音输入无法识别"],
+        },
+        {"item_id": "a", "text": "语音输入无法识别"},
+        [{"text": "今天天气不错"}],
+    )
+
+    assert decision.label == "matched"
+
+
 @pytest.mark.parametrize(
     ("raw", "code"),
     [

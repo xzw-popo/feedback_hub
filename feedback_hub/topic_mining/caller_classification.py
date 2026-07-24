@@ -37,7 +37,11 @@ def validate_decision(
     raw: Mapping[str, Any],
     candidate: Mapping[str, Any],
     context_items: Sequence[Mapping[str, Any]],
+    *,
+    evidence_scope: str = "candidate",
 ) -> CallerDecision:
+    if evidence_scope not in {"candidate", "candidate_or_context"}:
+        raise ValueError("unsupported evidence scope")
     if not isinstance(raw, Mapping):
         raise DecisionValidationError("unsupported_fields")
     if set(raw) != _FIELDS:
@@ -67,21 +71,26 @@ def validate_decision(
         raise DecisionValidationError("evidence_required")
     if label == "not_matched" and evidence:
         raise DecisionValidationError("evidence_not_allowed")
-    source_texts = []
     text = candidate.get("text")
-    if isinstance(text, str):
-        source_texts.append(text)
+    context_texts: list[str] = []
     for item in context_items:
         if not isinstance(item, Mapping):
             continue
         context_text = item.get("text") or item.get("feedback_text")
         if isinstance(context_text, str):
-            source_texts.append(context_text)
-    if label == "matched" and any(
-        not any(fragment in source for source in source_texts)
-        for fragment in evidence
-    ):
-        raise DecisionValidationError("evidence_not_grounded")
+            context_texts.append(context_text)
+    if label == "matched":
+        for fragment in evidence:
+            if isinstance(text, str) and fragment in text:
+                continue
+            in_context = any(fragment in source for source in context_texts)
+            if evidence_scope == "candidate_or_context" and in_context:
+                continue
+            if in_context:
+                raise DecisionValidationError(
+                    "evidence_not_candidate_grounded"
+                )
+            raise DecisionValidationError("evidence_not_grounded")
     return CallerDecision(
         item_id=item_id,
         label=label,

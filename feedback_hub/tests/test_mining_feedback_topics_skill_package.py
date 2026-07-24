@@ -64,6 +64,29 @@ def _run_validator(path: Path, *arguments: str) -> subprocess.CompletedProcess[s
     )
 
 
+def _run_decision_validator(
+    page: Path,
+    decisions: Path,
+    output: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DECISION_VALIDATOR),
+            "--page",
+            str(page),
+            "--file",
+            str(decisions),
+            "--output",
+            str(output),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _load_client_module():
     spec = importlib.util.spec_from_file_location("topic_backend_client", CLIENT)
     assert spec and spec.loader
@@ -1146,6 +1169,31 @@ def test_review_contract_requires_complete_context_grounded_decisions():
     assert "context_items" in policy
     assert "non-empty substrings" in policy
     assert "exact" in policy
+
+
+def test_decision_validator_rejects_context_only_evidence(tmp_path):
+    page = tmp_path / "page.json"
+    page.write_text(json.dumps({
+        "items": [{
+            "item_id": "feedback-1",
+            "item": {"item_id": "feedback-1", "text": "今天天气不错"},
+            "context_items": [{"text": "语音输入完全无法识别"}],
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    decisions = tmp_path / "decisions.json"
+    decisions.write_text(json.dumps([{
+        "item_id": "feedback-1",
+        "label": "matched",
+        "reason": "上下文提到了专题",
+        "evidence": ["语音输入完全无法识别"],
+    }], ensure_ascii=False), encoding="utf-8")
+    output = tmp_path / "validated.json"
+
+    result = _run_decision_validator(page, decisions, output)
+
+    assert result.returncode == 2
+    assert "candidate-grounded" in result.stderr
+    assert not output.exists()
 
 
 def test_skill_resumes_only_recoverable_preclassification_runs():
