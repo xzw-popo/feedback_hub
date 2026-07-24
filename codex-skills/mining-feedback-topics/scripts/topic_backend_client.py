@@ -175,11 +175,11 @@ def _platform_contract(capabilities: Any) -> dict[str, Any]:
 
 def _classification_contract(capabilities: Any) -> dict[str, Any]:
     expected = {
-        "version": 2,
+        "version": 3,
         "owner": "caller_ai",
         "candidate_page_default": 20,
         "candidate_page_maximum": 20,
-        "matched_evidence": "exact_source_or_context_substring",
+        "matched_evidence": "exact_candidate_substring",
         "partial_acceptance": True,
     }
     if (

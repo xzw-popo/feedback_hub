@@ -32,11 +32,11 @@ HYPERLINK_GATE = (
 
 def _classification_protocol():
     return {
-        "version": 2,
+        "version": 3,
         "owner": "caller_ai",
         "candidate_page_default": 20,
         "candidate_page_maximum": 20,
-        "matched_evidence": "exact_source_or_context_substring",
+        "matched_evidence": "exact_candidate_substring",
         "partial_acceptance": True,
     }
 
@@ -880,7 +880,7 @@ def test_skill_guidance_has_auditable_ordered_workflow_and_direct_resources():
         "data/index gaps",
         "vector watermark",
         "exact candidate coverage",
-        "source-grounded evidence",
+        "candidate-grounded evidence",
         "valid links",
     ):
         assert condition in body.lower()
@@ -1155,7 +1155,7 @@ def test_references_use_backend_anchored_atomic_time_preparation_command():
         assert "--default-now NOW" not in text
 
 
-def test_review_contract_requires_complete_context_grounded_decisions():
+def test_review_contract_requires_complete_candidate_grounded_decisions():
     skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     contract = (
         SKILL_ROOT / "references" / "backend-contract.md"
@@ -1167,6 +1167,9 @@ def test_review_contract_requires_complete_context_grounded_decisions():
     assert "cover exactly its page ids once" in contract.lower()
     assert "context_items" in skill
     assert "context_items" in policy
+    assert "interpret" in policy.lower()
+    assert "item.text" in policy
+    assert "must not substitute" in policy.lower()
     assert "non-empty substrings" in policy
     assert "exact" in policy
 
@@ -1205,7 +1208,7 @@ def test_skill_resumes_only_recoverable_preclassification_runs():
     assert "only for a recoverable pre-classification run" in skill
     assert "classification states are caller-owned" in skill
     assert "resume applies only to recoverable pre-classification work" in contract
-    assert "backend never chooses a semantic classifier for v2" in contract
+    assert "backend never chooses a semantic classifier for v3" in contract
 
 
 def test_backend_contract_keeps_internal_artifacts_out_of_download_contract():
