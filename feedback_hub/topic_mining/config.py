@@ -1,0 +1,42 @@
+"""Configuration for the isolated topic-mining runtime."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from feedback_hub import config as feedback_config
+
+
+@dataclass(frozen=True)
+class TopicMiningConfig:
+    source_db_path: Path = feedback_config.DB_PATH
+    data_dir: Path = Path(os.environ.get(
+        "TOPIC_MINING_DATA_DIR", str(feedback_config.DATA_DIR / "topic_mining")
+    ))
+    vector_api_url: str = os.environ.get("TOPIC_VECTOR_API_URL", "")
+    vector_api_token: str = os.environ.get("TOPIC_VECTOR_API_TOKEN", "")
+    vector_index: str = os.environ.get("TOPIC_VECTOR_INDEX", "feedback-items-v1")
+    vector_max_lag_seconds: int = int(os.environ.get("TOPIC_VECTOR_MAX_LAG_SECONDS", "21600"))
+    source_sync_interval_seconds: int = int(os.environ.get(
+        "TOPIC_SOURCE_SYNC_INTERVAL_SECONDS", "1200"
+    ))
+    api_token: str = os.environ.get("TOPIC_MINING_API_TOKEN", "")
+    # Worker recovery policy is backend-owned and intentionally not exposed as
+    # a client or deployment input. Tests may construct a shorter lease.
+    worker_lease_seconds: int = 3600
+    standard_channel_top_k: int = 200
+    standard_recall_pool_limit: int = 2000
+    standard_candidate_min: int = 100
+    standard_candidates_per_day: int = 80
+    standard_candidate_max: int = 500
+    exhaustive_channel_top_k: int = 2000
+    exhaustive_recall_pool_limit: int = 5000
+    exhaustive_candidate_limit: int = 5000
+    review_samples_per_day: int = 20
+    review_sample_max: int = 80
+    review_page_limit: int = 50
+    rrf_k: int = 60
+    classifier_batch_size: int = 20
+    classifier_concurrency: int = 8

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import L1Tag from '@/components/L1Tag.vue'
 import SeverityTag from '@/components/SeverityTag.vue'
@@ -9,6 +9,7 @@ import { formatTs } from '@/utils/format'
 
 const props = defineProps<{ id: string }>()
 const router = useRouter()
+const route = useRoute()
 
 const data = ref<DetailResp | null>(null)
 const notFound = ref(false)
@@ -31,7 +32,8 @@ async function load() {
 }
 
 function goBack() {
-  router.push('/')
+  const from = typeof route.query.from === 'string' ? route.query.from : ''
+  router.push(from.startsWith('/') ? from : '/')
 }
 
 function openOriginalChat() {

@@ -137,6 +137,172 @@ def test_pull_end_to_end_with_mock(tmp_path, monkeypatch):
     assert result["fetched_count"] == 1
     assert result["inserted_count"] == 1
     assert result["skipped_dup_count"] == 0
+    with db.connect(tmp_path / "fb.db") as verify:
+        coverage = verify.execute(
+            """SELECT channel, start_ts_ms, end_ts_ms, completed_at_ms
+               FROM feedback_source_coverage"""
+        ).fetchone()
+    assert coverage["channel"] == "wetype"
+    assert coverage["start_ts_ms"] == int(start.timestamp()) * 1000
+    assert coverage["end_ts_ms"] == int(end.timestamp()) * 1000
+    assert coverage["completed_at_ms"] >= coverage["end_ts_ms"]
     assert (tmp_path / "raw").exists()
     raw_files = list((tmp_path / "raw").glob("raw_wetype_*.json"))
     assert len(raw_files) == 1
+
+
+def test_pull_rejects_application_error_before_feedback_or_coverage_commit(tmp_path, monkeypatch):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 403, "errMsg": "denied"},
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    try:
+        with pytest.raises(puller.PullError, match="application failure"):
+            puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=conn)
+    finally:
+        conn.close()
+
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 0
+
+
+def test_fetch_window_rejects_http_200_application_error_without_err_code(monkeypatch):
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"content-type": "application/json"}
+    response.json.return_value = {"errMsg": "permission denied"}
+    monkeypatch.setattr(puller.requests, "post", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(puller.PullError, match="application failure"):
+        puller.fetch_window(1, 2)
+
+
+@pytest.mark.parametrize("payload", [{}, {"errCode": 0}, {"errCode": 0, "results": "not-a-list"}, {"errCode": 0, "results": None}, {"errCode": 0, "results": [], "errMsg": {}}, {"errCode": 0, "results": [], "error": {}}])
+def test_pull_rejects_malformed_success_shape_before_raw_feedback_or_coverage(tmp_path, monkeypatch, payload):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: payload)
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    connection = db.connect(db_path)
+    db.init_schema(connection)
+    try:
+        with pytest.raises(puller.PullError):
+            puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=connection)
+    finally:
+        connection.close()
+
+    assert not (tmp_path / "raw").exists()
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 0
+
+
+def test_pull_accepts_documented_empty_results_list(tmp_path, monkeypatch):
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(puller, "fetch_window", lambda *_args, **_kwargs: {"errCode": 0, "results": []})
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(puller, "ensure_dirs", lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True))
+    connection = db.connect(db_path)
+    db.init_schema(connection)
+    try:
+        result = puller.pull(datetime(2026, 7, 21, 8), datetime(2026, 7, 21, 9), conn=connection)
+    finally:
+        connection.close()
+
+    assert result["fetched_count"] == 0
+    with db.connect(db_path) as verify:
+        assert verify.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+        assert verify.execute("SELECT COUNT(*) FROM feedback_source_coverage").fetchone()[0] == 1
+
+
+def test_pull_publishes_feedback_and_coverage_in_one_transaction(
+    tmp_path, monkeypatch,
+):
+    ts_ms = 1747526400000
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window",
+        lambda *_args, **_kwargs: _sample_resp(ts_ms),
+    )
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(
+        puller, "ensure_dirs",
+        lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True),
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    original = db.record_feedback_source_coverage
+    visible_before_generation = []
+
+    def observe_before_generation(connection, **kwargs):
+        with db.connect(db_path) as observer:
+            visible_before_generation.append(
+                observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            )
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(db, "record_feedback_source_coverage", observe_before_generation)
+    start = datetime.fromtimestamp(ts_ms / 1000) - timedelta(seconds=1)
+    end = datetime.fromtimestamp(ts_ms / 1000) + timedelta(seconds=1)
+
+    try:
+        puller.pull(start, end, conn=conn)
+    finally:
+        conn.close()
+
+    assert visible_before_generation == [0]
+    with db.connect(db_path) as observer:
+        assert observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+        assert observer.execute(
+            "SELECT COUNT(*) FROM feedback_source_coverage"
+        ).fetchone()[0] == 1
+
+
+def test_pull_replays_the_whole_write_after_a_generation_collision(
+    tmp_path, monkeypatch,
+):
+    ts_ms = 1747526400000
+    db_path = tmp_path / "fb.db"
+    monkeypatch.setattr(
+        puller, "fetch_window",
+        lambda *_args, **_kwargs: _sample_resp(ts_ms),
+    )
+    monkeypatch.setattr(puller, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(
+        puller, "ensure_dirs",
+        lambda: (tmp_path / "raw").mkdir(parents=True, exist_ok=True),
+    )
+    conn = db.connect(db_path)
+    db.init_schema(conn)
+    original = db.record_feedback_source_coverage
+    attempts = 0
+
+    def collide_once(connection, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            connection.rollback()
+            raise db.SourceGenerationCollisionError(
+                "simulated source generation collision"
+            )
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(db, "record_feedback_source_coverage", collide_once)
+    start = datetime.fromtimestamp(ts_ms / 1000) - timedelta(seconds=1)
+    end = datetime.fromtimestamp(ts_ms / 1000) + timedelta(seconds=1)
+
+    try:
+        result = puller.pull(start, end, conn=conn)
+    finally:
+        conn.close()
+
+    assert attempts == 2
+    assert result["inserted_count"] == 1
+    with db.connect(db_path) as observer:
+        assert observer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+        assert observer.execute(
+            "SELECT COUNT(*) FROM feedback_source_coverage"
+        ).fetchone()[0] == 1

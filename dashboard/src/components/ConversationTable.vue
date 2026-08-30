@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import type { ConversationItem } from '@/api/feedback'
 import type { AiScoreMap } from '@/composables/useSearchState'
 import L1Tag from './L1Tag.vue'
@@ -17,8 +17,12 @@ const props = defineProps<{
 }>()
 
 const router = useRouter()
+const route = useRoute()
 function gotoDetail(row: ConversationItem) {
-  router.push(`/feedback/${row.conversation_id}`)
+  router.push({
+    path: `/feedback/${row.conversation_id}`,
+    query: { from: route.fullPath },
+  })
 }
 
 function openOriginalChat(row: ConversationItem) {

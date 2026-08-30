@@ -1,0 +1,90 @@
+schema_version: feedback_label_v2
+
+feedback_type:
+  required: true
+  type: single
+  values:
+    bug_problem: 用户反馈问题、异常、不可用或结果错误。
+    feature_request: 用户希望新增能力或支持新场景。
+    improvement_request: 用户希望优化已有能力。
+    question_help: 用户咨询怎么用、在哪里或为什么。
+    sentiment_only: 只有态度表达，没有具体可分析内容。
+    irrelevant_invalid: 测试、灌水、无关、空泛或无法使用的文本。
+    mixed: 明确包含多个有效意图。
+
+detail_policy:
+  always_label_detail:
+    - bug_problem
+    - feature_request
+    - improvement_request
+  conditional_detail:
+    - question_help
+    - sentiment_only
+  skip_detail:
+    - irrelevant_invalid
+
+product_area:
+  type: multi
+  values:
+    input_core: 打字、候选、拼音、纠错、上屏。
+    voice_input: 语音输入、语音识别、语音转文字。
+    emoji_expression: 表情包、Emoji、颜文字、表达推荐。
+    ai_generation: AI 润色、问 AI、文字整理、生成内容。
+    clipboard_sync: 剪贴板、跨设备粘贴、同步相关粘贴链路。
+    keyboard_ui: 键盘布局、高度、工具栏、按钮、交互面。
+    dictionary_phrases: 词库、热词、自定义短语、用户词。
+    permissions_privacy: 权限、隐私、安全感和信任问题。
+    performance_stability: 卡顿、卡死、耗电、发热、崩溃且领域不清。
+    install_update: 安装、升级、版本兼容、包体问题。
+    cross_app_compatibility: 特定 App 或宿主环境问题。
+    account_sync: 账号影响同步、数据恢复或跨端链路。
+    other_low_priority: 皮肤、纯视觉定制、纯账号登录等低优先领域。
+    other_unknown: 有效反馈但对象无法判断。
+
+issue_pattern:
+  type: multi
+  values:
+    unavailable_or_broken: 不可用、没反应、闪退、卡死、功能坏了。
+    incorrect_or_poor_result: 结果错误、识别差、推荐差、生成质量差。
+    missing_or_unsupported: 缺能力、不支持场景、平台或 App。
+    hard_to_use_or_trigger: 入口深、难找、触发不明、触发不稳定、操作复杂。
+    performance_problem: 慢、卡、延迟、耗电、发热。
+    layout_or_display_problem: 错位、遮挡、显示不全、视觉异常。
+    compatibility_problem: 与系统、设备、版本、App 或环境有关。
+    data_or_sync_problem: 同步失败、数据丢失、词库丢失、跨端失败。
+    other_unknown: 有效反馈但问题形态无法判断。
+
+evidence_signal:
+  type: multi
+  values:
+    has_actual_behavior: 说清楚实际发生了什么。
+    has_expected_behavior: 说清楚希望发生什么。
+    has_context: 包含平台、版本、设备、App、场景或环境。
+    has_repro_steps: 包含复现步骤。
+    has_scenario: 包含具体使用场景。
+    has_comparison: 与竞品、系统键盘、旧版本或其他平台对比。
+    has_workaround: 提到绕行方案。
+    vague: 信息太少，难以解释。
+
+experimental:
+  value_signal:
+    clear_actionable: 能转成产品或工程动作。
+    strong_pain: 用户表达强痛点。
+    workflow_blocker: 阻断完整工作流。
+    new_scenario: 出现新使用场景。
+    regression_suspected: 疑似版本退化或近期变坏。
+    competitor_mentioned: 提到竞品或替代方案。
+    retention_risk: 明确说不用、卸载或切换产品。
+    positive_signal: 明确表扬能力或优势。
+  observable_impact:
+    - blocked
+    - degraded
+    - friction
+    - preference
+    - unknown
+  actionability:
+    - actionable
+    - external_constraint
+    - product_policy
+    - insufficient_info
+    - unknown

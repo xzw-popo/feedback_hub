@@ -167,27 +167,33 @@ def upsert_post(
         """,
         (weibo_id, keyword, query_name or keyword, now, search_rank, source_mode),
     )
-    label = classify_post(text)
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO weibo_label (
-            weibo_id, brand_focus, sentiment, topics_json, post_type, risk_level,
-            confidence, reason, label_source, labeled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            weibo_id,
-            label["brand_focus"],
-            label["sentiment"],
-            _dumps(label["topics"]),
-            label["post_type"],
-            label["risk_level"],
-            label["confidence"],
-            label["reason"],
-            label["label_source"],
-            now,
-        ),
-    )
+    existing_label = conn.execute(
+        "SELECT label_source FROM weibo_label WHERE weibo_id = ?",
+        (weibo_id,),
+    ).fetchone()
+    existing_label_source = _row_get(existing_label, "label_source") if existing_label is not None else None
+    if existing_label_source not in ("llm", "llm_hidden"):
+        label = classify_post(text)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO weibo_label (
+                weibo_id, brand_focus, sentiment, topics_json, post_type, risk_level,
+                confidence, reason, label_source, labeled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                weibo_id,
+                label["brand_focus"],
+                label["sentiment"],
+                _dumps(label["topics"]),
+                label["post_type"],
+                label["risk_level"],
+                label["confidence"],
+                label["reason"],
+                label["label_source"],
+                now,
+            ),
+        )
     conn.commit()
     return {"inserted": inserted, "weibo_id": weibo_id}
 
@@ -492,3 +498,24 @@ def create_crawl_run(conn: Any, *, status: str, config: dict[str, Any], started_
     )
     conn.commit()
     return run_id
+
+
+def finish_crawl_run(
+    conn: Any,
+    run_id: str,
+    *,
+    status: str,
+    total_seen: int,
+    inserted_posts: int,
+    error_message: str | None = None,
+    finished_at: int | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE weibo_crawl_run
+        SET status = ?, finished_at = ?, total_seen = ?, inserted_posts = ?, error_message = ?
+        WHERE id = ?
+        """,
+        (status, finished_at or int(time.time()), total_seen, inserted_posts, error_message, run_id),
+    )
+    conn.commit()

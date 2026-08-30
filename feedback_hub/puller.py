@@ -35,6 +35,42 @@ urllib3.disable_warnings()
 PLATFORM_MAP = {1: "iOS", 2: "Android", 7: "Win", 9: "Mac", 11: "小程序"}
 
 
+class PullError(RuntimeError):
+    """A safe, non-success response from the feedback OpenAPI."""
+
+
+def _validate_success_response(response: object) -> dict:
+    """Accept only the documented success shape before any local write begins.
+
+    Existing API fixtures establish integer ``errCode == 0`` as success; an
+    omitted ``errCode`` remains compatible with older successful payloads.
+    Error response text is intentionally not copied into the exception because
+    it may contain user or service details.
+    """
+    if not isinstance(response, dict):
+        raise PullError("OpenAPI success payload is invalid")
+    if "errCode" in response:
+        code = response["errCode"]
+        if isinstance(code, bool) or not isinstance(code, int) or code != 0:
+            raise PullError("OpenAPI application failure (non-success errCode)")
+    for field in ("success", "ok"):
+        if field in response and not isinstance(response[field], bool):
+            raise PullError("OpenAPI success payload has malformed status")
+        if response.get(field) is False:
+            raise PullError("OpenAPI application failure")
+    if "errMsg" in response:
+        message = response["errMsg"]
+        if not isinstance(message, str):
+            raise PullError("OpenAPI success payload has malformed error field")
+        if message:
+            raise PullError("OpenAPI application failure")
+    if "error" in response and response["error"] is not None:
+        raise PullError("OpenAPI application failure")
+    if not isinstance(response.get("results"), list):
+        raise PullError("OpenAPI success payload requires list results")
+    return response
+
+
 def _platform(ci: dict) -> str:
     if not isinstance(ci, dict):
         return "未知"
@@ -80,7 +116,7 @@ def fetch_window(start_sec: int, end_sec: int, *,
             f"前 200 字节：{snippet}\n"
             f"➡️  常见原因：iOA SmartVPN 没开 / DNS 解析失败 / OpenAPI 临时维护"
         )
-    return r.json()
+    return _validate_success_response(r.json())
 
 
 def extract_rows(resp: dict, *, start_ms: int, end_ms: int,
@@ -167,13 +203,19 @@ def write_raw_dump(resp: dict, channel: str, tag: str) -> Path:
     return p
 
 
-def upsert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
+def upsert_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    commit: bool = True,
+) -> int:
     """把 extract_rows 的结果写入 feedback 表，返回新增行数（已存在的跳过）。"""
     inserted = 0
     for row in rows:
         if db.upsert_feedback(conn, row):
             inserted += 1
-    conn.commit()
+    if commit:
+        conn.commit()
     return inserted
 
 
@@ -184,7 +226,11 @@ def pull(start_dt: datetime, end_dt: datetime, *,
     """端到端：拉取 → 抽取 → 落 raw → 写库。返回汇总统计。"""
     s_sec, e_sec = int(start_dt.timestamp()), int(end_dt.timestamp())
     s_ms, e_ms = s_sec * 1000, e_sec * 1000
-    resp = fetch_window(s_sec, e_sec, channel=channel, service_vid=service_vid)
+    # Validate here as well: tests and callers may inject ``fetch_window``.
+    # This remains before raw dumps, feedback writes, and coverage publication.
+    resp = _validate_success_response(
+        fetch_window(s_sec, e_sec, channel=channel, service_vid=service_vid)
+    )
     rows, debug = extract_rows(resp, start_ms=s_ms, end_ms=e_ms, channel=channel)
 
     tag = _make_tag(start_dt, end_dt)
@@ -196,7 +242,24 @@ def pull(start_dt: datetime, end_dt: datetime, *,
         db.init_schema(conn)
         own_conn = True
     try:
-        inserted = upsert_rows(conn, rows)
+        for _attempt in range(8):
+            try:
+                inserted = upsert_rows(conn, rows, commit=False)
+                source_generation_ms = db.record_feedback_source_coverage(
+                    conn,
+                    channel=channel,
+                    start_ts_ms=s_ms,
+                    end_ts_ms=e_ms,
+                )
+                conn.commit()
+                break
+            except db.SourceGenerationCollisionError:
+                conn.rollback()
+        else:
+            raise RuntimeError("could not allocate a unique source generation")
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         if own_conn:
             conn.close()
@@ -206,6 +269,7 @@ def pull(start_dt: datetime, end_dt: datetime, *,
         "fetched_count": len(rows),
         "inserted_count": inserted,
         "skipped_dup_count": len(rows) - inserted,
+        "source_generation_ms": source_generation_ms,
         "raw_dump": str(raw_path),
         "debug": debug,
     }

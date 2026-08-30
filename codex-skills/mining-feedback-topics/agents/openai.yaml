@@ -1,0 +1,4 @@
+interface:
+  display_name: "反馈专题挖掘"
+  short_description: "从内部反馈中提取可审计的专题结果，并保留来源证据和反馈链接"
+  default_prompt: "使用 $mining-feedback-topics 从内部反馈中查找我描述的专题，并保留证据和链接。"

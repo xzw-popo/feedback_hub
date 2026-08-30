@@ -140,6 +140,213 @@ cd /opt/feedback_hub
 APP_PORT=8000 scripts/devcloud_runtime.sh status
 ```
 
+### 5.1 部署一次性反馈专题挖掘后端
+
+专题挖掘后端提供 `/api/topic-mining/*`，用于创建只读、可审核的专题 run。它不是日常拉取或通用打标流程的一部分：源数据库只读，快照和 run 状态只写入 `feedback_hub/data/topic_mining/`。
+
+部署代码后，在远端虚拟环境安装专题依赖：
+
+```bash
+cd /opt/feedback_hub
+./.venv/bin/pip install -r requirements-topic-mining.txt
+```
+
+在远端 `.env` 配置以下六个 `TOPIC_*` 变量；token 只能写在 `.env`，不要提交或复制到 Skill 源码：
+
+```dotenv
+TOPIC_MINING_DATA_DIR=/opt/feedback_hub/feedback_hub/data/topic_mining
+TOPIC_VECTOR_API_URL=https://your-internal-vector-service
+TOPIC_VECTOR_API_TOKEN=
+TOPIC_VECTOR_INDEX=feedback-items-v1
+TOPIC_VECTOR_MAX_LAG_SECONDS=21600
+TOPIC_MINING_API_TOKEN=
+```
+
+协议 v3 的专题挖掘不会调用后端语义分类模型。`LLM_*` 可以继续为搜索、打标等其他服务保留，但 `LLM_MODEL`（包括 `deepseek-v4-flash`）不会参与 v3 专题的成员判定：
+
+```dotenv
+LLM_API_URL=
+LLM_API_KEY=
+LLM_MODEL=
+```
+
+`TOPIC_VECTOR_API_URL` 指向受维护的向量召回服务；向量结果只用于候选召回，调用 Skill 的 AI 负责逐条语义分类，后端负责证据校验、验证和导出。向量服务返回的 `watermark_ts_ms` 必须是从 `feedback_source_coverage.completed_at_ms` 传递的同一数据代际，不能用最后一条反馈的事件时间代替。
+
+新版 schema 会创建 `feedback_source_coverage`，每次 `feedback_hub pull` 成功后写入本次的 channel、拉取起止区间和单调递增的数据代际。专题服务只读这张表：它用覆盖区间区分“该时段没有反馈”和“该时段尚未同步”，并用数据代际区分最大反馈时间不变的历史补录。旧数据库在首次启动新代码时只会建表，不会猜测历史覆盖范围；在运行专题前，必须用正常拉取流程同步请求的完整时间段。如果 run 返回 `data_coverage_error`，应补拉缺失区间并新建数据代际下的 run，不得伪造边界反馈或手工绕过验证。
+
+完成依赖和配置后，先重启新代码并确认新进程正常，再检查专题能力接口：
+
+```bash
+APP_PORT=8000 scripts/devcloud_runtime.sh restart
+APP_PORT=8000 scripts/devcloud_runtime.sh status
+```
+
+能力接口必须包含完整且精确的 v3 所有权契约，新的 Skill 才允许创建 Run：
+
+```json
+{
+  "classification_protocol": {
+    "version": 3,
+    "owner": "caller_ai",
+    "candidate_page_default": 20,
+    "candidate_page_maximum": 20,
+    "matched_evidence": "exact_candidate_substring",
+    "partial_acceptance": true
+  }
+}
+```
+
+健康的新 Run 在快照、硬筛和混合召回后应停在
+`classification_ready`，此时没有后台模型来源或重试信息。后续运维观察
+`accepted_decision_count` 和 `pending_decision_count`；覆盖完整后进入
+`verification_ready`。冒烟测试应故意把一条只存在于 `context_items` 的证据
+提交给候选反馈，确认返回 `evidence_not_candidate_grounded`、其他条目被接受、
+仅该 ID 保持 pending；再将其修复为 `not_matched`，并确认真正相关的上下文消息
+只有以自己的 Feedback ID 独立召回和判定后才能导出。不要恢复未完成的 v1/v2
+Run；旧 v1/v2 仅保留已验证结果的读取和重新导出兼容。
+
+`.env` 不会自动导出到当前 shell。保持在 `/opt/feedback_hub`，先用 `env -u` 避免当前 shell 的同名变量遮蔽项目配置，再由当前虚拟环境导入 `feedback_hub.config`，让它加载项目根 `.env`，最后把专题 API token 只保存到临时 shell 变量。以下命令不打印 token；也不要额外 `echo` 该变量：
+
+```bash
+cd /opt/feedback_hub
+TOPIC_CAPABILITIES_URL='http://127.0.0.1:8000/api/topic-mining/capabilities'
+TOPIC_TOKEN="$(
+  env -u TOPIC_MINING_API_TOKEN ./.venv/bin/python -c 'import os; from feedback_hub import config as _feedback_config; print(os.environ.get("TOPIC_MINING_API_TOKEN", ""))'
+)" || exit 1
+
+if [ -z "$TOPIC_TOKEN" ]; then
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "200" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+else
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "401" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  TOPIC_HTTP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $TOPIC_TOKEN" \
+    "$TOPIC_CAPABILITIES_URL")" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+  test "$TOPIC_HTTP_STATUS" = "200" || \
+    { unset TOPIC_TOKEN TOPIC_HTTP_STATUS; exit 1; }
+fi
+
+unset TOPIC_HTTP_STATUS
+unset TOPIC_TOKEN
+```
+
+空 token 分支确认未开启鉴权时返回 `200`；非空分支先确认无 token 请求返回 `401`，再确认携带正确 token 返回 `200`。每次 `curl` 的传输状态和 HTTP 状态都独立校验；任何一步不符合预期都会立即退出并传播非零状态，不会被后续成功命令掩盖。
+
+专题后端部署不上传或安装 `codex-skills/mining-feedback-topics/`：该目录是单独分发给 Codex 的客户端 Skill，不属于服务运行时。打包部署时应将其排除出服务包。部署也绝不替换生产 `feedback_hub/data/feedback.db`；仅保留既有数据库，并让专题 run 在独立 `topic_mining/` 数据目录内创建快照和产物。
+
+### 5.2 部署本地 Qwen 向量后端（需单独批准远端写入）
+
+向量模型、索引和日志都是远端运行态，固定保存在代码包之外；常规 `deploy_devcloud.sh` 会保留它们，归档和 Git 均不包含这些路径：
+
+- 模型：`/opt/feedback_hub/feedback_hub/data/models/Qwen3-Embedding-0.6B`
+- 索引：`/opt/feedback_hub/feedback_hub/data/vector_index`
+- 向量 API：只监听 `127.0.0.1:8011`（可用 `VECTOR_PORT` 覆盖）
+- 向量日志：`/opt/feedback_hub/logs/vector_index.log`
+- 增量同步日志：`/opt/feedback_hub/feedback_hub/data/logs/feedback_incremental_sync.log`
+
+模型只在获得远端写入批准后从本机已验证的实验目录上传。脚本要求本地模型同时有 `config.json`、`tokenizer.json`、`model.safetensors`，生成确定性 SHA-256 清单，仅上传与远端清单不同的文件，并通过临时目录校验后原子提升。它会先安装 `requirements-vector.txt`，再从官方 CPU 索引安装 PyTorch，并拒绝 CUDA 版本。它不会拉取原始反馈、不会打标、不会重建索引、不会修改 cron。
+
+```bash
+cd /Users/charvel/Desktop/用户反馈_2026_0612
+MODEL_SOURCE_DIR=/Users/charvel/Desktop/用户反馈_2026_0612/feedback_hub/data/embedding_lab/models/Qwen3-Embedding-0.6B \
+  scripts/deploy_vector_backend_devcloud.sh
+```
+
+首次 bootstrap 默认不启动向量服务：没有已验证的活动根 `manifest.json` 或安全的 `active-generation.json` 指针时，启动会被拒绝。完成获批的两周数据准备和 rebuild 后，才可明确请求启动：
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  set -e
+  cd /opt/feedback_hub &&
+  ACTIVE_POINTER=feedback_hub/data/vector_index/active-generation.json &&
+  ACTIVE_POINTER_BACKUP=feedback_hub/data/vector_index/backups/active-generation.json.pre-rebuild &&
+  NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild &&
+  mkdir -p feedback_hub/data/vector_index/backups &&
+  if [ -e "$ACTIVE_POINTER" ]; then
+    ./.venv/bin/python -m json.tool "$ACTIVE_POINTER" >/dev/null
+    rm -f -- "$NO_PRIOR_POINTER_MARKER"
+    cp -- "$ACTIVE_POINTER" "$ACTIVE_POINTER_BACKUP"
+    test -s "$ACTIVE_POINTER_BACKUP"
+  else
+    rm -f -- "$ACTIVE_POINTER_BACKUP"
+    : > "$NO_PRIOR_POINTER_MARKER"
+  fi
+  ./.venv/bin/python -m feedback_hub.cli ingest backfill --last 14d --chunk 6h &&
+  ./.venv/bin/python -m feedback_hub.cli vectors rebuild \
+    --target-model-version qwen3-embedding-0.6b-document-v2 \
+    --generation-id qwen3-embedding-0.6b-document-v2-20260721 &&
+  scripts/vector_runtime.sh start
+'
+```
+
+`--last 14d` 是本轮批准的最大历史回填窗口；不要因未来可能需要更长专题范围而扩大到 180 天。回填只写原始覆盖和向量数据，不能调用通用 `tag`。如果模型部署时索引已经存在，可用 `--start-after-bootstrap` 只在上述活动清单/指针有效时启动：
+
+```bash
+MODEL_SOURCE_DIR=/path/to/Qwen3-Embedding-0.6B \
+  scripts/deploy_vector_backend_devcloud.sh --start-after-bootstrap
+```
+
+常规代码部署在代码目录原子切换后，如果检测到活动索引，会先重启并检查向量服务，再启动 FastAPI。向量服务无法达到 `/health` 时应用保持停止，部署返回非零；脚本会把代码目录回滚，同时保留 `.venv`、`.env`、模型、SQLite 与 `feedback_hub/data/`。
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  cd /opt/feedback_hub &&
+  scripts/vector_runtime.sh status &&
+  curl -fsS http://127.0.0.1:8011/health &&
+  APP_PORT=8000 scripts/devcloud_runtime.sh status
+'
+```
+
+当前节点只通过内网/VPN 访问专题接口，因此 `TOPIC_MINING_API_TOKEN` 保持 unset；不要为了此部署设置、打印或提交该 token。仍需保留 `TOPIC_VECTOR_API_URL=http://127.0.0.1:8011` 和相应 `TOPIC_*` 运行时配置在远端 `.env`，而不是本机 shell 或仓库。
+
+在切换每 20 分钟增量 cron 前，先备份当前 crontab；回滚时恢复此备份并删除新条目。以下命令是一次性远端操作，不由部署脚本执行：
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  cd /opt/feedback_hub &&
+  mkdir -p feedback_hub/data/cron-backups &&
+  crontab -l > feedback_hub/data/cron-backups/crontab-pre-vector.txt &&
+  scripts/install_feedback_incremental_cron.sh &&
+  crontab -l
+'
+
+# rollback the cron only after inspecting the backup:
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  crontab /opt/feedback_hub/feedback_hub/data/cron-backups/crontab-pre-vector.txt
+'
+```
+
+若 rebuild 生成了错误活动代际，先停止向量服务。存在旧指针备份时恢复它；首次 rebuild 没有旧指针时，保留 `no-prior-active-generation.pre-rebuild` 标记、删除新建指针并确认健康端点不可用。不要删除模型或覆盖 `feedback_hub/data/`。记录操作后再决定是否恢复 crontab 备份。
+
+```bash
+ssh -p 36000 root@charvelxia-any2.devcloud.woa.com '
+  set -e
+  cd /opt/feedback_hub &&
+  ACTIVE_POINTER=feedback_hub/data/vector_index/active-generation.json &&
+  ACTIVE_POINTER_BACKUP=feedback_hub/data/vector_index/backups/active-generation.json.pre-rebuild &&
+  NO_PRIOR_POINTER_MARKER=feedback_hub/data/vector_index/backups/no-prior-active-generation.pre-rebuild &&
+  scripts/vector_runtime.sh stop &&
+  if test -s "$ACTIVE_POINTER_BACKUP"; then
+    cp -- "$ACTIVE_POINTER_BACKUP" "$ACTIVE_POINTER"
+    scripts/vector_runtime.sh start
+    curl -fsS http://127.0.0.1:8011/health
+  elif test -f "$NO_PRIOR_POINTER_MARKER"; then
+    rm -f -- "$ACTIVE_POINTER"
+    test ! -e "$ACTIVE_POINTER"
+    if curl -fsS http://127.0.0.1:8011/health; then exit 1; fi
+  else
+    echo "missing active-generation rollback evidence" >&2
+    exit 1
+  fi
+'
+```
+
 ## 6. 数据更新方案
 
 数据更新有两种方式：容器自动更新，或本机更新后同步数据库到容器。

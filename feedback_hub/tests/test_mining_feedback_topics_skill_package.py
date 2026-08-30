@@ -1,0 +1,1620 @@
+from __future__ import annotations
+
+import contextlib
+import http.client
+import importlib.util
+import io
+import json
+import subprocess
+import sys
+from pathlib import Path
+from urllib.error import URLError
+
+import pytest
+import yaml
+from openpyxl import Workbook, load_workbook
+
+from feedback_hub.tests.test_topic_mining_contracts import valid_spec
+from feedback_hub.topic_mining.contracts import topic_spec_json_schema, validate_topic_spec
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILL_ROOT = REPO_ROOT / "codex-skills" / "mining-feedback-topics"
+VALIDATOR = SKILL_ROOT / "scripts" / "validate_topic_spec.py"
+CLIENT = SKILL_ROOT / "scripts" / "topic_backend_client.py"
+DECISION_VALIDATOR = (
+    SKILL_ROOT / "scripts" / "validate_topic_decisions.py"
+)
+HYPERLINK_GATE = (
+    SKILL_ROOT / "scripts" / "ensure_feedback_hyperlinks.py"
+)
+
+
+def _classification_protocol():
+    return {
+        "version": 3,
+        "owner": "caller_ai",
+        "candidate_page_default": 20,
+        "candidate_page_maximum": 20,
+        "matched_evidence": "exact_candidate_substring",
+        "partial_acceptance": True,
+    }
+
+
+def _platform_contract():
+    return {
+        "canonical_values": ["Win", "Android", "iOS", "Mac"],
+        "aliases": {
+            "Win": "Win", "Windows": "Win", "Win端": "Win", "Windows端": "Win",
+            "Android": "Android", "安卓": "Android", "Android端": "Android", "安卓端": "Android",
+            "iOS": "iOS", "iOS端": "iOS",
+            "Mac": "Mac", "macOS": "Mac", "Mac端": "Mac", "macOS端": "Mac",
+        },
+        "matching": "case_insensitive_ignore_whitespace",
+    }
+
+
+def _run_validator(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(VALIDATOR), *arguments, str(path)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_decision_validator(
+    page: Path,
+    decisions: Path,
+    output: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DECISION_VALIDATOR),
+            "--page",
+            str(page),
+            "--file",
+            str(decisions),
+            "--output",
+            str(output),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _load_client_module():
+    spec = importlib.util.spec_from_file_location("topic_backend_client", CLIENT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_validator_module():
+    spec = importlib.util.spec_from_file_location("validate_topic_spec", VALIDATOR)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_client(module, arguments: list[str]) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            module.main(arguments)
+        except SystemExit as error:
+            return int(error.code), stdout.getvalue(), stderr.getvalue()
+    return 0, stdout.getvalue(), stderr.getvalue()
+
+
+def _parse_frontmatter(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    _, metadata, _ = text.split("---", 2)
+    value = yaml.safe_load(metadata)
+    assert isinstance(value, dict)
+    return value
+
+
+def _write_official_workbook(
+    tmp_path: Path,
+    *,
+    missing_link_for: str | None = None,
+) -> Path:
+    path = tmp_path / "official.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "反馈清单"
+    sheet.append(["反馈原文", "Feedback ID", "对应链接"])
+    for feedback_id, text, url in (
+        ("feedback-1", "第一条反馈", "https://example.test/1"),
+        ("feedback-2", "第二条反馈", "https://example.test/2"),
+    ):
+        sheet.append([text, feedback_id, None])
+        link = sheet.cell(sheet.max_row, 3)
+        if feedback_id != missing_link_for:
+            link.value = f'=HYPERLINK("{url}","打开反馈")'
+            link.hyperlink = url
+            link.style = "Hyperlink"
+    workbook.save(path)
+    return path
+
+
+def _write_derived_workbook(
+    tmp_path: Path,
+    *,
+    rows: list[tuple[object, object, object]],
+    name: str = "derived.xlsx",
+) -> Path:
+    path = tmp_path / name
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "反馈清单"
+    sheet.append(["Feedback ID", "反馈原文", "对应链接", "自定义分类"])
+    for feedback_id, link, label in rows:
+        sheet.append([feedback_id, f"加工后的 {feedback_id}", link, label])
+    workbook.save(path)
+    return path
+
+
+def _run_hyperlink_gate(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(HYPERLINK_GATE), *arguments],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_hyperlink_gate_repairs_filtered_reordered_and_labeled_workbook(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[
+            ("feedback-2", "https://wrong.test/plain", "类别 B"),
+            ("feedback-1", None, "类别 A"),
+        ],
+    )
+    original = derived.read_bytes()
+    output = tmp_path / "verified.xlsx"
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "feedback_rows": 2,
+        "item_sheets": 1,
+        "repaired_links": 2,
+    }
+    assert derived.read_bytes() == original
+    workbook = load_workbook(output, data_only=False)
+    sheet = workbook["反馈清单"]
+    assert sheet["C2"].data_type == "f"
+    assert sheet["C2"].value == '=HYPERLINK("https://example.test/2","打开反馈")'
+    assert sheet["C2"].hyperlink.target == "https://example.test/2"
+    assert sheet["C2"].style == "Hyperlink"
+    assert sheet["D2"].value == "类别 B"
+
+
+def test_hyperlink_gate_repairs_multiple_item_sheets_and_ignores_summary(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别 A")],
+    )
+    workbook = load_workbook(derived)
+    second = workbook.create_sheet("类别 B")
+    second.append(["说明"])
+    second.append(["此处是任意摘要"])
+    second.append(["Feedback ID", "对应链接", "附加判断"])
+    second.append(["feedback-2", "plain", "需要跟进"])
+    summary = workbook.create_sheet("汇总")
+    summary.append(["类别", "数量"])
+    summary.append(["类别 A", 1])
+    workbook.save(derived)
+    output = tmp_path / "verified.xlsx"
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value == {"feedback_rows": 2, "item_sheets": 2, "repaired_links": 2}
+    repaired = load_workbook(output, data_only=False)
+    assert repaired["类别 B"]["B4"].hyperlink.target == "https://example.test/2"
+    assert repaired["汇总"]["B2"].value == 1
+
+
+def test_hyperlink_gate_check_accepts_untouched_official_workbook(tmp_path):
+    official = _write_official_workbook(tmp_path)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(official),
+        "--check",
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "feedback_rows": 2,
+        "item_sheets": 1,
+        "repaired_links": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    (
+        ([("unknown", "plain", "类别")], "unknown"),
+        (
+            [
+                ("feedback-1", "plain", "类别 A"),
+                ("feedback-1", "plain", "类别 B"),
+            ],
+            "unique",
+        ),
+        ([(None, "plain", "类别")], "non-empty"),
+    ),
+)
+def test_hyperlink_gate_rejects_invalid_feedback_ids(tmp_path, rows, message):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(tmp_path, rows=rows)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert message in result.stderr.lower()
+
+
+@pytest.mark.parametrize("missing_header", ("Feedback ID", "对应链接"))
+def test_hyperlink_gate_rejects_feedback_sheet_missing_required_column(
+    tmp_path, missing_header,
+):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别")],
+    )
+    workbook = load_workbook(derived)
+    sheet = workbook["反馈清单"]
+    for cell in sheet[1]:
+        if cell.value == missing_header:
+            cell.value = "已删除"
+    workbook.save(derived)
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert "requires feedback id and link columns" in result.stderr.lower()
+
+
+def test_hyperlink_gate_rejects_missing_official_target(tmp_path):
+    official = _write_official_workbook(
+        tmp_path,
+        missing_link_for="feedback-2",
+    )
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-2", "plain", "类别")],
+    )
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(tmp_path / "verified.xlsx"),
+    ])
+
+    assert result.returncode == 2
+    assert "official link" in result.stderr.lower()
+
+
+def test_hyperlink_gate_rejects_same_input_and_output(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("feedback-1", "plain", "类别")],
+    )
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(derived),
+    ])
+
+    assert result.returncode == 2
+    assert "output must differ" in result.stderr.lower()
+
+
+def test_hyperlink_gate_failed_repair_preserves_existing_output(tmp_path):
+    official = _write_official_workbook(tmp_path)
+    derived = _write_derived_workbook(
+        tmp_path,
+        rows=[("unknown", "plain", "类别")],
+    )
+    output = tmp_path / "verified.xlsx"
+    output.write_bytes(b"existing artifact")
+
+    result = _run_hyperlink_gate([
+        "--official", str(official),
+        "--input", str(derived),
+        "--output", str(output),
+    ])
+
+    assert result.returncode == 2
+    assert "unknown" in result.stderr.lower()
+    assert output.read_bytes() == b"existing artifact"
+
+
+def test_skill_schema_matches_backend_contract():
+    bundled = json.loads((SKILL_ROOT / "references/topic-spec.schema.json").read_text(encoding="utf-8"))
+    assert bundled == topic_spec_json_schema()
+
+
+def test_skill_documents_platform_canonicalization_contract():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(
+        encoding="utf-8",
+    )
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(
+        encoding="utf-8",
+    )
+    schema = json.loads(
+        (SKILL_ROOT / "references" / "topic-spec.schema.json").read_text(
+            encoding="utf-8",
+        )
+    )
+
+    assert "Windows -> Win" in topic_spec
+    assert "安卓 -> Android" in topic_spec
+    assert "unsupported or ambiguous" in topic_spec
+    assert "scope_filters.platforms" in backend
+    assert "canonical platform" in skill
+    assert schema["properties"]["scope"]["properties"]["platforms"]["items"] == {
+        "enum": ["Win", "Android", "iOS", "Mac"],
+    }
+
+
+def test_validator_accepts_valid_json_and_rejects_bottom_layer_parameter(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    result = _run_validator(good)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == valid_spec()
+
+    bad = valid_spec()
+    bad["top_k"] = 100
+    bad_path = tmp_path / "bad.json"
+    bad_path.write_text(json.dumps(bad, ensure_ascii=False), encoding="utf-8")
+    result = _run_validator(bad_path)
+    assert result.returncode == 2
+    assert "unknown field: top_k" in result.stderr
+
+
+def test_validator_accepts_yaml_and_requires_timezone(tmp_path):
+    bad = valid_spec()
+    bad["scope"]["start_time"] = "2026-01-16T00:00:00"
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(bad, allow_unicode=True), encoding="utf-8")
+
+    result = _run_validator(path)
+
+    assert result.returncode == 2
+    assert "$.scope.start_time: timezone is required" in result.stderr
+
+
+def test_skill_validator_fills_missing_time_pair_from_fixed_now(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        path,
+        "--default-now",
+        "2026-07-21T12:00:00+08:00",
+        "--default-days",
+        "14",
+    )
+
+    assert result.returncode == 0, result.stderr
+    normalized = json.loads(result.stdout)
+    assert normalized["scope"]["start_time"] == "2026-07-07T12:00:00+08:00"
+    assert normalized["scope"]["end_time"] == "2026-07-21T12:00:00+08:00"
+
+
+def test_validator_prepares_independent_spec_consumed_by_create_run(tmp_path, monkeypatch):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        source,
+        "--default-now", "2026-07-21T12:00:00+08:00",
+        "--default-days", "14",
+        "--output", str(prepared),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(source.read_text(encoding="utf-8"))["scope"].get("start_time") is None
+    expected = json.loads(result.stdout)
+    assert json.loads(prepared.read_text(encoding="utf-8")) == expected
+
+    module = _load_client_module()
+    submitted = []
+
+    class Response:
+        def __init__(self, raw=b'{"run_id":"run-1"}'):
+            self.raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.raw
+
+    def recording_urlopen(request, *, timeout):
+        if request.data is None:
+            return Response(json.dumps({
+                "classification_protocol": _classification_protocol(),
+            }).encode("utf-8"))
+        submitted.append(json.loads(request.data.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, stdout, stderr = _run_client(
+        module,
+        ["--base-url", "https://topic.internal", "create-run", "--spec", str(prepared)],
+    )
+
+    assert code == 0, stderr
+    assert json.loads(stdout) == {"run_id": "run-1"}
+    assert submitted == [expected]
+    assert submitted[0]["scope"]["start_time"] == "2026-07-07T12:00:00+08:00"
+
+
+def test_validator_failure_leaves_no_prepared_output(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(source, "--output", str(prepared))
+
+    assert result.returncode == 2
+    assert not prepared.exists()
+    assert not prepared.with_name(f".{prepared.name}.tmp").exists()
+
+
+def test_validator_rejects_overwriting_source_with_prepared_output(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    original = source.read_bytes()
+
+    result = _run_validator(source, "--output", str(source))
+
+    assert result.returncode == 2
+    assert "must differ from topic spec path" in result.stderr
+    assert source.read_bytes() == original
+
+
+def test_validator_atomic_output_failure_preserves_target_and_removes_temporary_file(tmp_path, monkeypatch):
+    validator = _load_validator_module()
+    source = tmp_path / "source.json"
+    target = tmp_path / "prepared.json"
+    source.write_text("{}", encoding="utf-8")
+    target.write_bytes(b"old")
+
+    def fail_replace(_source, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(validator.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="cannot write prepared topic spec"):
+        validator._write_prepared_spec(target, source, b"new\n")
+
+    assert target.read_bytes() == b"old"
+    assert list(tmp_path.glob(".prepared.json.*.tmp")) == []
+
+
+def test_skill_validator_rejects_only_one_time_boundary(tmp_path):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(
+        path,
+        "--default-now",
+        "2026-07-21T12:00:00+08:00",
+        "--default-days",
+        "14",
+    )
+
+    assert result.returncode == 2
+    assert "both start_time and end_time" in result.stderr
+
+
+def test_skill_validator_rejects_conversation_unit_before_create_run(tmp_path):
+    raw = valid_spec()
+    raw["unit"] = "conversation"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+
+    assert result.returncode == 2
+    assert "$.unit: must be one of: feedback" in result.stderr
+
+
+def test_client_uses_environment_url_and_redacts_token(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://topic.internal")
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", "secret-value")
+    module = _load_client_module()
+
+    requested = []
+
+    def raising_urlopen(request, *, timeout):
+        requested.append((request.full_url, request.get_header("Authorization"), timeout))
+        raise URLError("failed with secret-value")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", raising_urlopen)
+    code, _, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 4
+    assert requested == [("https://topic.internal/api/topic-mining/capabilities", "Bearer secret-value", 30)]
+    assert "secret-value" not in stderr
+    assert "[REDACTED]" in stderr
+
+
+def test_client_prepare_spec_anchors_missing_scope_to_backend_waterline(tmp_path, monkeypatch):
+    raw = valid_spec()
+    raw["scope"].pop("start_time")
+    raw["scope"].pop("end_time")
+    raw["scope"]["platforms"] = ["Windows", "WIN"]
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    requests = []
+
+    def request(base_url, token, method, path, payload=None, *, expect_json=True):
+        requests.append((method, path))
+        return ({
+            "classification_protocol": _classification_protocol(),
+            "default_time_days": 14,
+            "source_freshness": {
+                "ready": True,
+                "available_through": "2026-07-22T16:40:01+08:00",
+            },
+            "scope_filters": {"platforms": _platform_contract()},
+        }, b"")
+
+    monkeypatch.setattr(module, "_request", request)
+    code, stdout, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+        "--window-days", "7",
+    ])
+
+    assert code == 0, stderr
+    assert requests == [("GET", "/capabilities")]
+    normalized = json.loads(stdout)
+    assert normalized["scope"]["start_time"] == "2026-07-15T16:40:01+08:00"
+    assert normalized["scope"]["end_time"] == "2026-07-22T16:40:01+08:00"
+    assert normalized["scope"]["platforms"] == ["Win"]
+    assert json.loads(prepared.read_text(encoding="utf-8")) == normalized
+    assert "start_time" not in json.loads(source.read_text(encoding="utf-8"))["scope"]
+
+
+def test_client_prepare_spec_preserves_complete_explicit_time_pair(tmp_path, monkeypatch):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "classification_protocol": _classification_protocol(),
+        "default_time_days": 14,
+        "source_freshness": {
+            "ready": True,
+            "available_through": "2026-07-22T16:40:01+08:00",
+        },
+        "scope_filters": {"platforms": _platform_contract()},
+    }, b""))
+
+    code, stdout, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 0, stderr
+    assert json.loads(stdout)["scope"] == valid_spec()["scope"]
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"), [("Windows", "Win"), ("安卓", "Android")],
+)
+def test_validator_requires_contract_to_prepare_platform_alias(
+    tmp_path, alias, canonical,
+):
+    raw = valid_spec()
+    raw["scope"]["platforms"] = [alias]
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    without_contract = _run_validator(source)
+    with_contract = _run_validator(
+        source,
+        "--platform-contract-json", json.dumps(_platform_contract(), ensure_ascii=False),
+    )
+
+    assert without_contract.returncode == 2
+    assert "scope.platforms" in without_contract.stderr
+    assert with_contract.returncode == 0, with_contract.stderr
+    assert json.loads(with_contract.stdout)["scope"]["platforms"] == [canonical]
+
+
+@pytest.mark.parametrize(
+    "platform_contract",
+    [
+        None,
+        {"canonical_values": ["Win"], "aliases": {"Win": "Win"}, "matching": "case_insensitive_ignore_whitespace"},
+        {"canonical_values": ["Win", "Android", "iOS", "Mac"], "aliases": {"Win": "Linux"}, "matching": "case_insensitive_ignore_whitespace"},
+    ],
+)
+def test_client_prepare_spec_fails_closed_on_missing_or_malformed_platform_contract(
+    tmp_path, monkeypatch, platform_contract,
+):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    prepared.write_text("old", encoding="utf-8")
+    capabilities = {
+        "classification_protocol": _classification_protocol(),
+        "default_time_days": 14,
+        "source_freshness": {
+            "ready": True,
+            "available_through": "2026-07-22T16:40:01+08:00",
+        },
+    }
+    if platform_contract is not None:
+        capabilities["scope_filters"] = {"platforms": platform_contract}
+    module = _load_client_module()
+    monkeypatch.setattr(
+        module, "_request", lambda *_args, **_kwargs: (capabilities, b""),
+    )
+
+    code, _, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 2
+    assert "platform" in stderr.lower()
+    assert "Traceback" not in stderr
+    assert prepared.read_text(encoding="utf-8") == "old"
+
+
+def test_client_prepare_spec_rejects_unready_source_without_output(tmp_path, monkeypatch):
+    source = tmp_path / "source.json"
+    prepared = tmp_path / "prepared.json"
+    source.write_text(json.dumps(valid_spec(), ensure_ascii=False), encoding="utf-8")
+    module = _load_client_module()
+    monkeypatch.setattr(module, "_request", lambda *args, **kwargs: ({
+        "classification_protocol": _classification_protocol(),
+        "default_time_days": 14,
+        "source_freshness": {"ready": False, "available_through": None},
+    }, b""))
+
+    code, _, stderr = _run_client(module, [
+        "prepare-spec", "--spec", str(source), "--output", str(prepared),
+    ])
+
+    assert code == 2
+    assert "source freshness is not ready" in stderr
+    assert not prepared.exists()
+
+
+def test_client_uses_packaged_default_url_without_configuration(monkeypatch):
+    monkeypatch.delenv("FEEDBACK_TOPIC_API_URL", raising=False)
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"authentication":"internal_network_boundary"}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append((request.full_url, timeout))
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, stdout, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 0, stderr
+    assert json.loads(stdout) == {"authentication": "internal_network_boundary"}
+    assert requested == [(
+        "http://charvelxia-any2.devcloud.woa.com:8000/api/topic-mining/capabilities",
+        30,
+    )]
+
+
+def test_client_whitespace_environment_url_uses_packaged_default(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "   \t")
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, _, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 0, stderr
+    assert requested == [
+        "http://charvelxia-any2.devcloud.woa.com:8000/api/topic-mining/capabilities",
+    ]
+
+
+def test_client_rejects_nonempty_malformed_environment_url_without_request(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "not-a-url")
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(module, ["capabilities"])
+
+    assert code == 2
+    assert "absolute HTTP(S) URL" in stderr
+    assert not requested
+
+
+def test_client_cli_url_takes_precedence_over_environment(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://environment.internal")
+    module = _load_client_module()
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{}'
+
+    def recording_urlopen(request, *, timeout):
+        requested.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", recording_urlopen)
+    code, _, stderr = _run_client(
+        module, ["--base-url", "https://command.internal", "capabilities"],
+    )
+
+    assert code == 0, stderr
+    assert requested == ["https://command.internal/api/topic-mining/capabilities"]
+
+
+def test_client_rejects_explicit_blank_url_instead_of_falling_back(monkeypatch):
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_URL", "https://environment.internal")
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(module, ["--base-url", "   ", "capabilities"])
+
+    assert code == 2
+    assert "base URL must not be blank" in stderr
+    assert not requested
+
+
+def test_skill_frontmatter_has_only_name_and_description():
+    metadata = _parse_frontmatter(SKILL_ROOT / "SKILL.md")
+    assert set(metadata) == {"name", "description"}
+    assert metadata["name"] == "mining-feedback-topics"
+    assert isinstance(metadata["description"], str)
+    assert metadata["description"].startswith("Use when")
+
+
+def test_skill_guidance_has_auditable_ordered_workflow_and_direct_resources():
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    body = text.split("---", 2)[2]
+    assert len(body.split()) < 500
+    for resource in (
+        "[topic spec](references/topic-spec.md)",
+        "[backend contract](references/backend-contract.md)",
+        "[decision policy](references/review-policy.md)",
+        "[validate_topic_spec.py](scripts/validate_topic_spec.py)",
+        "[topic_backend_client.py](scripts/topic_backend_client.py)",
+    ):
+        assert resource in body
+        assert f"`{resource}" not in body
+    gates = ("capabilities", "validate", "create", "inspect", "classify", "verify", "export", "deliver")
+    positions = [body.lower().index(gate) for gate in gates]
+    assert positions == sorted(positions)
+    for condition in (
+        "data/index gaps",
+        "vector watermark",
+        "exact candidate coverage",
+        "candidate-grounded evidence",
+        "valid links",
+    ):
+        assert condition in body.lower()
+
+
+def test_skill_guidance_does_not_embed_topic_rules_or_backend_tuning():
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    body = text.split("---", 2)[2].lower()
+    forbidden = (
+        "左下角",
+        "右上角",
+        "163 条",
+        "147 条",
+        "310 条",
+        "select ",
+        "top-k",
+        "similarity threshold",
+        "api_key",
+        "bearer ",
+        "https://",
+    )
+    for value in forbidden:
+        assert value not in body
+
+
+def test_skill_uses_backend_owned_dynamic_budgets_and_uncapped_confirmed_exports():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8").lower()
+
+    assert "candidate tuning remains backend-owned" in body
+    assert "all verified matched rows" in backend
+    assert "result_limit=null" in backend
+    for value in ("minimum 100", "80 per effective day", "maximum 500"):
+        assert value in backend
+    assert "standard classification is always 500" not in body
+    assert "export at 100" not in body
+
+
+def test_skill_guidance_keeps_unverified_or_plan_only_work_inside_the_backend_contract():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "do not query source databases or vector tools directly" in body
+    assert "do not claim results" in body
+
+
+def test_skill_guidance_preserves_user_named_target_objects():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "preserve user-named objects and behaviors as required inclusion conditions" in body
+    assert "exclude unrequested adjacent topics" in body
+
+
+def test_skill_guidance_copies_hard_scope_and_client_commands_without_invention():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "populate each hard-scope field only with values explicit in the current request" in body
+    assert "leave every other hard-scope field empty" in body
+    assert "read the [backend contract]" in body
+
+
+def test_skill_guidance_shapes_blocked_pre_run_responses():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "a blocked pre-run response contains four slots" in body
+    for slot in ("proposed inclusion", "proposed exclusion", "one material scope question", "service or configuration blocker"):
+        assert slot in body
+    assert "when exactly one boundary is supplied or timezone is unknowable" in body
+    assert "never default to all history" in body
+
+
+def test_skill_guidance_assigns_capability_and_run_quality_fields_to_the_right_commands():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    capabilities = next(line for line in body.splitlines() if line.startswith("1. **capabilities."))
+    inspect = next(line for line in body.splitlines() if line.startswith("4. **inspect."))
+    for value in ("schema versions", "formats", "statuses", "read-only flags"):
+        assert value in capabilities
+    assert "vector watermark" not in capabilities
+    assert "`get-run run_id`" in inspect
+    assert "vector watermark" in inspect
+
+
+def test_skill_guidance_presents_the_complete_verbatim_client_sequence():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    commands = (
+        "`capabilities`",
+        "`prepare-spec --spec topic_spec_path --output prepared_spec_path`",
+        "`create-run --spec prepared_spec_path`",
+        "`get-run run_id`",
+        "`resume run_id`",
+        "`candidate-page run_id --output page --offset offset --limit 20`",
+        "`apply-classifications run_id --page page --file decisions`",
+        "`verify run_id`",
+        "`export run_id --format xlsx|jsonl`",
+        "`download run_id artifact --output file`",
+    )
+    positions = [body.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
+def test_skill_guidance_asks_for_one_sided_or_timezone_missing_time_as_a_direct_question():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "what start time, end time, and timezone should this run use?" in body
+
+
+def test_skill_defaults_missing_time_to_backend_advertised_two_weeks():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "default to the most recent 14 days" in body
+    assert "ask the single time-range question" not in body
+
+
+def test_skill_uses_exhaustive_only_for_explicit_completeness_intent():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "all, complete, or exhaustive" in body
+    assert "mode: exhaustive" in body
+    assert "mode: standard" in body
+
+
+def test_skill_and_references_advertise_only_feedback_units():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(encoding="utf-8").lower()
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8").lower()
+    schema = json.loads((SKILL_ROOT / "references" / "topic-spec.schema.json").read_text(encoding="utf-8"))
+
+    assert "`unit: feedback`" in body
+    assert "only `feedback` is supported" in topic_spec
+    assert "supported_units=[\"feedback\"]" in backend
+    assert schema["properties"]["unit"] == {"enum": ["feedback"]}
+
+
+def test_skill_exhausts_candidate_pagination_with_page_local_submissions():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "limit 20" in body
+    assert "follow `next_offset`" in body
+    assert "independently decide every item" in body
+    assert "apply-classifications run_id --page page --file decisions" in body
+
+
+def test_skill_discloses_representative_scope():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "result_scope" in body
+    assert "returned_feedback" in body
+    assert "possibly_more_matches" in body
+    assert "representative" in body
+
+
+def test_skill_delivery_copies_all_five_backend_scope_fields_only():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    for field in (
+        "mode", "result_scope", "matched_total", "returned_feedback",
+        "possibly_more_matches",
+    ):
+        assert f"`{field}`" in body
+    assert "copy only these five backend-returned fields" in body
+
+
+def test_skill_requires_backend_official_excel_as_primary_delivery():
+    body = (
+        SKILL_ROOT / "SKILL.md"
+    ).read_text(encoding="utf-8").split("---", 2)[2].lower()
+
+    assert "backend official excel" in body
+    assert "first file" in body
+    assert "must not be replaced" in body
+    assert "must not be hidden" in body
+
+
+def test_skill_requires_every_presented_excel_to_pass_hyperlink_gate():
+    body = (
+        SKILL_ROOT / "SKILL.md"
+    ).read_text(encoding="utf-8").split("---", 2)[2].lower()
+
+    assert "every presented `.xlsx`" in body
+    assert "[ensure_feedback_hyperlinks.py](scripts/ensure_feedback_hyperlinks.py)" in body
+    assert "plain-text link" in body
+    assert "must not be delivered" in body
+    assert "feedback id" in body
+
+
+def test_backend_contract_has_copyable_hyperlink_delivery_gate_commands():
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8")
+
+    for command in (
+        "python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input OFFICIAL_XLSX --check",
+        "python3 scripts/ensure_feedback_hyperlinks.py --official OFFICIAL_XLSX --input DERIVED_XLSX --output VERIFIED_XLSX",
+    ):
+        assert command in contract
+    assert "arbitrary post-processing" in contract.lower()
+    assert "separate backend official excel" in contract.lower()
+
+
+def test_skill_uses_only_backend_returned_result_scope_values():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "result_scope=reviewed" in body
+    assert "never invent a result_scope value" in body
+
+
+def test_skill_current_internal_deployment_uses_default_with_optional_overrides():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2]
+    assert "FEEDBACK_TOPIC_API_URL" in body
+    assert "FEEDBACK_TOPIC_API_TOKEN" in body
+    assert "packaged internal default" in body
+    assert "optional override" in body
+    assert "Require `FEEDBACK_TOPIC_API_URL`" not in body
+    assert "unused for the current internal deployment" in body
+
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    assert "http://charvelxia-any2.devcloud.woa.com:8000" in backend
+    assert "Both URL overrides are optional" in backend
+    assert "Configure `FEEDBACK_TOPIC_API_URL`" not in backend
+
+
+def test_skill_guidance_resolves_explicit_relative_time_without_questioning():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "treat an explicit relative time range as supplied scope" in body
+    assert "resolve whole-day relative ranges from `available_through`" in body
+    assert "system or local current time" in body
+
+
+def test_skill_anchors_default_and_relative_windows_to_backend_waterline():
+    body = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[2].lower()
+    assert "source_freshness.available_through" in body
+    assert "`prepare-spec --spec topic_spec_path --output prepared_spec_path`" in body
+    assert "`--window-days days`" in body
+    assert "never use the agent's system or local current time" in body
+
+
+def test_backend_contract_has_one_copyable_complete_command_sequence():
+    text = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    commands = (
+        "python3 scripts/topic_backend_client.py capabilities",
+        "python3 scripts/topic_backend_client.py prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py create-run --spec PREPARED_SPEC_PATH",
+        "python3 scripts/topic_backend_client.py get-run RUN_ID",
+        "python3 scripts/topic_backend_client.py resume RUN_ID",
+        "python3 scripts/topic_backend_client.py candidate-page RUN_ID --output CANDIDATE_PAGE_PATH --offset OFFSET --limit 20",
+        "python3 scripts/topic_backend_client.py apply-classifications RUN_ID --page CANDIDATE_PAGE_PATH --file DECISIONS_PATH",
+        "python3 scripts/topic_backend_client.py verify RUN_ID",
+        "python3 scripts/topic_backend_client.py export RUN_ID --format xlsx",
+        "python3 scripts/topic_backend_client.py download RUN_ID ARTIFACT_NAME --output OUTPUT_PATH",
+    )
+    positions = [text.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
+def test_skill_references_define_default_mode_paging_and_delivery_policy():
+    topic_spec = (SKILL_ROOT / "references" / "topic-spec.md").read_text(encoding="utf-8")
+    backend = (SKILL_ROOT / "references" / "backend-contract.md").read_text(encoding="utf-8")
+    review = (SKILL_ROOT / "references" / "review-policy.md").read_text(encoding="utf-8")
+
+    assert "`mode: standard`" in topic_spec
+    assert "`mode: exhaustive`" in topic_spec
+    assert "prepare-spec --spec TOPIC_SPEC_PATH --output PREPARED_SPEC_PATH" in topic_spec
+    for value in ("minimum 100", "80 per effective day", "maximum 500", "result_scope=representative", "possibly_more_matches=true"):
+        assert value in backend
+    assert "authentication=internal_network_boundary" in backend
+    for field in ("mode", "result_scope", "matched_total", "returned_feedback", "possibly_more_matches"):
+        assert f"`{field}`" in backend
+    assert "follow `next_offset`" in backend
+    assert "at most 20 candidates per page" in review
+    assert "partial http 200 is progress" in review.lower()
+    assert "retrieved_candidate_count > classified_count" in backend
+    assert "possibly_more_matches=true in either mode" in backend
+
+
+def test_references_use_backend_anchored_atomic_time_preparation_command():
+    for name in ("topic-spec.md", "backend-contract.md"):
+        text = (SKILL_ROOT / "references" / name).read_text(encoding="utf-8")
+        commands = [
+            line for line in text.splitlines()
+            if "python3 scripts/topic_backend_client.py prepare-spec" in line
+        ]
+        assert commands, name
+        assert all("--output PREPARED_SPEC_PATH" in command for command in commands), (name, commands)
+        assert "--default-now NOW" not in text
+
+
+def test_review_contract_requires_complete_candidate_grounded_decisions():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8")
+    policy = (
+        SKILL_ROOT / "references" / "review-policy.md"
+    ).read_text(encoding="utf-8")
+
+    assert "cover exactly its page ids once" in contract.lower()
+    assert "context_items" in skill
+    assert "context_items" in policy
+    assert "interpret" in policy.lower()
+    assert "item.text" in policy
+    assert "must not substitute" in policy.lower()
+    assert "non-empty substrings" in policy
+    assert "exact" in policy
+
+
+def test_decision_validator_rejects_context_only_evidence(tmp_path):
+    page = tmp_path / "page.json"
+    page.write_text(json.dumps({
+        "items": [{
+            "item_id": "feedback-1",
+            "item": {"item_id": "feedback-1", "text": "今天天气不错"},
+            "context_items": [{"text": "语音输入完全无法识别"}],
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    decisions = tmp_path / "decisions.json"
+    decisions.write_text(json.dumps([{
+        "item_id": "feedback-1",
+        "label": "matched",
+        "reason": "上下文提到了专题",
+        "evidence": ["语音输入完全无法识别"],
+    }], ensure_ascii=False), encoding="utf-8")
+    output = tmp_path / "validated.json"
+
+    result = _run_decision_validator(page, decisions, output)
+
+    assert result.returncode == 2
+    assert "candidate-grounded" in result.stderr
+    assert not output.exists()
+
+
+def test_skill_resumes_only_recoverable_preclassification_runs():
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "only for a recoverable pre-classification run" in skill
+    assert "classification states are caller-owned" in skill
+    assert "resume applies only to recoverable pre-classification work" in contract
+    assert "backend never chooses a semantic classifier for v3" in contract
+
+
+def test_backend_contract_keeps_internal_artifacts_out_of_download_contract():
+    contract = (
+        SKILL_ROOT / "references" / "backend-contract.md"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "backend-internal" in contract
+    assert "never available through artifact download" in contract
+    assert "only verified final deliverables" in contract
+    for name in (
+        "final_results.jsonl", "quality_report.json", "feedback_list.xlsx",
+    ):
+        assert name in contract
+    assert "the run may expose `source_snapshot.sqlite`" not in contract
+
+
+def test_client_download_uses_atomic_replace(tmp_path, monkeypatch):
+    module = _load_client_module()
+    target = tmp_path / "result.xlsx"
+    target.write_bytes(b"old")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"new-artifact"
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda request, *, timeout: Response())
+    code, stdout, stderr = _run_client(
+        module,
+        ["--base-url", "https://topic.internal", "download", "run-1", "result.xlsx", "--output", str(target)],
+    )
+
+    assert code == 0, stderr
+    assert target.read_bytes() == b"new-artifact"
+    assert not target.with_name(f".{target.name}.tmp").exists()
+    assert json.loads(stdout) == {"output": str(target), "run_id": "run-1", "artifact_name": "result.xlsx"}
+
+
+def test_validator_rejects_boolean_schema_version(tmp_path):
+    bad = valid_spec()
+    bad["schema_version"] = True
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(bad, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+
+    assert result.returncode == 2
+    assert "$.schema_version" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-01-16T00:00:00Z", "2026-01-16t00:00:00z"],
+)
+def test_standalone_and_backend_accept_rfc3339_utc_timestamps(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    raw["scope"]["end_time"] = "2026-07-16T14:00:00Z"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time.isoformat() == "2026-01-16T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-01-16 00:00:00+00:00", "2026-01-16T00:00+00:00", "2026-01-16T00:00:00"],
+)
+def test_standalone_and_backend_reject_non_rfc3339_timestamps(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+    assert result.returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [" 2026-01-16T00:00:00Z", "2026-01-16T00:00:00Z ", "   "],
+)
+def test_standalone_and_backend_reject_timestamp_whitespace(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
+@pytest.mark.parametrize("timestamp", ["2026-01-16T00:00:00+00:60", "2026-01-16T00:00:00+24:00"])
+def test_standalone_and_backend_reject_invalid_rfc3339_offset_bounds(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 2
+    with pytest.raises(ValueError, match="scope.start_time"):
+        validate_topic_spec(raw)
+
+
+@pytest.mark.parametrize("timestamp", ["2026-01-16T00:00:00+23:59", "2026-01-16T00:00:00-00:00"])
+def test_standalone_and_backend_accept_valid_rfc3339_offset_bounds(tmp_path, timestamp):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = timestamp
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    "start_time,end_time",
+    [
+        ("2026-01-16T00:00:00Z", "2026-01-15T23:59:59Z"),
+        ("2026-01-16T00:00:00Z", "2026-01-16T00:00:00Z"),
+        ("2026-01-16T00:00:00Z", "2026-01-16T01:00:00+01:00"),
+    ],
+)
+def test_standalone_and_backend_reject_non_increasing_scope_instants(tmp_path, start_time, end_time):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = start_time
+    raw["scope"]["end_time"] = end_time
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    result = _run_validator(path)
+    assert result.returncode == 2
+    assert "$.scope.end_time" in result.stderr
+    with pytest.raises(ValueError, match="scope.end_time"):
+        validate_topic_spec(raw)
+
+
+def test_standalone_and_backend_compare_different_scope_offsets_as_instants(tmp_path):
+    raw = valid_spec()
+    raw["scope"]["start_time"] = "2026-01-16T00:30:00+01:00"
+    raw["scope"]["end_time"] = "2026-01-16T00:00:00Z"
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    assert _run_validator(path).returncode == 0
+    assert validate_topic_spec(raw).scope.start_time < validate_topic_spec(raw).scope.end_time
+
+
+def test_validator_enum_comparison_does_not_treat_boolean_as_number():
+    validator = _load_validator_module()
+
+    with pytest.raises(ValueError, match="must be one of"):
+        validator._validate(True, {"enum": [1]}, "$")
+
+
+@pytest.mark.parametrize("unsafe", ["..", "a/b", r"a\\b", "run?other", "run#fragment", "%2F", "run\x00id"])
+def test_client_rejects_unsafe_run_ids_before_building_a_url(monkeypatch, unsafe):
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", "get-run", unsafe])
+
+    assert code == 2
+    assert "run id" in stderr
+    assert not requested
+
+
+def test_client_resume_uses_token_post_route_and_redacts_http_error(monkeypatch):
+    token = "resume-secret"
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", token)
+    module = _load_client_module()
+    requested = []
+
+    def raising_urlopen(request, *, timeout):
+        requested.append(
+            (request.get_method(), request.full_url, request.get_header("Authorization"), timeout)
+        )
+        raise module.urllib.error.HTTPError(
+            request.full_url,
+            409,
+            "conflict",
+            {},
+            io.BytesIO(f'{{"detail":"failed {token}"}}'.encode()),
+        )
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", raising_urlopen)
+    code, _, stderr = _run_client(
+        module, ["--base-url", "https://topic.internal", "resume", "run-1"],
+    )
+
+    assert code == 3
+    assert requested == [(
+        "POST",
+        "https://topic.internal/api/topic-mining/runs/run-1/resume",
+        f"Bearer {token}",
+        30,
+    )]
+    assert token not in stderr
+    assert "[REDACTED]" in stderr
+
+
+@pytest.mark.parametrize("unsafe", ["..", "a/b", r"a\\b", "file?x", "file#x", "%2F", "file\x1f.xlsx"])
+def test_client_rejects_unsafe_artifact_names_before_building_a_url(tmp_path, monkeypatch, unsafe):
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: requested.append(args))
+
+    code, _, stderr = _run_client(
+        module,
+        ["--base-url", "https://topic.internal", "download", "run-1", unsafe, "--output", str(tmp_path / "out")],
+    )
+
+    assert code == 2
+    assert "artifact name" in stderr
+    assert not requested
+
+
+def test_client_maps_invalid_url_and_http_client_exceptions_without_token_leaks(monkeypatch):
+    token = "secret-value"
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", token)
+    module = _load_client_module()
+
+    code, _, stderr = _run_client(module, ["--base-url", "not-a-url", "capabilities"])
+    assert code == 2
+    assert token not in stderr
+    assert "Traceback" not in stderr
+
+    code, _, stderr = _run_client(module, ["--base-url", "https://[", "capabilities"])
+    assert code == 2
+    assert token not in stderr
+    assert "Traceback" not in stderr
+
+    def invalid_url(request, *, timeout):
+        raise http.client.InvalidURL(f"invalid route with {token}")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", invalid_url)
+    code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", "capabilities"])
+    assert code == 4
+    assert token not in stderr
+    assert "[REDACTED]" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_client_argument_errors_are_redacted(monkeypatch):
+    token = "secret-value"
+    monkeypatch.setenv("FEEDBACK_TOPIC_API_TOKEN", token)
+    module = _load_client_module()
+
+    code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", f"invalid-{token}"])
+
+    assert code == 2
+    assert token not in stderr
+    assert "[REDACTED]" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_client_rejects_non_json_api_response_and_preserves_candidate_output(tmp_path, monkeypatch):
+    module = _load_client_module()
+    target = tmp_path / "review.json"
+    target.write_text("old", encoding="utf-8")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda request, *, timeout: Response())
+    code, _, stderr = _run_client(
+        module,
+        ["--base-url", "https://topic.internal", "candidate-page", "run-1", "--output", str(target)],
+    )
+
+    assert code == 4
+    assert "invalid JSON response" in stderr
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_client_maps_every_command_to_the_contract_route_and_body(tmp_path, monkeypatch):
+    module = _load_client_module()
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(valid_spec()), encoding="utf-8")
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text(json.dumps([{
+        "item_id": "a", "label": "matched", "reason": "命中",
+        "evidence": ["原文"],
+    }]), encoding="utf-8")
+    review_output = tmp_path / "candidate-page.json"
+    download_output = tmp_path / "results.xlsx"
+    requests = []
+
+    class Response:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.raw
+
+    def urlopen(request, *, timeout):
+        requests.append((request.get_method(), request.full_url, request.data, timeout))
+        if request.full_url.endswith("/capabilities"):
+            raw = json.dumps({
+                "classification_protocol": _classification_protocol(),
+            }).encode("utf-8")
+        elif "/candidate-page?" in request.full_url:
+            raw = json.dumps({
+                "items": [{
+                    "item_id": "a", "item": {"item_id": "a", "text": "原文"},
+                    "context_items": [],
+                }],
+            }, ensure_ascii=False).encode("utf-8")
+        else:
+            raw = b"binary-xlsx" if "/artifacts/" in request.full_url else b'{"ok":true}'
+        return Response(raw)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    commands = [
+        ["capabilities"],
+        ["create-run", "--spec", str(spec_path)],
+        ["get-run", "run-1"],
+        ["resume", "run-1"],
+        [
+            "candidate-page", "run-1", "--output", str(review_output),
+            "--offset", "0", "--limit", "20",
+        ],
+        [
+            "apply-classifications", "run-1", "--page", str(review_output),
+            "--file", str(decisions_path),
+        ],
+        ["verify", "run-1"],
+        ["export", "run-1", "--format", "xlsx"],
+        ["download", "run-1", "results.xlsx", "--output", str(download_output)],
+    ]
+    for command in commands:
+        code, _, stderr = _run_client(module, ["--base-url", "https://topic.internal", *command])
+        assert code == 0, stderr
+
+    assert [(method, url, body, timeout) for method, url, body, timeout in requests] == [
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs", json.dumps(valid_spec(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 30),
+        ("GET", "https://topic.internal/api/topic-mining/runs/run-1", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/resume", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/candidate-page?offset=0&limit=20", None, 30),
+        ("GET", "https://topic.internal/api/topic-mining/capabilities", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/classifications", json.dumps([{
+            "item_id": "a", "label": "matched", "reason": "命中",
+            "evidence": ["原文"],
+        }], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"), 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/verify", None, 30),
+        ("POST", "https://topic.internal/api/topic-mining/runs/run-1/export", b'{"format":"xlsx"}', 30),
+        ("GET", "https://topic.internal/api/topic-mining/runs/run-1/artifacts/results.xlsx", None, 30),
+    ]
+    assert json.loads(review_output.read_text(encoding="utf-8"))["items"][0]["item_id"] == "a"
+    assert download_output.read_bytes() == b"binary-xlsx"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["--offset", "-1"],
+        ["--limit", "0"],
+        ["--limit", "51"],
+        ["--offset", "not-an-integer"],
+    ),
+)
+def test_client_rejects_invalid_candidate_page_arguments_before_request(
+    tmp_path, monkeypatch, arguments,
+):
+    module = _load_client_module()
+    requested = []
+    monkeypatch.setattr(
+        module.urllib.request, "urlopen",
+        lambda *args, **kwargs: requested.append(args),
+    )
+
+    code, _, stderr = _run_client(
+        module,
+        [
+            "--base-url", "https://topic.internal", "candidate-page", "run-1",
+            "--output", str(tmp_path / "page.json"), *arguments,
+        ],
+    )
+
+    assert code == 2
+    assert "candidate" in stderr or "offset" in stderr
+    assert not requested

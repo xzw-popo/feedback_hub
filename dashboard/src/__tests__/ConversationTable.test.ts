@@ -3,7 +3,12 @@ import { mount } from '@vue/test-utils'
 import ConversationTable from '@/components/ConversationTable.vue'
 import type { ConversationItem } from '@/api/feedback'
 
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+const push = vi.hoisted(() => vi.fn())
+
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push }),
+  useRoute: () => ({ fullPath: '/?platform=Win&q=win2.1.0' }),
+}))
 
 function item(): ConversationItem {
   return {
@@ -28,7 +33,7 @@ function item(): ConversationItem {
 
 describe('ConversationTable', () => {
   afterEach(() => {
-    vi.restoreAllMocks()
+    vi.clearAllMocks()
   })
 
   it('opens original chat from the table action', async () => {
@@ -65,5 +70,41 @@ describe('ConversationTable', () => {
       '_blank',
       'noopener,noreferrer',
     )
+  })
+
+  it('passes the current list route when opening a detail page', async () => {
+    const wrapper = mount(ConversationTable, {
+      props: { items: [item()] },
+      global: {
+        directives: { loading: {} },
+        stubs: {
+          L1Tag: true,
+          SeverityTag: true,
+          ElIcon: true,
+          ElTable: {
+            template: '<button @click="$emit(\'row-click\', data[0])"><slot /></button>',
+            props: ['data'],
+          },
+          ElTableColumn: {
+            template: '<div><slot name="default" :row="row" /></div>',
+            props: ['label', 'width', 'minWidth'],
+            setup() {
+              return { row: item() }
+            },
+          },
+          ElButton: {
+            template: '<button :disabled="disabled" @click="$emit(\'click\', $event)"><slot /></button>',
+            props: ['disabled'],
+          },
+        },
+      },
+    })
+
+    await wrapper.find('button').trigger('click')
+
+    expect(push).toHaveBeenCalledWith({
+      path: '/feedback/conv1',
+      query: { from: '/?platform=Win&q=win2.1.0' },
+    })
   })
 })

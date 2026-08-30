@@ -31,6 +31,7 @@ from feedback_hub.config import L1_VALUES, L2_VALUES, SEVERITY_VALUES
 from feedback_hub.importer import router as import_router
 from feedback_hub.search.api import router as search_router
 from feedback_hub.search.report_api import router as report_router
+from feedback_hub.topic_mining.api import router as topic_mining_router
 from feedback_hub.weibo.api import make_router as make_weibo_router
 
 
@@ -140,6 +141,8 @@ def create_app(
     app.include_router(search_router)
     # 注册搜索报告 API
     app.include_router(report_router)
+    # 专题反馈挖掘：独立运行数据库与只读源快照，不写正式标签。
+    app.include_router(topic_mining_router)
     # 注册微博舆情 API
     app.include_router(make_weibo_router(db_path))
 
